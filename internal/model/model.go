@@ -200,8 +200,7 @@ type TelemetryResolution string
 const (
 	TelemetryRaw       TelemetryResolution = "raw"
 	Telemetry10Seconds TelemetryResolution = "10s"
-	Telemetry1Minute   TelemetryResolution = "1m"
-	Telemetry10Minutes TelemetryResolution = "10m"
+	TelemetryAdaptive  TelemetryResolution = "adaptive"
 )
 
 type MetricAggregate struct {
@@ -210,7 +209,6 @@ type MetricAggregate struct {
 	First            Metric `json:"first"`
 	Last             Metric `json:"last"`
 	Delta            Metric `json:"delta"`
-	Mean             Metric `json:"mean"`
 	Count            uint64 `json:"count"`
 	UnavailableCount uint64 `json:"unavailableCount"`
 	UnsupportedCount uint64 `json:"unsupportedCount"`
@@ -267,6 +265,8 @@ type TelemetryAggregate struct {
 	Resolution       TelemetryResolution     `json:"resolution"`
 	WindowStart      time.Time               `json:"windowStart"`
 	WindowEnd        time.Time               `json:"windowEnd"`
+	FirstSequence    uint64                  `json:"firstSequence"`
+	LastSequence     uint64                  `json:"lastSequence"`
 	SampleCount      uint64                  `json:"sampleCount"`
 	Resources        AggregateResources      `json:"resources"`
 	IO               AggregateIOMetrics      `json:"io"`
