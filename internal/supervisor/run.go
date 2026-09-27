@@ -3,7 +3,6 @@ package supervisor
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/yohn-jp/jinushi/internal/ipc"
@@ -23,7 +22,7 @@ func Run(ctx context.Context, stateDir string) error {
 	if err := ensureStateDir(root); err != nil {
 		return err
 	}
-	if err := os.Chmod(root, 0700); err != nil {
+	if err := secureStateDir(root); err != nil {
 		return fmt.Errorf("restrict state directory: %w", err)
 	}
 	config, err := loadConfig(root)

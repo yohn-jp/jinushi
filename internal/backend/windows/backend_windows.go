@@ -115,6 +115,8 @@ func New() backend.Backend { return implementation{} }
 
 func (implementation) Capabilities() model.Capabilities { return Capabilities() }
 
+func (implementation) ValidateLimits(limits model.Limits) error { return ValidateLimits(limits) }
+
 func (implementation) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Process, error) {
 	return Start(spec, stdout, stderr)
 }
@@ -144,6 +146,26 @@ func Capabilities() model.Capabilities {
 	return c
 }
 
+// ValidateLimits checks Windows Job Object bounds before a Run is accepted.
+func ValidateLimits(limits model.Limits) error {
+	if limits.MemoryBytes < 0 || limits.ProcessCount < 0 || limits.CPUQuotaPercent < 0 {
+		return errors.New("resource limits must not be negative")
+	}
+	if limits.MemoryBytes > 0 && uint64(limits.MemoryBytes) > uint64(^uintptr(0)) {
+		return fmt.Errorf("memory limit exceeds Windows Job Object range: %w", errUnsupported)
+	}
+	if limits.ProcessCount > int64(^uint32(0)) {
+		return fmt.Errorf("process-count limit exceeds Windows Job Object range: %w", errUnsupported)
+	}
+	if limits.CPUQuotaPercent > 100 {
+		return fmt.Errorf("CPU quota exceeds Windows Job Object hard-cap range: %w", errUnsupported)
+	}
+	if limits.CPUQuotaPercent > 0 && !Capabilities().CPUQuotaEnforcement {
+		return fmt.Errorf("CPU quota cannot be enforced by this Windows host: %w", errUnsupported)
+	}
+	return nil
+}
+
 // Start creates the requested command directly. No shell is introduced.
 // Interactive output is merged by ConPTY and delivered to stdout.
 func Start(spec model.RunSpec, stdout, stderr io.Writer) (*Process, error) {
@@ -168,19 +190,8 @@ func Start(spec model.RunSpec, stdout, stderr io.Writer) (*Process, error) {
 	if spec.Interactive && !Capabilities().PTY {
 		return nil, fmt.Errorf("ConPTY: %w", errUnsupported)
 	}
-	if spec.Limits.MemoryBytes < 0 || spec.Limits.ProcessCount < 0 || spec.Limits.CPUQuotaPercent < 0 {
-		return nil, errors.New("resource limits must not be negative")
-	}
-	if spec.Limits.MemoryBytes > 0 && uint64(spec.Limits.MemoryBytes) > uint64(^uintptr(0)) {
-		return nil, fmt.Errorf("memory limit exceeds Windows Job Object range: %w", errUnsupported)
-	}
-	if spec.Limits.ProcessCount > int64(^uint32(0)) {
-		return nil, fmt.Errorf("process-count limit exceeds Windows Job Object range: %w", errUnsupported)
-	}
-	if spec.Limits.CPUQuotaPercent > 0 {
-		if spec.Limits.CPUQuotaPercent > 100 || !Capabilities().CPUQuotaEnforcement {
-			return nil, fmt.Errorf("CPU quota must be enforceable as a Windows Job Object hard cap: %w", errUnsupported)
-		}
+	if err := ValidateLimits(spec.Limits); err != nil {
+		return nil, err
 	}
 
 	envVars, err := environmentValues(spec.Environment)
@@ -652,6 +663,7 @@ func Reconcile(ownership model.Ownership) (backend.ReconcileResult, error) {
 	}
 	resources, _ := observeJob(job, nil)
 	if active == 0 {
+		uncertain.State = model.Terminal
 		uncertain.OwnershipProven = true
 		uncertain.Resources = resources
 		uncertain.Reason = "the owned Job Object is empty but its terminal receipt was not persisted"

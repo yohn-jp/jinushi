@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,13 @@ func TestJobObjectTerminatesDescendants(t *testing.T) {
 	if !result.TreeEmpty || !result.Forced {
 		t.Fatalf("Job Object did not prove forced descendant cleanup: %+v", result)
 	}
+	reconciled, err := Reconcile(process.Ownership())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.State != model.Terminal || !reconciled.OwnershipProven {
+		t.Fatalf("empty owned Job Object did not reconcile as proven terminal: %+v", reconciled)
+	}
 	exit, err := process.Wait()
 	if err != nil {
 		t.Fatal(err)
@@ -298,6 +306,21 @@ func TestWindowsArgumentQuoting(t *testing.T) {
 	for _, test := range cases {
 		if got := quoteWindowsArgument(test.input); got != test.want {
 			t.Errorf("quoteWindowsArgument(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestValidateLimitsRejectsWindowsJobObjectOverflow(t *testing.T) {
+	if err := ValidateLimits(model.Limits{ProcessCount: int64(^uint32(0)) + 1}); !errors.Is(err, errUnsupported) {
+		t.Fatalf("process-count overflow should be unsupported, got %v", err)
+	}
+	if err := ValidateLimits(model.Limits{CPUQuotaPercent: 101}); !errors.Is(err, errUnsupported) {
+		t.Fatalf("CPU quota over 100%% should be unsupported, got %v", err)
+	}
+	if strconv.IntSize == 32 {
+		overflow := int64(uint64(^uint32(0)) + 1)
+		if err := ValidateLimits(model.Limits{MemoryBytes: overflow}); !errors.Is(err, errUnsupported) {
+			t.Fatalf("memory-size overflow should be unsupported, got %v", err)
 		}
 	}
 }
