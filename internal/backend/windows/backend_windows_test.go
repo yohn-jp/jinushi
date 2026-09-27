@@ -10,14 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/yohn-jp/jinushi/internal/model"
+	winapi "golang.org/x/sys/windows"
 )
 
 func TestWindowsBackendChild(t *testing.T) {
@@ -60,6 +63,47 @@ func TestWindowsBackendChild(t *testing.T) {
 		for {
 			time.Sleep(time.Hour)
 		}
+	case "memory-flood":
+		const allocationSize = 2 << 20
+		limitReached := []byte("memory-limit-enforced")
+		allocations := make([]uintptr, 0, 64)
+		for range 64 {
+			address, err := winapi.VirtualAlloc(0, allocationSize, winapi.MEM_RESERVE|winapi.MEM_COMMIT, winapi.PAGE_READWRITE)
+			if err != nil || address == 0 {
+				_, _ = os.Stdout.Write(limitReached)
+				runtime.KeepAlive(allocations)
+				return
+			}
+			memory := unsafe.Slice((*byte)(unsafe.Pointer(address)), allocationSize)
+			for offset := 0; offset < len(memory); offset += 4096 {
+				memory[offset] = byte(offset)
+			}
+			allocations = append(allocations, address)
+		}
+		_, _ = fmt.Fprint(os.Stdout, "memory-limit-not-enforced")
+	case "cpu-burn":
+		duration := 2 * time.Second
+		if len(args) > 0 {
+			if parsed, err := time.ParseDuration(args[0]); err == nil {
+				duration = parsed
+			}
+		}
+		deadline := time.Now().Add(duration)
+		workers := runtime.NumCPU()
+		runtime.GOMAXPROCS(workers)
+		var workerGroup sync.WaitGroup
+		workerGroup.Add(workers)
+		for range workers {
+			go func() {
+				defer workerGroup.Done()
+				var value uint64 = 1
+				for time.Now().Before(deadline) {
+					value = value*1664525 + 1013904223
+				}
+				runtime.KeepAlive(value)
+			}()
+		}
+		workerGroup.Wait()
 	}
 }
 
@@ -253,6 +297,92 @@ func TestJobObjectEnforcesProcessCount(t *testing.T) {
 	if exit.Outcome != "exited" && exit.Outcome != "resource-limit:process-count" {
 		t.Fatalf("unexpected outcome after the native process limit: %+v", exit)
 	}
+}
+
+func TestJobObjectEnforcesMemoryCeiling(t *testing.T) {
+	if !Capabilities().MemoryEnforcement {
+		t.Skip("Job Object memory enforcement is unavailable")
+	}
+	const memoryLimit = int64(96 << 20)
+	exe, _ := os.Executable()
+	var stdout, stderr bytes.Buffer
+	process, err := Start(model.RunSpec{
+		Argv: []string{exe, "-test.run=^TestWindowsBackendChild$", "--", "memory-flood"},
+		Cwd:  t.TempDir(),
+		Environment: model.Environment{
+			Mode: "inherit-supervisor",
+			Set:  map[string]string{"JINUSHI_WINDOWS_BACKEND_CHILD": "memory-flood"},
+		},
+		Limits: model.Limits{MemoryBytes: memoryLimit},
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit, err := process.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "memory-limit-enforced") {
+		t.Fatalf("allocation continued without hitting the native Job Object ceiling: output=%q stderr=%q exit=%+v", stdout.String(), stderr.String(), exit)
+	}
+	if exit.Outcome != "resource-limit:memory" {
+		t.Fatalf("native Job Object memory-limit notification was not observed: %+v", exit)
+	}
+	resources, err := process.Observe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.PeakMemoryBytes.Status == "measured" && resources.PeakMemoryBytes.Value > memoryLimit {
+		t.Fatalf("Job Object peak memory exceeded configured ceiling: peak=%d limit=%d", resources.PeakMemoryBytes.Value, memoryLimit)
+	}
+}
+
+func TestJobObjectEnforcesCPUHardCap(t *testing.T) {
+	if !Capabilities().CPUQuotaEnforcement {
+		t.Skip("Job Object CPU hard-cap control is unavailable")
+	}
+	baselineRate := runCPUJobRate(t, 0)
+	limitedRate := runCPUJobRate(t, 10)
+	if baselineRate < float64(runtime.NumCPU())*0.5 {
+		t.Skipf("host did not provide enough unbounded CPU load to verify the hard cap (rate %.2f CPUs)", baselineRate)
+	}
+	if limitedRate > baselineRate*0.5 {
+		t.Fatalf("10%% Job Object CPU hard cap did not constrain the workload: unbounded %.2f CPUs, limited %.2f CPUs", baselineRate, limitedRate)
+	}
+}
+
+func runCPUJobRate(t *testing.T, quotaPercent int64) float64 {
+	t.Helper()
+	exe, _ := os.Executable()
+	var stdout, stderr bytes.Buffer
+	process, err := Start(model.RunSpec{
+		Argv: []string{exe, "-test.run=^TestWindowsBackendChild$", "--", "2s"},
+		Cwd:  t.TempDir(),
+		Environment: model.Environment{
+			Mode: "inherit-supervisor",
+			Set:  map[string]string{"JINUSHI_WINDOWS_BACKEND_CHILD": "cpu-burn"},
+		},
+		Limits: model.Limits{CPUQuotaPercent: quotaPercent},
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exit, err := process.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := process.Observe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.CPUTimeNs.Status != "measured" {
+		t.Skipf("CPU-time observation is %s", resources.CPUTimeNs.Status)
+	}
+	wallSeconds := exit.FinishedAt.Sub(exit.StartedAt).Seconds()
+	if wallSeconds <= 0 {
+		t.Fatalf("invalid measured Job Object lifetime: %+v", exit)
+	}
+	return float64(resources.CPUTimeNs.Value) / 1e9 / wallSeconds
 }
 
 func TestConPTYInputOutputAndResize(t *testing.T) {
