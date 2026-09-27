@@ -35,11 +35,14 @@ type terminationResult struct {
 }
 
 type reconcileResult struct {
-	live     bool
-	terminal bool
-	exit     exitResult
-	process  physical
-	receipt  *model.Receipt
+	live              bool
+	terminal          bool
+	exit              exitResult
+	process           physical
+	receipt           *model.Receipt
+	ownership         *model.Ownership
+	state             model.State
+	terminationReason string
 }
 
 type physical interface {
@@ -56,7 +59,7 @@ type physical interface {
 type executor interface {
 	Capabilities() model.Capabilities
 	Start(string, model.RunSpec, io.Writer, io.Writer) (physical, error)
-	Reconcile(string, model.Ownership, bool, io.Writer, io.Writer) (reconcileResult, error)
+	Reconcile(string, *model.Ownership, bool, io.Writer, io.Writer) (reconcileResult, error)
 }
 
 type active struct {
@@ -1071,20 +1074,27 @@ func (s *Service) reconcile() error {
 		if _, err := s.store.Update(run, &model.Event{Kind: "run.reconciling", ObservedAt: time.Now().UTC()}); err != nil {
 			return err
 		}
-		if run.Ownership != nil {
+		{
 			a := &active{run: run, done: make(chan struct{})}
 			stdout := &capture{s: s, a: a, stream: "stdout"}
 			stderr := &capture{s: s, a: a, stream: "stderr"}
 			if run.Spec.Interactive {
 				stdout.stream = "pty"
 			}
-			result, e := s.backend.Reconcile(run.ID, *run.Ownership, run.Spec.Interactive, stdout, stderr)
+			result, e := s.backend.Reconcile(run.ID, run.Ownership, run.Spec.Interactive, stdout, stderr)
 			if e == nil && result.terminal {
 				if refreshed, readErr := s.store.Get(run.ID); readErr == nil {
 					run = refreshed
 				}
 				now := time.Now().UTC()
 				run.State = model.Terminal
+				if run.Ownership == nil && result.ownership != nil {
+					owned := *result.ownership
+					run.Ownership = &owned
+				}
+				if result.terminationReason != "" {
+					run.TerminationReason = result.terminationReason
+				}
 				run.FinishedAt = &now
 				run.Generation++
 				if result.receipt != nil {
@@ -1092,6 +1102,8 @@ func (s *Service) reconcile() error {
 					copy.Output = run.Output
 					run.Receipt = &copy
 					run.FinishedAt = &copy.FinishedAt
+					run.StartedAt = copy.StartedAt
+					run.Resources = copy.Resources
 				} else {
 					outcome := result.exit.outcome
 					if outcome == "" {
@@ -1107,7 +1119,19 @@ func (s *Service) reconcile() error {
 			}
 			if e == nil && result.live && result.process != nil {
 				a.process = result.process
-				a.run.State = model.Running
+				if a.run.Ownership == nil {
+					owned := result.process.Ownership()
+					a.run.Ownership = &owned
+				}
+				if result.terminationReason != "" {
+					a.run.TerminationReason = result.terminationReason
+				}
+				if result.state == model.Terminating || a.run.TerminationReason != "" {
+					a.run.State = model.Terminating
+					a.terminating = true
+				} else {
+					a.run.State = model.Running
+				}
 				a.run.Generation++
 				if _, err := s.store.Update(a.run, &model.Event{Kind: "run.reconciled", ObservedAt: time.Now().UTC()}); err != nil {
 					return err

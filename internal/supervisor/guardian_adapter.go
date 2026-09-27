@@ -64,7 +64,7 @@ func (g *guardedExecutor) Start(id string, spec model.RunSpec, stdout, stderr io
 	return p, nil
 }
 
-func (g *guardedExecutor) Reconcile(id string, owned model.Ownership, interactive bool, stdout, stderr io.Writer) (reconcileResult, error) {
+func (g *guardedExecutor) Reconcile(id string, owned *model.Ownership, interactive bool, stdout, stderr io.Writer) (reconcileResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	h, err := guardian.Reattach(ctx, g.runDir(id), id)
@@ -74,6 +74,9 @@ func (g *guardedExecutor) Reconcile(id string, owned model.Ownership, interactiv
 	snap, err := h.Observe(ctx)
 	if err != nil {
 		return reconcileResult{}, err
+	}
+	if owned != nil && (snap.Ownership == nil || *snap.Ownership != *owned) {
+		return reconcileResult{}, errors.New("durable ownership mismatch")
 	}
 	if snap.State == model.Terminal && snap.Receipt != nil && snap.Receipt.Cleanup == "complete" {
 		p := newGuardianPhysical(h, interactive, stdout, stderr)
@@ -85,7 +88,7 @@ func (g *guardedExecutor) Reconcile(id string, owned model.Ownership, interactiv
 		if snap.LimitOutcome != "" {
 			outcome = snap.LimitOutcome
 		}
-		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}}, nil
+		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason}, nil
 	}
 	if snap.Ownership == nil {
 		return reconcileResult{}, errors.New("guardian ownership absent")
@@ -98,15 +101,12 @@ func (g *guardedExecutor) Reconcile(id string, owned model.Ownership, interactiv
 	if err != nil || !osEvidence.OwnershipProven || (osEvidence.State != model.Running && osEvidence.State != model.Terminating) {
 		return reconcileResult{}, errors.New("OS ownership not proven")
 	}
-	if *snap.Ownership != owned {
-		return reconcileResult{}, errors.New("durable ownership mismatch")
-	}
 	p := newGuardianPhysical(h, interactive, stdout, stderr)
 	p.ownership = *snap.Ownership
 	if err := p.syncOutput(); err != nil {
 		return reconcileResult{}, err
 	}
-	return reconcileResult{live: true, process: p}, nil
+	return reconcileResult{live: true, process: p, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason}, nil
 }
 
 type outputGapRecorder interface{ RecordGap(int64) error }
