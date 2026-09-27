@@ -160,6 +160,7 @@ See:
 - [Architecture](docs/ARCHITECTURE.md)
 - [Runtime contract](docs/RUNTIME_CONTRACT.md)
 - [Implementation plan](docs/IMPLEMENTATION.md)
+- [Wave 2 — Linux hardening and evidence runtime](docs/WAVE2.md)
 
 ## Explicit non-goals
 
@@ -179,7 +180,7 @@ A harness may choose to route tool execution through Jinushi to make those execu
 
 ## Initial implementation direction
 
-Jinushi is implemented in Go and targets Linux and Windows first.
+Jinushi is implemented in Go. Linux is the primary supported development target. The existing Windows backend is retained as an experimental, frozen implementation; Wave 2 does not require Windows feature parity or new Windows capability work.
 
 The initial product milestone includes:
 
