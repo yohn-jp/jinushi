@@ -1,8 +1,11 @@
 package store
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -82,6 +85,7 @@ type telemetryMeta struct {
 	LastSequence         uint64     `json:"lastSequence"`
 	CompactionGeneration uint64     `json:"compactionGeneration"`
 	LastObservedAt       *time.Time `json:"lastObservedAt,omitempty"`
+	LastSampleHash       string     `json:"lastSampleHash,omitempty"`
 	NextGapID            uint64     `json:"nextGapId"`
 	RawCount             int        `json:"rawCount"`
 	RawBytes             int64      `json:"rawBytes"`
@@ -272,12 +276,9 @@ func (s *Store) AppendTelemetry(runID string, sample model.TelemetrySample) (mod
 		if err != nil {
 			return err
 		}
-		if meta.LastSequence == math.MaxUint64 {
-			return fmt.Errorf("%w: telemetry sequence is exhausted", ErrInvalidTelemetry)
-		}
 		sample.RunID = runID
 		sample.Version = model.TelemetrySchemaVersion
-		sample.Sequence = meta.LastSequence + 1
+		sample.Sequence = 1
 		sample.ObservedAt = sample.ObservedAt.UTC()
 		for i := range sample.ProcessChanges {
 			sample.ProcessChanges[i].ObservedAt = sample.ProcessChanges[i].ObservedAt.UTC()
@@ -288,6 +289,49 @@ func (s *Store) AppendTelemetry(runID string, sample model.TelemetrySample) (mod
 		if meta.LastObservedAt != nil && sample.ObservedAt.Before(*meta.LastObservedAt) {
 			return fmt.Errorf("%w: observation time moved backwards", ErrInvalidTelemetry)
 		}
+		sample.Sequence = 0
+		identity, sampleHash, err := telemetrySampleIdentity(sample)
+		if err != nil {
+			return fmt.Errorf("identify telemetry sample: %w", err)
+		}
+		if meta.LastObservedAt != nil && sample.ObservedAt.Equal(*meta.LastObservedAt) {
+			if meta.LastSampleHash == sampleHash {
+				sample.Sequence = meta.LastSequence
+				appended = sample
+				return nil
+			}
+			// Metadata written before idempotency hashes were introduced can be
+			// upgraded from the newest retained sample when that sample is still
+			// available. New writes always persist LastSampleHash, including when
+			// raw retention immediately compacts the point.
+			if meta.LastSampleHash == "" {
+				key, data := raw.Cursor().Last()
+				if key != nil && data != nil {
+					var previous model.TelemetrySample
+					if err := json.Unmarshal(data, &previous); err != nil {
+						return fmt.Errorf("decode latest telemetry sample for retry detection: %w", err)
+					}
+					previous.Sequence = 0
+					previousIdentity, _, err := telemetrySampleIdentity(previous)
+					if err != nil {
+						return fmt.Errorf("identify latest telemetry sample: %w", err)
+					}
+					if bytes.Equal(identity, previousIdentity) {
+						meta.LastSampleHash = sampleHash
+						if err := persistTelemetryMeta(run, meta); err != nil {
+							return err
+						}
+						sample.Sequence = meta.LastSequence
+						appended = sample
+						return nil
+					}
+				}
+			}
+		}
+		if meta.LastSequence == math.MaxUint64 {
+			return fmt.Errorf("%w: telemetry sequence is exhausted", ErrInvalidTelemetry)
+		}
+		sample.Sequence = meta.LastSequence + 1
 		encoded, err := json.Marshal(sample)
 		if err != nil {
 			return fmt.Errorf("encode telemetry sample: %w", err)
@@ -301,6 +345,7 @@ func (s *Store) AppendTelemetry(runID string, sample model.TelemetrySample) (mod
 		meta.LastSequence = sample.Sequence
 		observedAt := sample.ObservedAt.UTC()
 		meta.LastObservedAt = &observedAt
+		meta.LastSampleHash = sampleHash
 		meta.RawCount++
 		meta.RawBytes += int64(len(encoded) + 8)
 		for meta.RawCount > options.RawSamples || meta.RawBytes > options.RawBytes {
@@ -344,6 +389,16 @@ func (s *Store) AppendTelemetry(runID string, sample model.TelemetrySample) (mod
 		return model.TelemetrySample{}, err
 	}
 	return appended, nil
+}
+
+func telemetrySampleIdentity(sample model.TelemetrySample) ([]byte, string, error) {
+	sample.Sequence = 0
+	encoded, err := json.Marshal(sample)
+	if err != nil {
+		return nil, "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return encoded, hex.EncodeToString(digest[:]), nil
 }
 
 // AppendTelemetryGap records a known interval where sampling or process

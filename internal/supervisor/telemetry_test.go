@@ -228,3 +228,36 @@ func TestRecoveredTelemetryPersistsOneLifecycleGapAndSeparateSample(t *testing.T
 		t.Fatalf("recovery journal contains unexpected events: %+v", journal)
 	}
 }
+
+func TestTelemetryAppendCrashBeforeRunUpdateIsIdempotentOnReconcile(t *testing.T) {
+	runID := "run_telemetry_append_crash"
+	at := time.Now().UTC()
+	sample := measuredTelemetryFixture(runID, at)
+	svc, _ := newTelemetryFixture(t, runID, sample)
+	if appended, err := svc.store.AppendTelemetry(runID, sample); err != nil || appended.Sequence != 1 {
+		t.Fatalf("pre-crash telemetry append = sequence %d, err=%v", appended.Sequence, err)
+	}
+	// The stored Run still has no LastResourceSampleAt, matching a crash after
+	// AppendTelemetry committed but before the Supervisor Run update committed.
+	staleRun, err := svc.store.Get(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleRun.LastResourceSampleAt != nil {
+		t.Fatalf("fixture unexpectedly committed Run sample watermark: %v", staleRun.LastResourceSampleAt)
+	}
+	events := svc.recoveredResourceEvents(&staleRun, reconcileResult{telemetry: &sample})
+	if _, err := svc.store.UpdateWithEvents(staleRun, events); err != nil {
+		t.Fatal(err)
+	}
+	telemetry, err := svc.store.QueryTelemetry(model.TelemetryQuery{RunID: runID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(telemetry.Samples) != 1 || telemetry.Samples[0].Sequence != 1 {
+		t.Fatalf("reconcile duplicated the sample after the crash window: %#v", telemetry.Samples)
+	}
+	if staleRun.LastResourceSampleAt == nil || !staleRun.LastResourceSampleAt.Equal(at) {
+		t.Fatalf("reconcile did not import the durable sample watermark: %v", staleRun.LastResourceSampleAt)
+	}
+}

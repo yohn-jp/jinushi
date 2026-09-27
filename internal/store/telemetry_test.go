@@ -183,6 +183,51 @@ func TestTelemetryAdaptiveCompactionPreservesCounterSpikeAndSequence(t *testing.
 	}
 }
 
+func TestAppendTelemetryExactLatestSampleIsIdempotent(t *testing.T) {
+	db, err := Open(t.TempDir()+"/state.db", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	run, _, err := db.Create(testRun("run-telemetry-retry"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC()
+	sample := testTelemetrySample(at, 4096, 88)
+	first, err := db.AppendTelemetry(run.ID, sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := db.AppendTelemetry(run.ID, sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Sequence != 1 || retry.Sequence != first.Sequence {
+		t.Fatalf("exact append retry sequences = %d then %d, want same sequence", first.Sequence, retry.Sequence)
+	}
+	changed := sample
+	changed.Resources.MemoryBytes.Value++
+	second, err := db.AppendTelemetry(run.ID, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedRetry, err := db.AppendTelemetry(run.ID, changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Sequence != 2 || changedRetry.Sequence != second.Sequence {
+		t.Fatalf("changed same-time append sequences = %d then %d, want same second sequence", second.Sequence, changedRetry.Sequence)
+	}
+	response, err := db.QueryTelemetry(model.TelemetryQuery{RunID: run.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Samples) != 2 || response.Samples[0].Sequence != 1 || response.Samples[1].Sequence != 2 {
+		t.Fatalf("retry produced duplicate telemetry points: %#v", response.Samples)
+	}
+}
+
 func TestTelemetryQueryCursorAndGapCompactionAreExplicit(t *testing.T) {
 	db, err := Open(t.TempDir()+"/state.db", Options{})
 	if err != nil {
