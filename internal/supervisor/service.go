@@ -1481,7 +1481,7 @@ func (s *Service) recoveredResourceEvents(run *model.Run, result reconcileResult
 	var events []model.Event
 	if gapNeeded {
 		_ = s.recordTelemetryGap(run, sample.ObservedAt, "supervisor-unavailable", false)
-		latest := normalizeResources(sample.Resources, s.backend.Capabilities(), s.config.SampleIntervalMs)
+		latest := sample.Resources
 		latest.SampleIntervalMs = s.config.SampleIntervalMs
 		to := sample.ObservedAt
 		events = append(events, model.Event{
