@@ -1,6 +1,8 @@
 name: Go development release
 
-# Managed by yohn-jp/.github after Jinushi joins the organization sync target.
+# Canonical wrapper managed by yohn-jp/.github. Jinushi keeps only the product
+# build target here; build, verification, artifact integrity, and dev release
+# allocation remain owned by the shared reusable workflow.
 on:
   push:
     branches: [main]
