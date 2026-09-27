@@ -76,7 +76,7 @@ func TestParseCPUQuotaAndFiniteLimits(t *testing.T) {
 }
 
 func TestPhysicalControlsAreCapabilityGatedByDelegatedCgroup(t *testing.T) {
-	process, err := New().Start(testSpec(t, "/run/current-system/sw/bin/sleep", "30"), io.Discard, io.Discard)
+	process, err := New().Start(testSpec(t, "/bin/sleep", "30"), io.Discard, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestRecoverGuardianLossTerminatesOnlyProvenOwnedTree(t *testing.T) {
 }
 
 func TestRecoverGuardianLossDoesNotTargetUnprovenOwnership(t *testing.T) {
-	process, err := New().Start(testSpec(t, "/run/current-system/sw/bin/sleep", "30"), io.Discard, io.Discard)
+	process, err := New().Start(testSpec(t, "/bin/sleep", "30"), io.Discard, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestRecoverGuardianLossDoesNotTargetUnprovenOwnership(t *testing.T) {
 }
 
 func TestControlInputRejectsNonFiniteValues(t *testing.T) {
-	process, err := New().Start(testSpec(t, "/run/current-system/sw/bin/sleep", "30"), io.Discard, io.Discard)
+	process, err := New().Start(testSpec(t, "/bin/sleep", "30"), io.Discard, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
