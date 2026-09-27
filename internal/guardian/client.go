@@ -263,7 +263,7 @@ func randomToken() (string, error) {
 
 func unavailableResources() model.Resources {
 	metric := model.Metric{Status: "unavailable"}
-	return model.Resources{MemoryBytes: metric, PeakMemoryBytes: metric, CPUTimeNs: metric, ProcessCount: metric, PeakProcessCount: metric}
+	return model.Resources{MemoryBytes: metric, PeakMemoryBytes: metric, CPUTimeNs: metric, ProcessCount: metric, PeakProcessCount: metric, TaskCount: metric, PeakTaskCount: metric}
 }
 
 func unavailableResourcesFor(sampleIntervalMs int64) model.Resources {

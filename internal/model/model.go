@@ -347,6 +347,7 @@ type Capabilities struct {
 	MemoryTelemetry       bool     `json:"memoryTelemetry"`
 	CPUTelemetry          bool     `json:"cpuTelemetry"`
 	ProcessTelemetry      bool     `json:"processTelemetry"`
+	TaskTelemetry         bool     `json:"taskTelemetry"`
 	RestartReconciliation string   `json:"restartReconciliation"`
 	Signals               []string `json:"signals"`
 }

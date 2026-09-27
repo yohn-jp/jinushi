@@ -356,14 +356,33 @@ func TestUnavailableCurrentPreservesUnsupportedAndDoesNotReuseMeasuredCPU(t *tes
 		MemoryBytes:     model.Metric{Status: "unsupported"},
 		CPUTimeNs:       model.Metric{Status: "measured", Value: 42},
 		ProcessCount:    model.Metric{Status: "measured", Value: 2},
+		TaskCount:       model.Metric{Status: "measured", Value: 4},
 		PeakMemoryBytes: model.Metric{Status: "measured", Value: 99},
 	}
 	got := unavailableCurrent(previous)
-	if got.MemoryBytes.Status != "unsupported" || got.CPUTimeNs.Status != "unavailable" || got.ProcessCount.Status != "unavailable" {
+	if got.MemoryBytes.Status != "unsupported" || got.CPUTimeNs.Status != "unavailable" || got.ProcessCount.Status != "unavailable" || got.TaskCount.Status != "unavailable" {
 		t.Fatalf("failed current observation status = %+v", got)
 	}
 	if got.PeakMemoryBytes != previous.PeakMemoryBytes {
 		t.Fatalf("historical peak changed: %+v", got.PeakMemoryBytes)
+	}
+}
+
+func TestMergeResourcesKeepsTaskPeakAndUnsupportedDistinct(t *testing.T) {
+	previous := unavailableResources()
+	measured := model.Resources{TaskCount: model.Metric{Status: "measured", Value: 5}}
+	caps := &model.Capabilities{TaskTelemetry: true}
+	first := mergeResources(previous, measured, 250, caps)
+	if first.TaskCount.Status != "measured" || first.PeakTaskCount.Value != 5 {
+		t.Fatalf("measured task evidence was lost: %+v", first)
+	}
+	second := mergeResources(first, model.Resources{TaskCount: model.Metric{Status: "measured", Value: 2}}, 250, caps)
+	if second.TaskCount.Value != 2 || second.PeakTaskCount.Value != 5 {
+		t.Fatalf("task peak was not preserved: %+v", second)
+	}
+	unsupported := mergeResources(previous, model.Resources{}, 250, &model.Capabilities{})
+	if unsupported.TaskCount.Status != "unsupported" || unsupported.PeakTaskCount.Status != "unsupported" {
+		t.Fatalf("unsupported task telemetry was not explicit: %+v", unsupported)
 	}
 }
 

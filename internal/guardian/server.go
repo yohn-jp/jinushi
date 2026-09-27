@@ -260,7 +260,7 @@ func (s *runState) observe() (Snapshot, error) {
 		observedAt := time.Now().UTC()
 		s.snapshot.LastResourceSampleAt = &observedAt
 		if observeErr == nil {
-			s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources, s.descriptor.SampleIntervalMs)
+			s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources, s.descriptor.SampleIntervalMs, s.snapshot.EffectiveCapabilities)
 		} else {
 			s.snapshot.Resources = unavailableCurrent(s.snapshot.Resources)
 		}
@@ -511,7 +511,7 @@ func (s *runState) sample() {
 	observedAt := time.Now().UTC()
 	s.snapshot.LastResourceSampleAt = &observedAt
 	if observeErr == nil {
-		s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources, s.descriptor.SampleIntervalMs)
+		s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources, s.descriptor.SampleIntervalMs, s.snapshot.EffectiveCapabilities)
 	} else {
 		s.snapshot.Resources = unavailableCurrent(s.snapshot.Resources)
 	}
@@ -550,7 +550,7 @@ func (s *runState) finish(exit backend.Exit) bool {
 	observedAt := time.Now().UTC()
 	s.snapshot.LastResourceSampleAt = &observedAt
 	if observeErr == nil {
-		resources = mergeResources(s.snapshot.Resources, observed, s.descriptor.SampleIntervalMs)
+		resources = mergeResources(s.snapshot.Resources, observed, s.descriptor.SampleIntervalMs, s.snapshot.EffectiveCapabilities)
 	} else {
 		resources = unavailableCurrent(resources)
 	}
@@ -805,10 +805,21 @@ func timePtrOrNil(value time.Time) *time.Time {
 	return &value
 }
 
-func mergeResources(previous, current model.Resources, sampleIntervalMs int64) model.Resources {
+func mergeResources(previous, current model.Resources, sampleIntervalMs int64, capabilities *model.Capabilities) model.Resources {
+	taskSupported := current.TaskCount.Status != ""
+	if capabilities != nil {
+		taskSupported = capabilities.TaskTelemetry
+	}
+	if !taskSupported {
+		current.TaskCount = model.Metric{Status: "unsupported"}
+		current.PeakTaskCount = model.Metric{Status: "unsupported"}
+	} else if current.TaskCount.Status == "" {
+		current.TaskCount = model.Metric{Status: "unavailable"}
+	}
 	out := current
 	out.PeakMemoryBytes = maxMetric(previous.PeakMemoryBytes, current.PeakMemoryBytes, current.MemoryBytes)
 	out.PeakProcessCount = maxMetric(previous.PeakProcessCount, current.PeakProcessCount, current.ProcessCount)
+	out.PeakTaskCount = maxMetric(previous.PeakTaskCount, current.PeakTaskCount, current.TaskCount)
 	if current.CPUTimeNs.Status == "measured" || current.CPUTimeNs.Status == "unsupported" {
 		out.CPUTimeNs = current.CPUTimeNs
 	} else if previous.CPUTimeNs.Status == "measured" {
@@ -836,7 +847,7 @@ func maxMetric(previous, reported, current model.Metric) model.Metric {
 
 func unavailableCurrent(previous model.Resources) model.Resources {
 	out := previous
-	for _, metric := range []*model.Metric{&out.MemoryBytes, &out.CPUTimeNs, &out.ProcessCount} {
+	for _, metric := range []*model.Metric{&out.MemoryBytes, &out.CPUTimeNs, &out.ProcessCount, &out.TaskCount} {
 		if metric.Status != "unsupported" {
 			*metric = model.Metric{Status: "unavailable"}
 		}

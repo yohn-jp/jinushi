@@ -148,7 +148,7 @@ func initialResources(c model.Capabilities, sampleIntervalMs int64) model.Resour
 		}
 		return model.Metric{Status: "unsupported"}
 	}
-	return model.Resources{MemoryBytes: metric(c.MemoryTelemetry), PeakMemoryBytes: metric(c.MemoryTelemetry), CPUTimeNs: metric(c.CPUTelemetry), ProcessCount: metric(c.ProcessTelemetry), PeakProcessCount: metric(c.ProcessTelemetry), TaskCount: metric(c.ProcessTelemetry), PeakTaskCount: metric(c.ProcessTelemetry), SampleIntervalMs: sampleIntervalMs}
+	return model.Resources{MemoryBytes: metric(c.MemoryTelemetry), PeakMemoryBytes: metric(c.MemoryTelemetry), CPUTimeNs: metric(c.CPUTelemetry), ProcessCount: metric(c.ProcessTelemetry), PeakProcessCount: metric(c.ProcessTelemetry), TaskCount: metric(c.TaskTelemetry), PeakTaskCount: metric(c.TaskTelemetry), SampleIntervalMs: sampleIntervalMs}
 }
 
 func normalizeResources(r model.Resources, c model.Capabilities, sampleIntervalMs int64) model.Resources {
@@ -595,6 +595,9 @@ func (s *Service) sample(a *active) {
 			if a.run.Resources.ProcessCount.Status != "unsupported" {
 				a.run.Resources.ProcessCount = model.Metric{Status: "unavailable"}
 			}
+			if a.run.Resources.TaskCount.Status != "unsupported" {
+				a.run.Resources.TaskCount = model.Metric{Status: "unavailable"}
+			}
 			a.run.LastResourceSampleAt = &now
 			resources := a.run.Resources
 			_, _ = s.store.Update(a.run, &model.Event{Kind: model.EventResourceUnavailable, ObservedAt: now, Payload: &model.EventPayload{Resource: &model.ResourceEventPayload{Resources: resources}}})
@@ -627,6 +630,12 @@ func (s *Service) sample(a *active) {
 	}
 	if a.run.Resources.PeakProcessCount.Status == "measured" && r.PeakProcessCount.Value < a.run.Resources.PeakProcessCount.Value {
 		r.PeakProcessCount = a.run.Resources.PeakProcessCount
+	}
+	if r.PeakTaskCount.Status != "measured" && r.TaskCount.Status == "measured" {
+		r.PeakTaskCount = r.TaskCount
+	}
+	if a.run.Resources.PeakTaskCount.Status == "measured" && r.PeakTaskCount.Value < a.run.Resources.PeakTaskCount.Value {
+		r.PeakTaskCount = a.run.Resources.PeakTaskCount
 	}
 	a.run.Resources = r
 	a.run.LastResourceSampleAt = &now

@@ -60,6 +60,7 @@ func (*Backend) Capabilities() model.Capabilities {
 		MemoryTelemetry:         true,
 		CPUTelemetry:            true,
 		ProcessTelemetry:        true,
+		TaskTelemetry:           true,
 		ProcessCountEnforcement: false,
 		RestartReconciliation:   "process-subreaper-tree",
 		Signals:                 []string{"SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"},
