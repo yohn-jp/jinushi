@@ -822,6 +822,140 @@ func TestSupervisorCrashRestartReconcilesLiveRun(t *testing.T) {
 	}
 }
 
+func TestSupervisorRestartDoesNotDuplicateRunOutput(t *testing.T) {
+	h := newHarness(t)
+	gate := filepath.Join(t.TempDir(), "write-suffix")
+	prefix := "output-before-supervisor-restart:"
+	suffix := "output-after-supervisor-restart"
+	script := `printf '%s' "$2"; while [ ! -e "$1" ]; do sleep 0.02; done; printf '%s' "$3"`
+	started := h.run("--", "/bin/sh", "-c", script, "jinushi-output-cursor", gate, prefix, suffix)
+	h.waitUntil("pre-restart prefix to enter the durable Run output", 10*time.Second, func() bool {
+		current := h.inspect(started.ID)
+		return current.State == "running" && current.Output.Stdout.ObservedBytes >= int64(len(prefix))
+	})
+	beforeRestart := h.inspect(started.ID)
+	if beforeRestart.Output.Stdout.ObservedBytes != int64(len(prefix)) {
+		t.Fatalf("held workload wrote beyond its pre-restart prefix: %+v", beforeRestart.Output.Stdout)
+	}
+	preRestartBytes, preRestartOutput := readRunStdout(t, h, started.ID, 1024)
+	if preRestartOutput.Gap || !bytes.Equal(preRestartBytes, []byte(prefix)) {
+		t.Fatalf("Store did not contain the exact prefix before Supervisor restart: data=%q metadata=%+v", preRestartBytes, preRestartOutput)
+	}
+
+	supervisorDown := false
+	t.Cleanup(func() {
+		if supervisorDown && h.sup == nil {
+			h.startSupervisor()
+			supervisorDown = false
+		}
+	})
+	h.stopSupervisor(true)
+	supervisorDown = true
+	h.startSupervisor()
+	supervisorDown = false
+
+	afterRestart := h.inspect(started.ID)
+	if afterRestart.State != "running" || afterRestart.Output.Stdout.ObservedBytes != int64(len(prefix)) {
+		t.Fatalf("Supervisor reconciliation changed the persisted output cursor: state=%s output=%+v", afterRestart.State, afterRestart.Output.Stdout)
+	}
+	resumedBytes, resumedOutput := readRunStdout(t, h, started.ID, 1024)
+	if resumedOutput.Gap || !bytes.Equal(resumedBytes, []byte(prefix)) {
+		t.Fatalf("reconciled Store output duplicated or lost the pre-restart prefix: data=%q metadata=%+v", resumedBytes, resumedOutput)
+	}
+	if err := os.WriteFile(gate, []byte("continue"), 0600); err != nil {
+		t.Fatalf("release post-restart output suffix: %v", err)
+	}
+
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code != 0 || completed.Receipt.Outcome != "exited" || completed.Receipt.ExitCode == nil || *completed.Receipt.ExitCode != 0 {
+		t.Fatalf("output cursor Run did not exit cleanly: code=%d receipt=%+v", code, completed.Receipt)
+	}
+	expected := []byte(prefix + suffix)
+	if completed.Output.Stdout.ObservedBytes != int64(len(expected)) || completed.Output.Stdout.Truncated {
+		t.Fatalf("output byte accounting changed across restart: %+v, expected %d bytes", completed.Output.Stdout, len(expected))
+	}
+	finalBytes, finalOutput := readRunStdout(t, h, started.ID, 1024)
+	if finalOutput.Gap || !bytes.Equal(finalBytes, expected) {
+		t.Fatalf("final stdout differs from the exact prefix+suffix once: got=%q want=%q metadata=%+v", finalBytes, expected, finalOutput)
+	}
+}
+
+func TestSupervisorRestartPreservesTruncatedOutputCursor(t *testing.T) {
+	h := newHarness(t)
+	gate := filepath.Join(t.TempDir(), "write-suffix")
+	const retention = int64(64)
+	// OutputBytes is an aggregate Run ceiling divided across stdout, stderr,
+	// and PTY retention by the Store, so reserve three stream ceilings here.
+	const outputLimit = retention * 3
+	prefix := strings.Repeat("P", 160)
+	suffix := strings.Repeat("S", 32)
+	script := `printf '%s' "$2"; while [ ! -e "$1" ]; do sleep 0.02; done; printf '%s' "$3"`
+	started := h.run("--output-bytes", strconv.FormatInt(outputLimit, 10), "--", "/bin/sh", "-c", script, "jinushi-truncated-output", gate, prefix, suffix)
+	h.waitUntil("truncated pre-restart prefix to enter the durable Run output", 10*time.Second, func() bool {
+		current := h.inspect(started.ID)
+		return current.State == "running" && current.Output.Stdout.ObservedBytes >= int64(len(prefix))
+	})
+	beforeRestart := h.inspect(started.ID)
+	if beforeRestart.Output.Stdout.ObservedBytes != int64(len(prefix)) || beforeRestart.Output.Stdout.RetainedBytes != retention || !beforeRestart.Output.Stdout.Truncated {
+		t.Fatalf("pre-restart output did not reach its expected retention bound: %+v", beforeRestart.Output.Stdout)
+	}
+	preRestartBytes, preRestartOutput := readRunStdout(t, h, started.ID, 1024)
+	if !preRestartOutput.Gap || preRestartOutput.RetainedFrom != uint64(len(prefix))-uint64(retention) || string(preRestartBytes) != strings.Repeat("P", int(retention)) {
+		t.Fatalf("pre-restart truncation metadata/data were inconsistent: data=%q response=%+v", preRestartBytes, preRestartOutput)
+	}
+
+	supervisorDown := false
+	t.Cleanup(func() {
+		if supervisorDown && h.sup == nil {
+			h.startSupervisor()
+			supervisorDown = false
+		}
+	})
+	h.stopSupervisor(true)
+	supervisorDown = true
+	h.startSupervisor()
+	supervisorDown = false
+
+	afterRestart := h.inspect(started.ID)
+	if afterRestart.State != "running" || afterRestart.Output.Stdout.ObservedBytes != int64(len(prefix)) || afterRestart.Output.Stdout.RetainedBytes != retention || !afterRestart.Output.Stdout.Truncated {
+		t.Fatalf("Supervisor reconciliation changed truncated output metadata: state=%s output=%+v", afterRestart.State, afterRestart.Output.Stdout)
+	}
+	resumedBytes, resumedOutput := readRunStdout(t, h, started.ID, 1024)
+	if !resumedOutput.Gap || resumedOutput.RetainedFrom != preRestartOutput.RetainedFrom || !bytes.Equal(resumedBytes, preRestartBytes) {
+		t.Fatalf("reconciled Store changed pre-restart truncated output: data=%q response=%+v", resumedBytes, resumedOutput)
+	}
+	if err := os.WriteFile(gate, []byte("continue"), 0600); err != nil {
+		t.Fatalf("release post-restart truncated output suffix: %v", err)
+	}
+
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code != 0 || completed.Receipt.Outcome != "exited" || completed.Receipt.ExitCode == nil || *completed.Receipt.ExitCode != 0 {
+		t.Fatalf("truncation output Run did not exit cleanly: code=%d receipt=%+v", code, completed.Receipt)
+	}
+	expected := []byte(prefix + suffix)
+	if completed.Output.Stdout.ObservedBytes != int64(len(expected)) || completed.Output.Stdout.RetainedBytes != retention || !completed.Output.Stdout.Truncated || completed.Output.Stdout.RetainedFrom != int64(len(expected))-retention {
+		t.Fatalf("final truncation metadata changed across restart: %+v, expected %d observed / %d retained", completed.Output.Stdout, len(expected), retention)
+	}
+	finalBytes, finalOutput := readRunStdout(t, h, started.ID, 1024)
+	wantTail := expected[len(expected)-int(retention):]
+	if !finalOutput.Gap || finalOutput.RetainedFrom != uint64(len(expected))-uint64(retention) || !bytes.Equal(finalBytes, wantTail) {
+		t.Fatalf("final retained output is not the exact truncated tail: got=%q want=%q response=%+v", finalBytes, wantTail, finalOutput)
+	}
+}
+
+func readRunStdout(t *testing.T, h *harness, id string, limit int64) ([]byte, response) {
+	t.Helper()
+	code, _, result := h.invoke(5*time.Second, "output", "--state-dir", h.stateDir, "--stream", "stdout", "--offset", "0", "--limit", strconv.FormatInt(limit, 10), "--json", id)
+	if code != 0 || result.Error != nil {
+		t.Fatalf("read stdout for Run %s: exit=%d response=%+v", id, code, result)
+	}
+	data, err := base64.StdEncoding.DecodeString(result.Data)
+	if err != nil {
+		t.Fatalf("decode stdout for Run %s: %v; response=%+v", id, err, result)
+	}
+	return data, result
+}
+
 func TestConcurrentRunsRemainIsolated(t *testing.T) {
 	h := newHarness(t)
 	const count = 12
