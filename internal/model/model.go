@@ -100,24 +100,26 @@ type Receipt struct {
 }
 
 type Run struct {
-	ID                  string     `json:"runId"`
-	Spec                RunSpec    `json:"spec"`
-	State               State      `json:"state"`
-	Generation          uint64     `json:"generation"`
-	CreatedAt           time.Time  `json:"createdAt"`
-	StartedAt           *time.Time `json:"startedAt,omitempty"`
-	FinishedAt          *time.Time `json:"finishedAt,omitempty"`
-	Ownership           *Ownership `json:"ownership,omitempty"`
-	Resources           Resources  `json:"resources"`
-	Output              Output     `json:"output"`
-	Receipt             *Receipt   `json:"receipt,omitempty"`
-	LeaseGeneration     uint64     `json:"leaseGeneration,omitempty"`
-	LeaseExpiry         *time.Time `json:"leaseExpiry,omitempty"`
-	LastOutputAt        *time.Time `json:"lastOutputAt,omitempty"`
-	LastCPUActivityAt   *time.Time `json:"lastCpuActivityAt,omitempty"`
-	LastProcessChangeAt *time.Time `json:"lastProcessChangeAt,omitempty"`
-	TerminationReason   string     `json:"terminationReason,omitempty"`
-	Attachments         int        `json:"attachments"`
+	ID                          string     `json:"runId"`
+	Spec                        RunSpec    `json:"spec"`
+	State                       State      `json:"state"`
+	Generation                  uint64     `json:"generation"`
+	CreatedAt                   time.Time  `json:"createdAt"`
+	StartedAt                   *time.Time `json:"startedAt,omitempty"`
+	FinishedAt                  *time.Time `json:"finishedAt,omitempty"`
+	Ownership                   *Ownership `json:"ownership,omitempty"`
+	Resources                   Resources  `json:"resources"`
+	Output                      Output     `json:"output"`
+	Receipt                     *Receipt   `json:"receipt,omitempty"`
+	LeaseGeneration             uint64     `json:"leaseGeneration,omitempty"`
+	LeaseExpiry                 *time.Time `json:"leaseExpiry,omitempty"`
+	LastLeaseExpectedGeneration uint64     `json:"lastLeaseExpectedGeneration,omitempty"`
+	LastLeaseMs                 int64      `json:"lastLeaseMs,omitempty"`
+	LastOutputAt                *time.Time `json:"lastOutputAt,omitempty"`
+	LastCPUActivityAt           *time.Time `json:"lastCpuActivityAt,omitempty"`
+	LastProcessChangeAt         *time.Time `json:"lastProcessChangeAt,omitempty"`
+	TerminationReason           string     `json:"terminationReason,omitempty"`
+	Attachments                 int        `json:"attachments"`
 }
 
 type Event struct {

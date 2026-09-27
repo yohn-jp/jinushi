@@ -976,6 +976,16 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	if a.run.Spec.Lifetime.Mode != "lease-bound" {
 		return failure("invalid-request", "Run is detached")
 	}
+	if a.run.LeaseExpiry != nil && time.Now().After(*a.run.LeaseExpiry) {
+		go s.terminate(a, "lease-expired")
+		return failure("lease-expired", "lease has expired")
+	}
+	if a.run.LeaseGeneration == req.LeaseGeneration+1 && a.run.LastLeaseExpectedGeneration == req.LeaseGeneration && a.run.LastLeaseMs == req.LeaseMs {
+		out = response()
+		r := publicRun(a.run)
+		out.Run = &r
+		return out
+	}
 	if a.run.LeaseGeneration != req.LeaseGeneration {
 		return failure("stale-generation", "stale lease generation")
 	}
@@ -983,6 +993,8 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 		return failure("already-terminal", "Run is terminating")
 	}
 	next := a.run
+	next.LastLeaseExpectedGeneration = req.LeaseGeneration
+	next.LastLeaseMs = req.LeaseMs
 	next.LeaseGeneration++
 	expiry := time.Now().UTC().Add(time.Duration(req.LeaseMs) * time.Millisecond)
 	next.LeaseExpiry = &expiry
