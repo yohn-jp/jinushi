@@ -80,7 +80,7 @@ func (s *Service) queryTelemetry(req protocol.Request) protocol.Response {
 		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrRunNotFound):
-				return failure("run-not-found", "Run not found")
+				return s.missingRunFailure(query.RunID, "Run or telemetry history not found")
 			case errors.Is(err, store.ErrTelemetryCursorStale):
 				return failure("stale-telemetry-cursor", "telemetry cursor is stale after compaction")
 			case errors.Is(err, store.ErrInvalidTelemetry):

@@ -83,6 +83,7 @@ func TestRetentionCollectionKeepsQueryableIncompleteTombstone(t *testing.T) {
 	for _, request := range []protocol.Request{
 		{Version: model.ProtocolVersion, Op: "events", RunID: run.ID},
 		{Version: model.ProtocolVersion, Op: "output", RunID: run.ID, Stream: "stdout"},
+		{Version: model.ProtocolVersion, Op: "telemetry", RunID: run.ID, TelemetryQuery: &model.TelemetryQuery{RunID: run.ID}},
 	} {
 		response := svc.Handle(context.Background(), request)
 		if response.Error == nil || response.Error.Code != "evidence-collected" || response.Tombstone == nil {
