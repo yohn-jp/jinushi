@@ -64,7 +64,7 @@ func (p *Process) Signal(name string) error {
 		}
 		return signalCgroup(p.cg, signal)
 	}
-	return signalSession(p.ownership, signal)
+	return signalOwnedTree(p.ownership, signal)
 }
 
 // LimitOutcome returns typed kernel evidence observed since this Run's cgroup
@@ -228,24 +228,13 @@ func (p *Process) Observe() (model.Resources, error) {
 		}
 		return p.observeCgroup(), nil
 	}
-	bootID, sessionID, err := parseOwnershipToken(p.ownership.Token)
-	if err != nil {
-		return unavailableResources(), err
-	}
-	currentBootID, err := readBootID()
-	if err != nil || currentBootID != bootID {
-		if err == nil {
-			err = errors.New("Linux boot identity changed")
-		}
-		return unavailableResources(), err
-	}
-	processes, err := scanSession(sessionID)
+	processes, err := scanOwnedTree(p.ownership)
 	if err != nil {
 		return unavailableResources(), err
 	}
 	resources := p.observeProcesses(processes)
 	if len(activeProcesses(processes)) == 0 {
-		// Session scans only see live processes. Once all members have exited,
+		// Process-table scans only see live processes. Once all members have exited,
 		// their cumulative CPU time is no longer observable without cgroup
 		// accounting; reporting the empty sum as measured zero would erase the
 		// last valid sample in the final receipt.
@@ -422,12 +411,16 @@ func (p *Process) waitForTreeEmpty() error {
 		if p.cg != nil {
 			empty, err = cgroupEmpty(p.cg)
 		} else {
-			_, sessionID, tokenErr := parseOwnershipToken(p.ownership.Token)
-			if tokenErr != nil {
-				return tokenErr
-			}
 			var processes []procInfo
-			processes, err = scanSession(sessionID)
+			processes, err = scanOwnedTree(p.ownership)
+			if err == nil {
+				parsed, parseErr := subreaperToken(p.ownership)
+				if parseErr != nil {
+					err = parseErr
+				} else if reapErr := reapAdoptedZombies(processes, parsed.Subreaper, p.ownership.PID, p.ownership.StartTime); reapErr != nil {
+					err = reapErr
+				}
+			}
 			empty = len(activeProcesses(processes)) == 0
 		}
 		if err != nil {

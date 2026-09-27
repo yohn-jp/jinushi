@@ -17,10 +17,11 @@ func (*Backend) Reconcile(owner model.Ownership) (backend.ReconcileResult, error
 	if owner.Backend != "linux" {
 		return uncertain("ownership backend is not Linux"), nil
 	}
-	bootID, sessionID, cgroupName, err := parseFullOwnershipToken(owner.Token)
+	token, err := parseLinuxOwnershipToken(owner.Token)
 	if err != nil {
 		return uncertain("Linux ownership token is invalid"), nil
 	}
+	bootID, sessionID, cgroupName := token.BootID, token.SessionID, token.CgroupName
 	currentBootID, err := readBootID()
 	if err != nil {
 		return uncertain("current Linux boot identity is unavailable"), nil
@@ -69,13 +70,12 @@ func (*Backend) Reconcile(owner model.Ownership) (backend.ReconcileResult, error
 	if cgroupName != "-" {
 		return uncertain("ownership token names a cgroup but no cgroup path was persisted"), nil
 	}
-	root, err := readProcInfo(owner.PID)
-	if err != nil || root.StartTime != owner.StartTime || root.Session != sessionID || root.ProcessGroup != owner.ProcessGroup {
-		return uncertain("root PID start-time/session identity cannot be revalidated without cgroup evidence"), nil
+	if token.Version != 2 || token.Subreaper.PID <= 0 || token.Subreaper.StartTime == 0 {
+		return uncertain("no-cgroup ownership lacks a validated Linux child-subreaper identity"), nil
 	}
-	processes, err := scanSession(sessionID)
+	processes, err := scanSubreaperTree(token.Subreaper)
 	if err != nil {
-		return uncertain("dedicated Linux session membership is incomplete"), nil
+		return uncertain("Linux child-subreaper descendants cannot be revalidated"), nil
 	}
 	resourceTotals := totals(processes)
 	resources := model.Resources{
@@ -86,7 +86,8 @@ func (*Backend) Reconcile(owner model.Ownership) (backend.ReconcileResult, error
 		PeakProcessCount: model.Metric{Status: "unavailable"},
 	}
 	if len(activeProcesses(processes)) == 0 {
-		return backend.ReconcileResult{State: model.Terminal, Resources: resources, OwnershipProven: true, Reason: "validated Linux session has no live processes"}, nil
+		resources.CPUTimeNs = model.Metric{Status: "unavailable"}
+		return backend.ReconcileResult{State: model.Terminal, Resources: resources, OwnershipProven: true, Reason: "validated Linux child-subreaper has no live Run descendants"}, nil
 	}
 	return backend.ReconcileResult{State: model.Running, Resources: resources, OwnershipProven: true}, nil
 }

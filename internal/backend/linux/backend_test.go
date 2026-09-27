@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,9 +17,22 @@ import (
 
 	"github.com/yohn-jp/jinushi/internal/backend"
 	"github.com/yohn-jp/jinushi/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 const memoryLimitChildEnv = "JINUSHI_MEMORY_LIMIT_CHILD"
+const escapedDescendantMarkerEnv = "JINUSHI_ESCAPED_DESCENDANT_MARKER"
+
+func TestMain(m *testing.M) {
+	wasSubreaper, err := childSubreaperEnabled()
+	code := m.Run()
+	if err == nil && !wasSubreaper {
+		if err := setChildSubreaper(false); err != nil {
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
 
 type lockedBuffer struct {
 	mu     sync.Mutex
@@ -94,6 +108,165 @@ func TestCompletedNoCgroupCPUTimeIsUnavailable(t *testing.T) {
 	}
 	if resources.CPUTimeNs.Status != "unavailable" {
 		t.Fatalf("an empty session cannot prove cumulative CPU time, got %+v", resources.CPUTimeNs)
+	}
+}
+
+func TestSetsidDescendantRemainsOwnedAfterRootExit(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "escaped-pid")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := testSpec(t, executable, "-test.run=^TestLinuxEscapedDescendantRootHelper$")
+	spec.Environment.Set = map[string]string{escapedDescendantMarkerEnv: marker}
+	process, err := New().Start(spec, io.Discard, io.Discard)
+	if errors.Is(err, ErrUnsupported) {
+		t.Skipf("kernel does not support required no-cgroup subreaper ownership: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	linuxProcess := process.(*Process)
+	t.Cleanup(func() {
+		result, err := process.Terminate(0)
+		if err != nil {
+			t.Errorf("cleanup escaped-descendant test Run: %v (result %+v)", err, result)
+		}
+		if !result.TreeEmpty {
+			t.Errorf("escaped-descendant test Run cleanup was not proven: %+v", result)
+		}
+	})
+	if linuxProcess.cg != nil {
+		result, err := process.Terminate(0)
+		if err != nil || !result.TreeEmpty {
+			t.Fatalf("cleanup before cgroup-only skip failed: %+v, %v", result, err)
+		}
+		t.Skip("setsid fallback proof requires a host without writable cgroup v2")
+	}
+
+	childPID := waitForMarkedPID(t, marker)
+	childInfo, err := readProcInfo(childPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processIsActive(childPID) {
+		t.Fatalf("setsid grandchild exited before ownership verification: %+v", childInfo)
+	}
+	owner := process.Ownership()
+	if childInfo.Session == owner.ProcessGroup {
+		t.Fatalf("grandchild did not escape the workload session: %+v", childInfo)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		root, err := readProcInfo(owner.PID)
+		if errors.Is(err, os.ErrNotExist) || err == nil && (root.State == 'Z' || root.State == 'X' || root.State == 'x') {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if root, err := readProcInfo(owner.PID); err == nil && root.State != 'Z' && root.State != 'X' && root.State != 'x' {
+		t.Fatalf("workload root did not exit before ownership check: %+v", root)
+	}
+
+	waitDone := make(chan backend.Exit, 1)
+	go func() {
+		exit, _ := process.Wait()
+		waitDone <- exit
+	}()
+	select {
+	case exit := <-waitDone:
+		t.Fatalf("Wait reported terminal while setsid descendant %d is active: %+v", childPID, exit)
+	case <-time.After(50 * time.Millisecond):
+	}
+	resources, err := process.Observe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.ProcessCount.Status != "measured" || resources.ProcessCount.Value < 1 {
+		t.Fatalf("observation missed setsid descendant after root exit: %+v", resources.ProcessCount)
+	}
+
+	reconciled, err := New().Reconcile(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.State != model.Running || !reconciled.OwnershipProven {
+		t.Fatalf("reconcile missed setsid descendant after root exit: %+v", reconciled)
+	}
+	parts := strings.Split(owner.Token, ";")
+	if len(parts) != 6 {
+		t.Fatalf("no-cgroup ownership token does not include subreaper identity: %q", owner.Token)
+	}
+	reaperStart, err := strconv.ParseUint(parts[5], 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts[5] = strconv.FormatUint(reaperStart+1, 10)
+	owner.Token = strings.Join(parts, ";")
+	uncertain, err := New().Reconcile(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uncertain.State != model.Uncertain || uncertain.OwnershipProven {
+		t.Fatalf("reconcile guessed after subreaper identity mismatch: %+v", uncertain)
+	}
+	owner = process.Ownership()
+
+	termination, err := process.Terminate(100 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("terminate escaped descendant: %+v, %v", termination, err)
+	}
+	if !termination.TreeEmpty {
+		t.Fatalf("termination did not prove escaped descendant cleanup: %+v", termination)
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not complete after escaped descendant cleanup")
+	}
+	if processIsActive(childPID) {
+		t.Fatalf("setsid descendant %d remains active after termination", childPID)
+	}
+}
+
+func TestLinuxEscapedDescendantRootHelper(t *testing.T) {
+	marker := os.Getenv(escapedDescendantMarkerEnv)
+	if marker == "" {
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(executable, "-test.run=^TestLinuxEscapedDescendantChildHelper$")
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("setsid grandchild did not write its readiness marker")
+}
+
+func TestLinuxEscapedDescendantChildHelper(t *testing.T) {
+	marker := os.Getenv(escapedDescendantMarkerEnv)
+	if marker == "" {
+		return
+	}
+	if _, err := unix.Setsid(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		time.Sleep(time.Hour)
 	}
 }
 
@@ -302,6 +475,23 @@ func waitForChildPID(t *testing.T, output *lockedBuffer) int {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for child PID in output %q", output.String())
+	return 0
+}
+
+func waitForMarkedPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for escaped descendant marker %q", path)
 	return 0
 }
 

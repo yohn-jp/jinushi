@@ -44,7 +44,7 @@ func (*Backend) Capabilities() model.Capabilities {
 		MemoryTelemetry:       true,
 		CPUTelemetry:          true,
 		ProcessTelemetry:      true,
-		RestartReconciliation: "process-session",
+		RestartReconciliation: "process-subreaper-tree",
 		Signals:               []string{"SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"},
 	}
 	if ok {
@@ -125,6 +125,17 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 	if err != nil {
 		return nil, err
 	}
+	bootID, err := readBootID()
+	if err != nil {
+		return nil, fmt.Errorf("read Linux boot identity: %w", err)
+	}
+	var reaper subreaperIdentity
+	if cg == nil {
+		reaper, err = enableSubreaper()
+		if err != nil {
+			return nil, fmt.Errorf("%w: no-cgroup process-tree ownership requires a child subreaper: %v", ErrUnsupported, err)
+		}
+	}
 	cmd := exec.Command(path, spec.Argv[1:]...)
 	cmd.Args = append([]string(nil), spec.Argv...)
 	cmd.Dir = spec.Cwd
@@ -190,21 +201,23 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 		_ = slave.Close()
 	}
 
-	bootID, bootErr := readBootID()
 	info, infoErr := readProcInfo(cmd.Process.Pid)
-	if bootErr != nil || infoErr != nil || info.StartTime == 0 || info.Session != cmd.Process.Pid {
-		cause := errors.Join(bootErr, infoErr)
+	owner := model.Ownership{Backend: "linux", PID: cmd.Process.Pid, ProcessGroup: cmd.Process.Pid}
+	if cg != nil {
+		owner.CgroupPath = cg.location.childPath
+		owner.Token = ownershipToken(bootID, cmd.Process.Pid, cg.name)
+	} else {
+		owner.Token = ownershipTokenWithSubreaper(bootID, cmd.Process.Pid, reaper)
+	}
+	if infoErr != nil || info.StartTime == 0 || info.Session != cmd.Process.Pid {
+		cause := infoErr
 		if cause == nil {
 			cause = errors.New("could not validate started process identity")
 		}
-		owner := model.Ownership{Backend: "linux", PID: cmd.Process.Pid, ProcessGroup: cmd.Process.Pid}
 		if cg != nil {
 			owner.CgroupPath = cg.location.childPath
-			owner.Token = ownershipToken(bootID, cmd.Process.Pid, cg.name)
-		} else if bootErr == nil {
-			owner.Token = ownershipToken(bootID, cmd.Process.Pid, "-")
 		}
-		cleanupErr := cleanupUnidentifiedStart(cmd, cg, cmd.Process.Pid)
+		cleanupErr := cleanupUnidentifiedStart(cmd, cg, owner)
 		if cleanupErr != nil {
 			return nil, &backend.UncertainError{Ownership: owner, Err: errors.Join(cause, cleanupErr)}
 		}
@@ -218,7 +231,7 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 		PID:          cmd.Process.Pid,
 		StartTime:    info.StartTime,
 		ProcessGroup: info.ProcessGroup,
-		Token:        ownershipToken(bootID, info.Session, "-"),
+		Token:        ownershipTokenWithSubreaper(bootID, info.Session, reaper),
 	}
 	if cg != nil {
 		p.ownership.CgroupPath = cg.location.childPath
@@ -233,18 +246,17 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 	return p, nil
 }
 
-func cleanupUnidentifiedStart(cmd *exec.Cmd, cg *cgroup, sessionID int) error {
+func cleanupUnidentifiedStart(cmd *exec.Cmd, cg *cgroup, owner model.Ownership) error {
+	var controlErr error
 	if cg != nil {
-		if err := killCgroup(cg); err != nil {
-			return err
-		}
-	} else if err := syscall.Kill(-sessionID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return err
+		controlErr = killCgroup(cg)
+	} else {
+		controlErr = signalOwnedTree(owner, syscall.SIGKILL)
 	}
 	if err := cmd.Wait(); err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
-			return err
+			return errors.Join(controlErr, err)
 		}
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -255,15 +267,23 @@ func cleanupUnidentifiedStart(cmd *exec.Cmd, cg *cgroup, sessionID int) error {
 			empty, err = cgroupEmpty(cg)
 		} else {
 			var list []procInfo
-			list, err = scanSession(sessionID)
-			empty = len(activeProcesses(list)) == 0
+			list, err = scanOwnedTree(owner)
+			if err == nil {
+				parsed, parseErr := subreaperToken(owner)
+				if parseErr != nil {
+					err = parseErr
+				} else if reapErr := reapAdoptedZombies(list, parsed.Subreaper, owner.PID, owner.StartTime); reapErr != nil {
+					err = reapErr
+				}
+			}
+			empty = err == nil && len(activeProcesses(list)) == 0
 		}
 		if err == nil && empty {
 			return nil
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	return errors.New("started process tree did not reach a proven empty state")
+	return errors.Join(controlErr, errors.New("started process tree did not reach a proven empty state"))
 }
 
 func isCgroupSpawnUnavailable(err error) bool {
@@ -436,35 +456,56 @@ func signalCgroup(cg *cgroup, signal syscall.Signal) error {
 	return errors.Join(failures...)
 }
 
-func signalSession(owner model.Ownership, signal syscall.Signal) error {
-	bootID, sessionID, err := parseOwnershipToken(owner.Token)
+func subreaperToken(owner model.Ownership) (linuxOwnershipToken, error) {
+	if owner.Backend != "linux" || owner.PID <= 0 {
+		return linuxOwnershipToken{}, errors.New("incomplete Linux process ownership evidence")
+	}
+	parsed, err := parseLinuxOwnershipToken(owner.Token)
 	if err != nil {
-		return err
+		return linuxOwnershipToken{}, err
+	}
+	if parsed.Version != 2 || parsed.CgroupName != "-" || parsed.Subreaper.PID <= 0 || parsed.Subreaper.StartTime == 0 {
+		return linuxOwnershipToken{}, errors.New("Linux process-tree ownership lacks subreaper evidence")
+	}
+	if parsed.SessionID != owner.ProcessGroup {
+		return linuxOwnershipToken{}, errors.New("Linux process session does not match persisted ownership")
 	}
 	currentBootID, err := readBootID()
+	if err != nil || currentBootID != parsed.BootID {
+		if err == nil {
+			err = errors.New("Linux boot identity changed")
+		}
+		return linuxOwnershipToken{}, err
+	}
+	return parsed, nil
+}
+
+func scanOwnedTree(owner model.Ownership) ([]procInfo, error) {
+	parsed, err := subreaperToken(owner)
+	if err != nil {
+		return nil, err
+	}
+	return scanSubreaperTree(parsed.Subreaper)
+}
+
+func signalOwnedTree(owner model.Ownership, signal syscall.Signal) error {
+	parsed, err := subreaperToken(owner)
 	if err != nil {
 		return err
 	}
-	if bootID == "" || currentBootID != bootID {
-		return errors.New("Linux boot identity changed; process ownership cannot be revalidated")
-	}
-	processes, err := scanSession(sessionID)
+	processes, err := scanSubreaperTree(parsed.Subreaper)
 	if err != nil {
 		return err
 	}
-	active := activeProcesses(processes)
 	var failures []error
-	for _, process := range active {
+	for _, process := range activeProcesses(processes) {
 		before := process
 		err := pidfdSignal(process.PID, signal, before, func() bool {
 			currentBootID, bootErr := readBootID()
-			if bootErr != nil || currentBootID != bootID {
-				return false
-			}
-			return true
+			return bootErr == nil && currentBootID == parsed.BootID && isSubreaperDescendant(process.PID, process.StartTime, parsed.Subreaper)
 		})
 		if err != nil && !errors.Is(err, syscall.ESRCH) {
-			failures = append(failures, fmt.Errorf("signal session process %d: %w", process.PID, err))
+			failures = append(failures, fmt.Errorf("signal owned Linux descendant %d: %w", process.PID, err))
 		}
 	}
 	return errors.Join(failures...)

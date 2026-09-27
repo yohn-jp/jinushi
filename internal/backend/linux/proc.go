@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -30,6 +32,19 @@ type procTotals struct {
 	Processes int64
 	Memory    int64
 	CPUTimeNS int64
+}
+
+type subreaperIdentity struct {
+	PID       int
+	StartTime uint64
+}
+
+type linuxOwnershipToken struct {
+	Version    int
+	BootID     string
+	SessionID  int
+	CgroupName string
+	Subreaper  subreaperIdentity
 }
 
 func readProcInfo(pid int) (procInfo, error) {
@@ -98,7 +113,7 @@ func parseProcStat(data []byte) (procInfo, error) {
 	}, nil
 }
 
-func scanSession(sessionID int) ([]procInfo, error) {
+func scanProcesses() ([]procInfo, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
@@ -115,17 +130,142 @@ func scanSession(sessionID int) ([]procInfo, error) {
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 				continue
 			}
-			incomplete = fmt.Errorf("cannot inspect process %d while enumerating session %d: %w", pid, sessionID, err)
+			incomplete = fmt.Errorf("cannot inspect process %d while enumerating Linux processes: %w", pid, err)
 			continue
 		}
-		if info.Session == sessionID {
-			processes = append(processes, info)
-		}
+		processes = append(processes, info)
 	}
 	if incomplete != nil {
-		return processes, incomplete
+		return nil, incomplete
 	}
 	return processes, nil
+}
+
+func enableSubreaper() (subreaperIdentity, error) {
+	if err := setChildSubreaper(true); err != nil {
+		return subreaperIdentity{}, fmt.Errorf("enable Linux child subreaper: %w", err)
+	}
+	enabled, err := childSubreaperEnabled()
+	if err != nil {
+		return subreaperIdentity{}, fmt.Errorf("verify Linux child subreaper: %w", err)
+	}
+	if !enabled {
+		return subreaperIdentity{}, errors.New("Linux child subreaper flag did not become active")
+	}
+	info, err := readProcInfo(os.Getpid())
+	if err != nil {
+		return subreaperIdentity{}, fmt.Errorf("identify Linux child subreaper: %w", err)
+	}
+	return subreaperIdentity{PID: info.PID, StartTime: info.StartTime}, nil
+}
+
+func childSubreaperEnabled() (bool, error) {
+	var enabled int32
+	err := unix.Prctl(unix.PR_GET_CHILD_SUBREAPER, uintptr(unsafe.Pointer(&enabled)), 0, 0, 0)
+	runtime.KeepAlive(&enabled)
+	if err != nil {
+		return false, err
+	}
+	return enabled == 1, nil
+}
+
+func setChildSubreaper(enabled bool) error {
+	value := uintptr(0)
+	if enabled {
+		value = 1
+	}
+	return unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, value, 0, 0, 0)
+}
+
+// scanSubreaperTree returns all descendants of the validated per-Run helper.
+// Children that detach from their session are reparented into this tree when
+// their intermediate parent exits because the helper is a child subreaper.
+func scanSubreaperTree(reaper subreaperIdentity) ([]procInfo, error) {
+	if reaper.PID <= 0 || reaper.StartTime == 0 {
+		return nil, errors.New("Linux subreaper identity is incomplete")
+	}
+	processes, err := scanProcesses()
+	if err != nil {
+		return nil, err
+	}
+	byParent := make(map[int][]procInfo)
+	var reaperFound bool
+	for _, process := range processes {
+		if process.PID == reaper.PID {
+			if process.StartTime != reaper.StartTime {
+				return nil, errors.New("Linux subreaper PID was reused")
+			}
+			reaperFound = true
+		}
+		byParent[process.PPID] = append(byParent[process.PPID], process)
+	}
+	if !reaperFound {
+		return nil, errors.New("Linux subreaper is no longer observable")
+	}
+
+	seen := map[int]struct{}{reaper.PID: {}}
+	queue := []int{reaper.PID}
+	descendants := make([]procInfo, 0)
+	for len(queue) != 0 {
+		parent := queue[0]
+		queue = queue[1:]
+		for _, child := range byParent[parent] {
+			if _, exists := seen[child.PID]; exists {
+				continue
+			}
+			seen[child.PID] = struct{}{}
+			descendants = append(descendants, child)
+			queue = append(queue, child.PID)
+		}
+	}
+	return descendants, nil
+}
+
+func isSubreaperDescendant(pid int, startTime uint64, reaper subreaperIdentity) bool {
+	if pid <= 0 || startTime == 0 {
+		return false
+	}
+	current, err := readProcInfo(pid)
+	if err != nil || current.StartTime != startTime {
+		return false
+	}
+	seen := map[int]struct{}{pid: {}}
+	for range 4096 {
+		parentPID := current.PPID
+		if parentPID == reaper.PID {
+			parent, err := readProcInfo(reaper.PID)
+			return err == nil && parent.StartTime == reaper.StartTime
+		}
+		if parentPID <= 1 {
+			return false
+		}
+		if _, exists := seen[parentPID]; exists {
+			return false
+		}
+		seen[parentPID] = struct{}{}
+		current, err = readProcInfo(parentPID)
+		if err != nil {
+			return false
+		}
+	}
+	return false
+}
+
+func reapAdoptedZombies(processes []procInfo, reaper subreaperIdentity, rootPID int, rootStartTime uint64) error {
+	var failures []error
+	for _, process := range processes {
+		if process.PPID != reaper.PID || process.State != 'Z' {
+			continue
+		}
+		if process.PID == rootPID && (rootStartTime == 0 || process.StartTime == rootStartTime) {
+			continue
+		}
+		var status unix.WaitStatus
+		if _, err := unix.Wait4(process.PID, &status, unix.WNOHANG, nil); err != nil && !errors.Is(err, syscall.ECHILD) && !errors.Is(err, syscall.ESRCH) {
+			failures = append(failures, fmt.Errorf("reap adopted Linux child %d: %w", process.PID, err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func activeProcesses(processes []procInfo) []procInfo {
@@ -165,21 +305,45 @@ func ownershipToken(bootID string, sessionID int, cgroupName string) string {
 	return fmt.Sprintf("linux-v1;%s;%d;%s", bootID, sessionID, cgroupName)
 }
 
-func parseOwnershipToken(token string) (bootID string, sessionID int, err error) {
-	bootID, sessionID, _, err = parseFullOwnershipToken(token)
-	return bootID, sessionID, err
+func ownershipTokenWithSubreaper(bootID string, sessionID int, reaper subreaperIdentity) string {
+	return fmt.Sprintf("linux-v2;%s;%d;-;%d;%d", bootID, sessionID, reaper.PID, reaper.StartTime)
 }
 
 func parseFullOwnershipToken(token string) (bootID string, sessionID int, cgroupName string, err error) {
+	parsed, err := parseLinuxOwnershipToken(token)
+	if err != nil {
+		return "", 0, "", err
+	}
+	return parsed.BootID, parsed.SessionID, parsed.CgroupName, nil
+}
+
+func parseLinuxOwnershipToken(token string) (linuxOwnershipToken, error) {
 	parts := strings.Split(token, ";")
-	if len(parts) != 4 || parts[0] != "linux-v1" || parts[1] == "" {
-		return "", 0, "", errors.New("invalid Linux ownership token")
+	if (len(parts) != 4 && len(parts) != 6) || (parts[0] != "linux-v1" && parts[0] != "linux-v2") || parts[1] == "" {
+		return linuxOwnershipToken{}, errors.New("invalid Linux ownership token")
 	}
-	sessionID, err = strconv.Atoi(parts[2])
+	sessionID, err := strconv.Atoi(parts[2])
 	if err != nil || sessionID <= 0 {
-		return "", 0, "", errors.New("invalid Linux session identity")
+		return linuxOwnershipToken{}, errors.New("invalid Linux session identity")
 	}
-	return parts[1], sessionID, parts[3], nil
+	parsed := linuxOwnershipToken{Version: 1, BootID: parts[1], SessionID: sessionID, CgroupName: parts[3]}
+	if parts[0] == "linux-v1" {
+		if len(parts) != 4 {
+			return linuxOwnershipToken{}, errors.New("invalid legacy Linux ownership token")
+		}
+		return parsed, nil
+	}
+	if len(parts) != 6 || parts[3] != "-" {
+		return linuxOwnershipToken{}, errors.New("invalid Linux subreaper ownership token")
+	}
+	reaperPID, pidErr := strconv.Atoi(parts[4])
+	reaperStart, startErr := strconv.ParseUint(parts[5], 10, 64)
+	if pidErr != nil || reaperPID <= 0 || startErr != nil || reaperStart == 0 {
+		return linuxOwnershipToken{}, errors.New("invalid Linux subreaper identity")
+	}
+	parsed.Version = 2
+	parsed.Subreaper = subreaperIdentity{PID: reaperPID, StartTime: reaperStart}
+	return parsed, nil
 }
 
 func procCgroupPath(pid int) (string, error) {
