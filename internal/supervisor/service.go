@@ -247,6 +247,8 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 		return s.detach(req)
 	case "input":
 		return s.input(req)
+	case "close-input":
+		return s.closeInput(req.RunID)
 	case "resize":
 		return s.resize(req)
 	case "signal":
@@ -843,6 +845,27 @@ func (s *Service) input(req protocol.Request) protocol.Response {
 		return failure("backend-failure", "Run not started")
 	}
 	if err := p.WriteInput(data); err != nil {
+		return failure("backend-failure", err.Error())
+	}
+	return response()
+}
+
+func (s *Service) closeInput(id string) protocol.Response {
+	a, out := s.lookupActive(id)
+	if a == nil {
+		return out
+	}
+	a.mu.Lock()
+	interactive := a.run.Spec.Interactive
+	p := a.process
+	a.mu.Unlock()
+	if interactive {
+		return failure("unsupported-capability", "PTY input cannot be half-closed")
+	}
+	if p == nil {
+		return failure("backend-failure", "Run not started")
+	}
+	if err := p.CloseInput(); err != nil {
 		return failure("backend-failure", err.Error())
 	}
 	return response()
