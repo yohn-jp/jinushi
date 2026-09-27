@@ -177,6 +177,11 @@ func (s *Service) markGuardianLossUncertain(a *active, reason string, receipt *m
 	if receipt != nil {
 		copy := *receipt
 		copy.Output = next.Output
+		// The Guardian receipt is evidence about the root process, but this
+		// path could not independently prove cleanup of the owned tree. Never
+		// publish its complete-cleanup claim as an ordinary terminal receipt.
+		copy.Cleanup = "unproven"
+		copy.EvidenceIncomplete = true
 		if next.EffectiveCapabilities == nil && copy.EffectiveCapabilities != nil {
 			effective := *copy.EffectiveCapabilities
 			next.EffectiveCapabilities = &effective

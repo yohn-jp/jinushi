@@ -458,7 +458,7 @@ func TestMonitorUsesLinuxRecoveryAfterTerminalWaitButFailedCleanupRPC(t *testing
 	}
 }
 
-func TestMonitorPreservesGuardianReceiptWhenIndependentCleanupIsUnproven(t *testing.T) {
+func TestMonitorMarksGuardianReceiptIncompleteWhenIndependentCleanupIsUnproven(t *testing.T) {
 	root := t.TempDir()
 	db, err := store.Open(filepath.Join(root, "state.db"), store.Options{})
 	if err != nil {
@@ -483,8 +483,12 @@ func TestMonitorPreservesGuardianReceiptWhenIndependentCleanupIsUnproven(t *test
 	svc.active[run.ID] = a
 	svc.monitor(a)
 	stored, err := db.Get(run.ID)
-	if err != nil || stored.State != model.Uncertain || stored.Receipt == nil || stored.Receipt.Outcome != "exited" || stored.Receipt.Cleanup != "complete" {
-		t.Fatalf("uncertain Run lost terminal receipt evidence: run=%+v err=%v", stored, err)
+	if err != nil || stored.State != model.Uncertain || stored.Receipt == nil || stored.Receipt.Outcome != "exited" || stored.Receipt.Cleanup != "unproven" || !stored.Receipt.EvidenceIncomplete {
+		t.Fatalf("uncertain Run exposed a complete terminal receipt: run=%+v err=%v", stored, err)
+	}
+	inspected := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "inspect", RunID: run.ID})
+	if inspected.Error != nil || inspected.Run == nil || inspected.Run.State != model.Uncertain || inspected.Run.Receipt == nil || inspected.Run.Receipt.Cleanup != "unproven" || !inspected.Run.Receipt.EvidenceIncomplete {
+		t.Fatalf("inspect exposed a clean receipt for uncertain Run: response=%+v", inspected)
 	}
 	if executor.calls != 1 || executor.owner != owner {
 		t.Fatalf("independent recovery calls=%d owner=%+v", executor.calls, executor.owner)
