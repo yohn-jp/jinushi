@@ -113,57 +113,77 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 	defer cancel()
 	h, err := guardian.Reattach(ctx, g.runDir(run.ID), run.ID)
 	if err != nil {
-		return reconcileResult{}, err
+		return reconcileResult{}, g.recoverLostGuardian(run, err, true)
 	}
 	snap, err := h.Observe(ctx)
 	if err != nil {
-		return reconcileResult{}, err
+		return reconcileResult{}, g.recoverLostGuardian(run, err, true)
+	}
+	result, evidenceErr := reconcileControlSnapshot(run.ID, snap)
+	if evidenceErr != nil {
+		return result, evidenceErr
 	}
 	if run.Ownership != nil && (snap.Ownership == nil || *snap.Ownership != *run.Ownership) {
-		return reconcileResult{}, errors.New("durable ownership mismatch")
+		return result, errors.New("durable ownership mismatch")
 	}
 	if err := validateOutputCursor(run.Output, snap.Output, run.Spec.Interactive); err != nil {
-		return reconcileResult{}, err
+		return result, err
 	}
 	if snap.State == model.Uncertain && snap.Live && snap.Termination.Requested && snap.TerminationReason != "" && snap.Ownership != nil {
 		osEvidence, osErr := g.native.Reconcile(*snap.Ownership)
 		if osErr != nil || !osEvidence.OwnershipProven {
-			return reconcileResult{}, errors.New("OS ownership is not proven for termination retry")
+			return result, errors.New("OS ownership is not proven for termination retry")
 		}
 		grace := time.Duration(g.config.TerminationGraceMs) * time.Millisecond
 		retryCtx, retryCancel := context.WithTimeout(context.Background(), grace+15*time.Second)
 		defer retryCancel()
 		termination, retryErr := h.Terminate(retryCtx, grace, snap.TerminationReason)
 		if retryErr != nil || !termination.TreeEmpty {
-			return reconcileResult{}, errors.New("guardian termination retry did not prove cleanup")
+			return result, errors.New("guardian termination retry did not prove cleanup")
 		}
 		evidence, waitErr := h.Wait(retryCtx)
 		if waitErr != nil {
-			return reconcileResult{}, errors.New("guardian termination retry lacks terminal receipt")
+			return result, errors.New("guardian termination retry lacks terminal receipt")
 		}
 		snap = evidence.Snapshot
+		result, evidenceErr = reconcileControlSnapshot(run.ID, snap)
+		if evidenceErr != nil {
+			return result, evidenceErr
+		}
 	}
 	if snap.State == model.Terminal && snap.Receipt != nil && snap.Receipt.Cleanup == "complete" {
 		p := newReconciledGuardianPhysical(h, run, stdout, stderr)
 		if err := p.syncOutput(0); err != nil {
-			return reconcileResult{}, err
+			return result, err
 		}
 		receipt := *snap.Receipt
 		outcome := receipt.Outcome
 		if snap.LimitOutcome != "" {
 			outcome = snap.LimitOutcome
 		}
-		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, telemetry: cloneSnapshotTelemetry(snap), lastOutputAt: snap.LastOutputAt}, nil
+		result.terminal = true
+		result.receipt = &receipt
+		result.exit = exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}
+		result.ownership = snap.Ownership
+		result.effective = snap.EffectiveCapabilities
+		result.state = snap.State
+		result.terminationReason = snap.TerminationReason
+		result.lease = leaseFromSnapshot(snap)
+		result.resources = snap.Resources
+		result.lastSampleAt = snap.LastResourceSampleAt
+		result.telemetry = cloneSnapshotTelemetry(snap)
+		result.lastOutputAt = snap.LastOutputAt
+		return result, nil
 	}
 	if snap.State != model.Running && snap.State != model.Terminating {
-		return reconcileResult{}, errors.New("guardian has no provable live Run state")
+		return result, errors.New("guardian has no provable live Run state")
 	}
 	if snap.Ownership == nil {
-		return reconcileResult{}, errors.New("guardian ownership absent")
+		return result, errors.New("guardian ownership absent")
 	}
 	liveSnap, err := h.Probe(ctx)
 	if err != nil || !liveSnap.Live {
-		return reconcileResult{}, errors.New("guardian is not live")
+		return result, g.recoverLostGuardian(run, errors.Join(err, errors.New("guardian is not live")), false)
 	}
 	osEvidence, err := g.native.Reconcile(*snap.Ownership)
 	if err == nil && osEvidence.OwnershipProven && osEvidence.State == model.Terminal {
@@ -173,20 +193,40 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer waitCancel()
 		if _, waitErr := h.Wait(waitCtx); waitErr != nil {
-			return reconcileResult{}, errors.New("owned tree is empty but guardian receipt is unavailable")
+			return result, errors.New("owned tree is empty but guardian receipt is unavailable")
 		}
 		return g.Reconcile(run, stdout, stderr)
 	}
 	if err != nil || !osEvidence.OwnershipProven || (osEvidence.State != model.Running && osEvidence.State != model.Terminating) {
-		return reconcileResult{}, errors.New("OS ownership not proven")
+		return result, errors.New("OS ownership not proven")
 	}
 	p := newReconciledGuardianPhysical(h, run, stdout, stderr)
 	p.ownership = *snap.Ownership
 	p.effective = snap.EffectiveCapabilities
 	if err := p.syncOutput(16); err != nil {
-		return reconcileResult{}, err
+		return result, err
 	}
-	return reconcileResult{live: true, process: p, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, telemetry: cloneSnapshotTelemetry(snap), lastOutputAt: snap.LastOutputAt}, nil
+	result.live = true
+	result.process = p
+	result.ownership = snap.Ownership
+	result.effective = snap.EffectiveCapabilities
+	result.state = snap.State
+	result.terminationReason = snap.TerminationReason
+	result.lease = leaseFromSnapshot(snap)
+	result.resources = snap.Resources
+	result.lastSampleAt = snap.LastResourceSampleAt
+	result.telemetry = cloneSnapshotTelemetry(snap)
+	result.lastOutputAt = snap.LastOutputAt
+	return result, nil
+}
+
+func reconcileControlSnapshot(runID string, snapshot guardian.Snapshot) (reconcileResult, error) {
+	if snapshot.RunID != runID {
+		gap := controlEvidenceGap(runID, guardian.ControlEvidenceGap{}, "identity-mismatch", "Guardian control snapshot Run identity does not match durable Run")
+		return reconcileResult{controlGap: gap}, errors.New("guardian snapshot Run identity mismatch")
+	}
+	operations, uncertain, gap := retainedGuardianControlEvidence(runID, snapshot.Controls)
+	return reconcileResult{controlEvidence: operations, controlUncertain: uncertain, controlGap: gap}, nil
 }
 
 func newReconciledGuardianPhysical(h *guardian.Handle, run model.Run, stdout, stderr io.Writer) *guardianPhysical {
@@ -448,4 +488,62 @@ func (p *guardianPhysical) CloseInput() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return p.h.CloseInput(ctx)
+}
+
+func (p *guardianPhysical) Pause(requestID string) (model.ControlEventPayload, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.h.Pause(ctx, requestID)
+}
+
+func (p *guardianPhysical) Resume(requestID string) (model.ControlEventPayload, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.h.Resume(ctx, requestID)
+}
+
+func (p *guardianPhysical) SetMemoryHigh(requestID string, bytes int64) (model.ControlEventPayload, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.h.SetMemoryHigh(ctx, requestID, bytes)
+}
+
+func (p *guardianPhysical) SetCPUQuotaPercent(requestID string, percent int64) (model.ControlEventPayload, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.h.SetCPUQuotaPercent(ctx, requestID, percent)
+}
+
+func (p *guardianPhysical) LookupControl(requestID string) (guardian.ControlOperation, bool, guardian.ControlEvidenceGap, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.h.LookupControl(ctx, requestID)
+}
+
+func (p *guardianPhysical) ControlSnapshot() (guardian.Snapshot, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.h.Observe(ctx)
+}
+
+// LookupControl can reconcile a pending supervisor claim after a restart,
+// including from the durable Guardian snapshot when its helper is unavailable.
+func (g *guardedExecutor) LookupControl(runID, requestID string) (guardian.ControlOperation, bool, guardian.ControlEvidenceGap, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h, err := guardian.Reattach(ctx, g.runDir(runID), runID)
+	if err != nil {
+		return guardian.ControlOperation{}, false, guardian.ControlEvidenceGap{}, err
+	}
+	return h.LookupControl(ctx, requestID)
+}
+
+func (g *guardedExecutor) RecoverGuardianLoss(owner model.Ownership, grace time.Duration) (backend.TerminationResult, error) {
+	recovery, ok := g.native.(interface {
+		RecoverGuardianLoss(model.Ownership, time.Duration) (backend.TerminationResult, error)
+	})
+	if !ok {
+		return backend.TerminationResult{}, errors.New("backend does not support Guardian-loss recovery")
+	}
+	return recovery.RecoverGuardianLoss(owner, grace)
 }

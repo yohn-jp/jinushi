@@ -40,13 +40,15 @@ func mutationDigest(value any) (string, error) {
 }
 
 type controlIdentity struct {
-	Operation string `json:"operation"`
-	Stream    string `json:"stream,omitempty"`
-	Data      string `json:"data,omitempty"`
-	Signal    string `json:"signal,omitempty"`
-	Rows      int    `json:"rows,omitempty"`
-	Cols      int    `json:"cols,omitempty"`
-	Reason    string `json:"reason,omitempty"`
+	Operation       string `json:"operation"`
+	Stream          string `json:"stream,omitempty"`
+	Data            string `json:"data,omitempty"`
+	Signal          string `json:"signal,omitempty"`
+	Rows            int    `json:"rows,omitempty"`
+	Cols            int    `json:"cols,omitempty"`
+	MemoryHighBytes int64  `json:"memoryHighBytes,omitempty"`
+	CPUQuotaPercent int64  `json:"cpuQuotaPercent,omitempty"`
+	Reason          string `json:"reason,omitempty"`
 }
 
 func controlIdentityFor(req protocol.Request) controlIdentity {
@@ -61,6 +63,10 @@ func controlIdentityFor(req protocol.Request) controlIdentity {
 		identity.Signal = req.Signal
 	case "resize":
 		identity.Rows, identity.Cols = req.Rows, req.Cols
+	case "memory-high":
+		identity.MemoryHighBytes = req.MemoryHighBytes
+	case "cpu-quota":
+		identity.CPUQuotaPercent = req.CPUQuotaPercent
 	case "cancel":
 		identity.Reason = "cancelled"
 	case "close-input":
@@ -94,7 +100,7 @@ func (s *Service) mutateControlWithWriterGate(req protocol.Request, prepare func
 		if replay, found, err := s.store.FindControlRequest(req.RunID, req.RequestID, digest, time.Now().UTC()); err != nil {
 			return controlStoreFailure(err)
 		} else if found {
-			return s.controlReplay(req.RunID, replay)
+			return s.controlReplayRequest(req, replay, nil)
 		}
 		return out
 	}
@@ -103,7 +109,10 @@ func (s *Service) mutateControlWithWriterGate(req protocol.Request, prepare func
 	if replay, found, err := s.store.FindControlRequest(req.RunID, req.RequestID, digest, time.Now().UTC()); err != nil {
 		return controlStoreFailure(err)
 	} else if found {
-		return s.controlReplay(req.RunID, replay)
+		a.mu.Lock()
+		process := a.process
+		a.mu.Unlock()
+		return s.controlReplayRequest(req, replay, process)
 	}
 
 	if requireWriter {
@@ -163,8 +172,9 @@ func (s *Service) mutateControlWithWriterGate(req protocol.Request, prepare func
 		return controlStoreFailure(err)
 	}
 	if !claimed.Created {
+		process := a.process
 		a.mu.Unlock()
-		return s.controlReplay(req.RunID, claimed.Request)
+		return s.controlReplayRequest(req, claimed.Request, process)
 	}
 	a.run.Generation = claimed.Run.Generation
 	a.mu.Unlock()

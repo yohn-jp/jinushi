@@ -56,6 +56,9 @@ type reconcileResult struct {
 	lastSampleAt      *time.Time
 	telemetry         *model.TelemetrySample
 	lastOutputAt      *time.Time
+	controlEvidence   []guardian.ControlOperation
+	controlUncertain  []guardian.ControlOperation
+	controlGap        *model.ControlEventPayload
 }
 
 type leaseState struct {
@@ -388,6 +391,8 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 		return s.input(req)
 	case "close-input":
 		return s.closeInput(req)
+	case "pause", "resume", "memory-high", "cpu-quota":
+		return s.changeRunControl(req)
 	case "resize":
 		return s.resize(req)
 	case "signal":
@@ -621,12 +626,18 @@ func (s *Service) monitor(a *active) {
 			return
 		case w := <-waitCh:
 			if w.err != nil {
+				if s.recoverActiveGuardianLoss(a) {
+					return
+				}
 				s.markUncertain(a, "wait failed")
 				return
 			}
 			s.sample(a)
 			termination, err := a.process.Terminate(time.Duration(s.config.TerminationGraceMs) * time.Millisecond)
 			if err != nil || !termination.complete {
+				if s.recoverActiveGuardianLossAfterWait(a, w.result) {
+					return
+				}
 				s.markUncertain(a, "process tree cleanup unproven")
 				return
 			}
@@ -634,26 +645,7 @@ func (s *Service) monitor(a *active) {
 			reason := a.run.TerminationReason
 			forced := a.forced || termination.forced
 			a.mu.Unlock()
-			outcome := "exited"
-			if w.result.signal != "" {
-				outcome = "signaled"
-			}
-			limitOutcome := w.result.outcome
-			if limitOutcome == "" {
-				limitOutcome = termination.outcome
-			}
-			if strings.HasPrefix(limitOutcome, "resource-limit:") {
-				outcome = "resource-limit"
-				w.result.outcome = limitOutcome
-			} else if limitOutcome == "timed-out" || limitOutcome == "cancelled" {
-				outcome = limitOutcome
-			}
-			if reason != "" {
-				outcome = reason
-			}
-			if outcome == "lease-expired" {
-				outcome = "cancelled"
-			}
+			outcome := resolvedExitOutcome(&w.result, termination, reason)
 			s.finish(a, outcome, w.result, forced || w.result.forced, "complete")
 			return
 		case <-ticker.C:
@@ -734,6 +726,12 @@ func (s *Service) sample(a *active) {
 }
 
 func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool, cleanup string) {
+	a.controlMu.Lock()
+	defer a.controlMu.Unlock()
+	s.finishWithControlLock(a, outcome, exit, forced, cleanup)
+}
+
+func (s *Service) finishWithControlLock(a *active, outcome string, exit exitResult, forced bool, cleanup string) {
 	a.mu.Lock()
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
 		a.mu.Unlock()
@@ -819,6 +817,30 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 	s.mu.Unlock()
 }
 
+func resolvedExitOutcome(exit *exitResult, termination terminationResult, reason string) string {
+	outcome := "exited"
+	if exit.signal != "" {
+		outcome = "signaled"
+	}
+	limitOutcome := exit.outcome
+	if limitOutcome == "" {
+		limitOutcome = termination.outcome
+	}
+	if strings.HasPrefix(limitOutcome, "resource-limit:") {
+		outcome = "resource-limit"
+		exit.outcome = limitOutcome
+	} else if limitOutcome == "timed-out" || limitOutcome == "cancelled" {
+		outcome = limitOutcome
+	}
+	if reason != "" {
+		outcome = reason
+	}
+	if outcome == "lease-expired" {
+		outcome = "cancelled"
+	}
+	return outcome
+}
+
 func terminalEvents(now time.Time, exitOutcome, reason, priorReason string) []model.Event {
 	if strings.HasPrefix(exitOutcome, "resource-limit:") {
 		return []model.Event{{Kind: model.EventLimitReached, ObservedAt: now, Payload: &model.EventPayload{Limit: &model.LimitEventPayload{Limit: strings.TrimPrefix(exitOutcome, "resource-limit:")}}}}
@@ -833,6 +855,8 @@ func terminalEvents(now time.Time, exitOutcome, reason, priorReason string) []mo
 }
 
 func (s *Service) markUncertain(a *active, reason string) {
+	a.controlMu.Lock()
+	defer a.controlMu.Unlock()
 	a.mu.Lock()
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
 		a.mu.Unlock()
@@ -1336,6 +1360,9 @@ func (s *Service) driveTermination(a *active, p physical) {
 	}
 	result, err := p.Terminate(time.Duration(s.config.TerminationGraceMs) * time.Millisecond)
 	if err != nil || !result.complete {
+		if s.recoverActiveGuardianLoss(a) {
+			return
+		}
 		s.markUncertain(a, "termination unproven")
 		return
 	}
@@ -1492,6 +1519,7 @@ func (s *Service) reconcile() error {
 		if err := s.persistRunEvent(run, &model.Event{Kind: model.EventRunReconciling, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Reconciling, Generation: run.Generation}}}); err != nil {
 			return err
 		}
+		var reconcileErr error
 		{
 			a := &active{run: run, done: make(chan struct{})}
 			stdout := &capture{s: s, a: a, stream: "stdout"}
@@ -1500,6 +1528,34 @@ func (s *Service) reconcile() error {
 				stdout.stream = "pty"
 			}
 			result, e := s.backend.Reconcile(run, stdout, stderr)
+			var evidenceErr error
+			if err := s.importReconciledGuardianControls(run.ID, result.controlEvidence); err != nil {
+				evidenceErr = errors.Join(evidenceErr, errControlEvidenceReconcile, err)
+				gap := controlEvidenceGap(run.ID, guardian.ControlEvidenceGap{}, "incomplete", "Verified Guardian control evidence did not reconcile with Supervisor state")
+				if persistErr := s.persistRecoveredControlEvent(run.ID, *gap); persistErr != nil {
+					evidenceErr = errors.Join(evidenceErr, persistErr)
+				}
+			}
+			if err := s.persistUncertainGuardianControls(run.ID, result.controlUncertain); err != nil {
+				evidenceErr = errors.Join(evidenceErr, errControlEvidenceReconcile, err)
+				gap := controlEvidenceGap(run.ID, guardian.ControlEvidenceGap{}, "incomplete", "Guardian uncertain control evidence did not reconcile with Supervisor state")
+				if persistErr := s.persistRecoveredControlEvent(run.ID, *gap); persistErr != nil {
+					evidenceErr = errors.Join(evidenceErr, persistErr)
+				}
+			}
+			if result.controlGap != nil {
+				if err := s.persistRecoveredControlEvent(run.ID, *result.controlGap); err != nil {
+					evidenceErr = errors.Join(evidenceErr, errControlEvidenceReconcile, err)
+				}
+			}
+			if recoveryEvidence, _, ok := guardianRecoveryEvents(e); ok {
+				for _, evidence := range recoveryEvidence {
+					if err := s.persistRecoveredControlEvent(run.ID, evidence); err != nil {
+						evidenceErr = errors.Join(evidenceErr, errControlEvidenceReconcile, err)
+					}
+				}
+			}
+			e = errors.Join(e, evidenceErr)
 			refreshed, readErr := s.store.Get(run.ID)
 			if readErr != nil {
 				return readErr
@@ -1589,10 +1645,24 @@ func (s *Service) reconcile() error {
 				}
 				continue
 			}
+			reconcileErr = e
 		}
 		run.State = model.Uncertain
 		run.Generation++
-		if err := s.persistRunEvent(run, &model.Event{Kind: model.EventRunUncertain, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Uncertain, Generation: run.Generation, Reason: "ownership or outcome not proven"}}}); err != nil {
+		reason := "ownership or outcome not proven"
+		if errors.Is(reconcileErr, errControlJournalGap) {
+			reason = "control-evidence-deduplication-unproven"
+		} else if errors.Is(reconcileErr, errControlEvidenceReconcile) {
+			reason = "control-evidence-reconciliation-unproven"
+		}
+		events := make([]model.Event, 0, 1)
+		if _, recoveryReason, ok := guardianRecoveryEvents(reconcileErr); ok {
+			if recoveryReason != "" {
+				reason = recoveryReason
+			}
+		}
+		events = append(events, model.Event{Kind: model.EventRunUncertain, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Uncertain, Generation: run.Generation, Reason: reason}}})
+		if err := s.persistRunEvents(run, events); err != nil {
 			return err
 		}
 	}
