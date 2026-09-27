@@ -1347,6 +1347,9 @@ func renderCallResult(response protocol.Response, err error, human bool, stdout,
 			writeJSON(stdout, response)
 		} else {
 			fmt.Fprintf(stderr, "%s: %s\n", response.Error.Code, response.Error.Message)
+			if response.Tombstone != nil {
+				renderTombstone(stderr, response.Tombstone)
+			}
 		}
 		return response, 1
 	}
@@ -1375,14 +1378,21 @@ func renderResponse(w io.Writer, response protocol.Response, human bool) int {
 	}
 	if response.Run != nil {
 		run := response.Run
+		evidence := ""
+		if run.Receipt != nil && run.Receipt.EvidenceIncomplete {
+			evidence = " evidence=incomplete"
+		}
 		if run.Receipt != nil {
 			if run.Receipt.ExitCode != nil {
-				fmt.Fprintf(w, "%s %s outcome=%s exit=%d\n", run.ID, run.State, run.Receipt.Outcome, *run.Receipt.ExitCode)
+				fmt.Fprintf(w, "%s %s outcome=%s exit=%d%s\n", run.ID, run.State, run.Receipt.Outcome, *run.Receipt.ExitCode, evidence)
 			} else {
-				fmt.Fprintf(w, "%s %s outcome=%s\n", run.ID, run.State, run.Receipt.Outcome)
+				fmt.Fprintf(w, "%s %s outcome=%s%s\n", run.ID, run.State, run.Receipt.Outcome, evidence)
 			}
 		} else {
 			fmt.Fprintf(w, "%s %s\n", run.ID, run.State)
+		}
+		if response.Tombstone != nil {
+			renderTombstone(w, response.Tombstone)
 		}
 		return 0
 	}
@@ -1394,6 +1404,35 @@ func renderResponse(w io.Writer, response protocol.Response, human bool) int {
 	}
 	if response.Capabilities != nil {
 		writeJSON(w, response.Capabilities)
+		return 0
+	}
+	if response.Status != nil {
+		status := response.Status
+		usage := status.Store
+		fmt.Fprintf(w, "runs total=%d nonterminal=%d terminal=%d uncertain=%d\n", usage.RunCount, usage.NonterminalRunCount, usage.TerminalRunCount, usage.UncertainRunCount)
+		fmt.Fprintf(w, "store status=%s logicalBytes=%d databaseBytes=%d freeBytes=%d tombstones=%d expiredBindings=%d\n", usage.Status, usage.LogicalBytes, usage.DatabaseBytes, usage.FreeBytes, usage.TombstoneCount, usage.ExpiredBindingCount)
+		retention := status.Retention
+		lastRun := "never"
+		if retention.LastRunAt != nil {
+			lastRun = retention.LastRunAt.UTC().Format(time.RFC3339)
+		}
+		compactionAttempt := "never"
+		if retention.CompactionAttemptedAt != nil {
+			compactionAttempt = retention.CompactionAttemptedAt.UTC().Format(time.RFC3339)
+		}
+		fmt.Fprintf(w, "retention status=%s lastRun=%s evictedRuns=%d evictedBytes=%d terminalRuns=%d terminalBytes=%d budgetExceeded=%t compactionRecommended=%t compactionStatus=%s compactionError=%s compactionAttemptedAt=%s\n",
+			retention.Status, lastRun, retention.EvictedRunsTotal, retention.EvictedBytesTotal, retention.TerminalRunsRemaining,
+			retention.TerminalEvidenceBytes, retention.BudgetExceeded, retention.CompactionRecommended,
+			retention.CompactionStatus, retention.CompactionErrorCode, compactionAttempt)
+		policy := retention.Policy
+		fmt.Fprintf(w, "retention-policy maxAgeMs=%d maxTerminalRuns=%d maxStateBytes=%d preserveTombstones=%t maxTombstones=%d maxTombstoneAgeMs=%d compactMinFreeBytes=%d compactMinFreeRatio=%.3f\n",
+			policy.MaxAgeMs, policy.MaxTerminalRuns, policy.MaxStateBytes, policy.PreserveTombstones, policy.MaxTombstones,
+			policy.MaxTombstoneAgeMs, policy.CompactMinFreeBytes, policy.CompactMinFreeRatio)
+		if response.HostEnvelope != nil {
+			host := response.HostEnvelope
+			fmt.Fprintf(w, "host-envelope status=%s activeRuns=%s memoryBytes=%s taskCount=%s\n",
+				host.Status, metricText(host.ActiveRuns), metricText(host.MemoryBytes), metricText(host.TaskCount))
+		}
 		return 0
 	}
 	if response.Events != nil {
@@ -1409,6 +1448,15 @@ func renderResponse(w io.Writer, response protocol.Response, human bool) int {
 	}
 	fmt.Fprintln(w, "ok")
 	return 0
+}
+
+func renderTombstone(w io.Writer, tombstone *model.TombstoneSummary) {
+	fmt.Fprintf(w, "tombstone runId=%s evictedAt=%s reasons=%s receiptSha256=%s\n",
+		tombstone.RunID, tombstone.EvictedAt.UTC().Format(time.RFC3339), strings.Join(tombstone.Reasons, ","), tombstone.ReceiptSHA256)
+}
+
+func metricText(metric model.Metric) string {
+	return fmt.Sprintf("%s:%d", metric.Status, metric.Value)
 }
 
 func writeJSON(w io.Writer, value any) {

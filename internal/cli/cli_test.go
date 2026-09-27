@@ -513,6 +513,70 @@ func TestPhysicalControlCommandsForwardRetryIdentity(t *testing.T) {
 	}
 }
 
+func TestHumanStatusRendersRuntimeAndRetentionSummary(t *testing.T) {
+	lastRun := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	response := protocol.Response{
+		Version: model.ProtocolVersion,
+		Status: &model.RuntimeStatus{
+			Version: 1,
+			Store: model.RuntimeStoreUsage{
+				Status: "available", RunCount: 4, NonterminalRunCount: 1, TerminalRunCount: 2, UncertainRunCount: 1,
+				LogicalBytes: 4096, DatabaseBytes: 8192, FreeBytes: 1024, TombstoneCount: 3,
+			},
+			Retention: model.RuntimeRetentionStatus{
+				Status: "available", LastRunAt: &lastRun, EvictedRunsTotal: 5, TerminalRunsRemaining: 2,
+				TerminalEvidenceBytes: 2048, BudgetExceeded: true, CompactionRecommended: true,
+				CompactionStatus: "failed", CompactionErrorCode: "compaction-failed",
+				Policy: model.RuntimeRetentionPolicy{MaxAgeMs: 1000, MaxTerminalRuns: 10, MaxStateBytes: 1 << 20},
+			},
+		},
+		HostEnvelope: &model.HostEnvelopeStatus{
+			Status: "unavailable", ActiveRuns: model.Metric{Status: "unsupported"},
+			MemoryBytes: model.Metric{Status: "unavailable"}, TaskCount: model.Metric{Status: "unsupported"},
+		},
+	}
+	var stdout bytes.Buffer
+	if code := renderResponse(&stdout, response, true); code != 0 {
+		t.Fatalf("render status exit = %d", code)
+	}
+	for _, want := range []string{
+		"runs total=4 nonterminal=1 terminal=2 uncertain=1",
+		"store status=available logicalBytes=4096 databaseBytes=8192 freeBytes=1024 tombstones=3",
+		"evictedRuns=5",
+		"budgetExceeded=true compactionRecommended=true compactionStatus=failed compactionError=compaction-failed",
+		"compactionAttemptedAt=never",
+		"compactMinFreeBytes=0 compactMinFreeRatio=0.000",
+		"host-envelope status=unavailable activeRuns=unsupported:0",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("status output %q does not contain %q", stdout.String(), want)
+		}
+	}
+}
+
+func TestHumanTombstoneResponseMarksCollectedEvidence(t *testing.T) {
+	response := protocol.Response{
+		Version: model.ProtocolVersion,
+		Run: &model.Run{
+			ID: "run_collected", State: model.Terminal,
+			Receipt: &model.Receipt{Outcome: "exited", EvidenceIncomplete: true},
+		},
+		Tombstone: &model.TombstoneSummary{
+			RunID: "run_collected", EvictedAt: time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC),
+			Reasons: []string{"terminal-count"}, ReceiptSHA256: strings.Repeat("a", 64),
+		},
+	}
+	var stdout bytes.Buffer
+	if code := renderResponse(&stdout, response, true); code != 0 {
+		t.Fatalf("render tombstone exit = %d", code)
+	}
+	for _, want := range []string{"evidence=incomplete", "reasons=terminal-count", "receiptSha256=" + strings.Repeat("a", 64)} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("tombstone output %q does not contain %q", stdout.String(), want)
+		}
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

@@ -47,6 +47,7 @@ func Run(ctx context.Context, stateDir string) error {
 	if err := s.reconcile(); err != nil {
 		return fmt.Errorf("reconcile Runs: %w", err)
 	}
+	s.startRetentionWorker()
 	listener, err := ipc.Listen(root)
 	if err != nil {
 		return fmt.Errorf("listen local IPC: %w", err)

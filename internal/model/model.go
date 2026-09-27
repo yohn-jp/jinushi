@@ -109,6 +109,87 @@ type HostEnvelopeStatus struct {
 	Reason         string                   `json:"reason,omitempty"`
 }
 
+// RuntimeStoreUsage is a bounded logical and physical store size projection.
+// It deliberately contains counters and byte totals only, never Run content.
+type RuntimeStoreUsage struct {
+	Status   string `json:"status"`
+	RunCount int    `json:"runCount"`
+	// NonterminalRunCount includes accepted/starting/terminating state records;
+	// it is not a count of currently executing physical processes.
+	NonterminalRunCount       int   `json:"nonterminalRunCount"`
+	TerminalRunCount          int   `json:"terminalRunCount"`
+	UncertainRunCount         int   `json:"uncertainRunCount"`
+	TombstoneCount            int   `json:"tombstoneCount"`
+	ExpiredBindingCount       int   `json:"expiredBindingCount"`
+	LogicalBytes              int64 `json:"logicalBytes"`
+	RunBytes                  int64 `json:"runBytes"`
+	EventBytes                int64 `json:"eventBytes"`
+	OutputBytes               int64 `json:"outputBytes"`
+	TelemetryBytes            int64 `json:"telemetryBytes"`
+	TombstoneBytes            int64 `json:"tombstoneBytes"`
+	SubmissionBytes           int64 `json:"submissionBytes"`
+	SubmissionReplayStubBytes int64 `json:"submissionReplayStubBytes"`
+	ControlRequestBytes       int64 `json:"controlRequestBytes"`
+	WatchIndexBytes           int64 `json:"watchIndexBytes"`
+	OtherBytes                int64 `json:"otherBytes"`
+	TerminalEvidenceBytes     int64 `json:"terminalEvidenceBytes"`
+	DatabaseBytes             int64 `json:"databaseBytes"`
+	PageSize                  int   `json:"pageSize"`
+	FreePages                 int   `json:"freePages"`
+	PendingPages              int   `json:"pendingPages"`
+	FreeBytes                 int64 `json:"freeBytes"`
+}
+
+// RuntimeRetentionPolicy uses explicit milliseconds so configuration and
+// protocol values do not depend on Go's duration serialization units.
+type RuntimeRetentionPolicy struct {
+	MaxAgeMs            int64   `json:"maxAgeMs"`
+	MaxTerminalRuns     int     `json:"maxTerminalRuns"`
+	MaxStateBytes       int64   `json:"maxStateBytes"`
+	PreserveTombstones  bool    `json:"preserveTombstones"`
+	MaxTombstones       int     `json:"maxTombstones"`
+	MaxTombstoneAgeMs   int64   `json:"maxTombstoneAgeMs"`
+	CompactMinFreeBytes int64   `json:"compactMinFreeBytes"`
+	CompactMinFreeRatio float64 `json:"compactMinFreeRatio"`
+}
+
+// RuntimeRetentionStatus contains the effective policy and one bounded
+// durable checkpoint of terminal evidence collection.
+type RuntimeRetentionStatus struct {
+	Status                     string                 `json:"status"`
+	Policy                     RuntimeRetentionPolicy `json:"policy"`
+	LastRunAt                  *time.Time             `json:"lastRunAt,omitempty"`
+	EvictedRunsTotal           uint64                 `json:"evictedRunsTotal"`
+	EvictedBytesTotal          int64                  `json:"evictedBytesTotal"`
+	RemovedTombstonesTotal     uint64                 `json:"removedTombstonesTotal"`
+	ExpiredBindingsTotal       uint64                 `json:"expiredBindingsTotal"`
+	SubmissionReplayStubsTotal uint64                 `json:"submissionReplayStubsTotal"`
+	LastEvictedFinishedAt      *time.Time             `json:"lastEvictedFinishedAt,omitempty"`
+	TerminalRunsRemaining      int                    `json:"terminalRunsRemaining"`
+	TerminalEvidenceBytes      int64                  `json:"terminalEvidenceBytes"`
+	BudgetExceeded             bool                   `json:"budgetExceeded"`
+	CompactionRecommended      bool                   `json:"compactionRecommended"`
+	CompactionStatus           string                 `json:"compactionStatus"`
+	CompactionErrorCode        string                 `json:"compactionErrorCode,omitempty"`
+	CompactionAttemptedAt      *time.Time             `json:"compactionAttemptedAt,omitempty"`
+}
+
+// RuntimeStatus is a point-in-time summary of bounded store/retention state.
+type RuntimeStatus struct {
+	Version   int                    `json:"version"`
+	Store     RuntimeStoreUsage      `json:"store"`
+	Retention RuntimeRetentionStatus `json:"retention"`
+}
+
+// TombstoneSummary identifies which historical terminal evidence was evicted
+// without returning its original spec, output, event bodies, or processes.
+type TombstoneSummary struct {
+	RunID         string    `json:"runId"`
+	EvictedAt     time.Time `json:"evictedAt"`
+	Reasons       []string  `json:"reasons"`
+	ReceiptSHA256 string    `json:"receiptSha256"`
+}
+
 // Resources reports process counts independently from Linux kernel task
 // counts. ProcessCount is distinct owned processes; TaskCount includes
 // threads and matches cgroup v2 pids-controller accounting.

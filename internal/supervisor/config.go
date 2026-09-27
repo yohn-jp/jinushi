@@ -8,34 +8,79 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/yohn-jp/jinushi/internal/store"
 )
 
 // Config is supervisor-owned safety policy loaded from stateDir/config.json.
 // A missing file uses deterministic defaults. Zero disables optional host
 // envelope ceilings; other zero fields retain their defaults in partial JSON.
 type Config struct {
-	SampleIntervalMs    int64 `json:"sampleIntervalMs"`
-	TerminationGraceMs  int64 `json:"terminationGraceMs"`
-	DefaultOutputBytes  int64 `json:"defaultOutputBytes"`
-	MaxOutputBytes      int64 `json:"maxOutputBytes"`
-	MaxWallTimeMs       int64 `json:"maxWallTimeMs"`
-	MaxMemoryBytes      int64 `json:"maxMemoryBytes"`
-	MaxProcessCount     int64 `json:"maxProcessCount"`
-	MaxTaskCount        int64 `json:"maxTaskCount"`
-	HostMemoryBytes     int64 `json:"hostMemoryBytes"`
-	HostTaskCount       int64 `json:"hostTaskCount"`
-	MaxActiveRuns       int64 `json:"maxActiveRuns"`
-	EventRetentionCount int   `json:"eventRetentionCount"`
-	EventRetentionBytes int64 `json:"eventRetentionBytes"`
+	SampleIntervalMs    int64           `json:"sampleIntervalMs"`
+	TerminationGraceMs  int64           `json:"terminationGraceMs"`
+	DefaultOutputBytes  int64           `json:"defaultOutputBytes"`
+	MaxOutputBytes      int64           `json:"maxOutputBytes"`
+	MaxWallTimeMs       int64           `json:"maxWallTimeMs"`
+	MaxMemoryBytes      int64           `json:"maxMemoryBytes"`
+	MaxProcessCount     int64           `json:"maxProcessCount"`
+	MaxTaskCount        int64           `json:"maxTaskCount"`
+	HostMemoryBytes     int64           `json:"hostMemoryBytes"`
+	HostTaskCount       int64           `json:"hostTaskCount"`
+	MaxActiveRuns       int64           `json:"maxActiveRuns"`
+	EventRetentionCount int             `json:"eventRetentionCount"`
+	EventRetentionBytes int64           `json:"eventRetentionBytes"`
+	RetentionIntervalMs int64           `json:"retentionIntervalMs"`
+	Retention           RetentionConfig `json:"retention"`
+}
+
+// RetentionConfig is the supervisor's stable millisecond-based JSON
+// projection of the store retention policy.
+type RetentionConfig struct {
+	MaxAgeMs            int64   `json:"maxAgeMs"`
+	MaxTerminalRuns     int     `json:"maxTerminalRuns"`
+	MaxStateBytes       int64   `json:"maxStateBytes"`
+	PreserveTombstones  bool    `json:"preserveTombstones"`
+	MaxTombstones       int     `json:"maxTombstones"`
+	MaxTombstoneAgeMs   int64   `json:"maxTombstoneAgeMs"`
+	CompactMinFreeBytes int64   `json:"compactMinFreeBytes"`
+	CompactMinFreeRatio float64 `json:"compactMinFreeRatio"`
 }
 
 func defaultConfig() Config {
+	retention := retentionConfigFromPolicy(store.DefaultRetentionPolicy())
 	return Config{
 		SampleIntervalMs: 250, TerminationGraceMs: 2000,
 		DefaultOutputBytes: 1 << 20, MaxOutputBytes: 64 << 20,
 		MaxWallTimeMs:  int64((7 * 24 * time.Hour) / time.Millisecond),
 		MaxMemoryBytes: 1 << 40, MaxProcessCount: 4096, MaxTaskCount: 4096,
 		EventRetentionCount: 4096, EventRetentionBytes: 16 << 20,
+		RetentionIntervalMs: 60_000, Retention: retention,
+	}
+}
+
+func retentionConfigFromPolicy(policy store.RetentionPolicy) RetentionConfig {
+	return RetentionConfig{
+		MaxAgeMs:            policy.MaxAge.Milliseconds(),
+		MaxTerminalRuns:     policy.MaxTerminalRuns,
+		MaxStateBytes:       policy.MaxStateBytes,
+		PreserveTombstones:  policy.PreserveTombstones,
+		MaxTombstones:       policy.MaxTombstones,
+		MaxTombstoneAgeMs:   policy.MaxTombstoneAge.Milliseconds(),
+		CompactMinFreeBytes: policy.CompactMinFreeBytes,
+		CompactMinFreeRatio: policy.CompactMinFreeRatio,
+	}
+}
+
+func (config RetentionConfig) policy() store.RetentionPolicy {
+	return store.RetentionPolicy{
+		MaxAge:              time.Duration(config.MaxAgeMs) * time.Millisecond,
+		MaxTerminalRuns:     config.MaxTerminalRuns,
+		MaxStateBytes:       config.MaxStateBytes,
+		PreserveTombstones:  config.PreserveTombstones,
+		MaxTombstones:       config.MaxTombstones,
+		MaxTombstoneAge:     time.Duration(config.MaxTombstoneAgeMs) * time.Millisecond,
+		CompactMinFreeBytes: config.CompactMinFreeBytes,
+		CompactMinFreeRatio: config.CompactMinFreeRatio,
 	}
 }
 
@@ -85,6 +130,12 @@ func loadConfig(root string) (Config, error) {
 	}
 	if config.EventRetentionCount < 16 || config.EventRetentionCount > 1000000 || config.EventRetentionBytes < 256<<10 || config.EventRetentionBytes > 1<<30 {
 		return Config{}, errors.New("invalid event retention bounds")
+	}
+	if config.RetentionIntervalMs < 1000 || config.RetentionIntervalMs > int64((24*time.Hour)/time.Millisecond) {
+		return Config{}, errors.New("retentionIntervalMs must be between 1000 and 86400000")
+	}
+	if err := validateRetentionConfig(config.Retention); err != nil {
+		return Config{}, err
 	}
 	return config, nil
 }

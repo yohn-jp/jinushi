@@ -94,19 +94,22 @@ type active struct {
 }
 
 type Service struct {
-	store        *store.Store
-	backend      executor
-	root         string
-	config       Config
-	writerLeases *WriterLeaseManager
-	mu           sync.RWMutex
-	submissionMu sync.Mutex
-	active       map[string]*active
-	stop         chan struct{}
-	closeOnce    sync.Once
-	workers      sync.WaitGroup
-	closing      bool // guarded by mu; also gates workers.Add against Close.Wait
-	notifier     *runtimeNotifier
+	store             *store.Store
+	backend           executor
+	root              string
+	config            Config
+	writerLeases      *WriterLeaseManager
+	mu                sync.RWMutex
+	submissionMu      sync.Mutex
+	retentionPassMu   sync.Mutex
+	retentionStatusMu sync.RWMutex
+	compaction        compactionObservation
+	active            map[string]*active
+	stop              chan struct{}
+	closeOnce         sync.Once
+	workers           sync.WaitGroup
+	closing           bool // guarded by mu; also gates workers.Add against Close.Wait
+	notifier          *runtimeNotifier
 }
 
 func newService(root string, db *store.Store, backend executor, config Config) *Service {
@@ -309,7 +312,14 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 	}
 	switch req.Op {
 	case "status":
-		return s.hostEnvelopeResponse(response())
+		out := s.hostEnvelopeResponse(response())
+		status, err := s.runtimeStatus()
+		out.Status = &status
+		if err != nil {
+			out.Error = &protocol.Failure{Code: "storage-failure", Message: "runtime status could not be read"}
+			return out
+		}
+		return out
 	case "capabilities":
 		caps := s.backend.Capabilities()
 		out := response()
@@ -400,7 +410,7 @@ func (s *Service) create(req protocol.Request) protocol.Response {
 	if existing, found, err := s.store.ResolveSubmission(req.SubmissionID, digest, time.Now().UTC()); err != nil {
 		return submissionStoreFailure(err)
 	} else if found {
-		return acceptedRunResponse(existing)
+		return s.acceptedRunResponse(existing)
 	}
 	// Validation applies defaults, so keep them on a per-request copy. A
 	// caller retry can arrive concurrently with the same decoded specification
@@ -476,7 +486,7 @@ func (s *Service) create(req protocol.Request) protocol.Response {
 	}
 	if !created.Created {
 		s.mu.Unlock()
-		return acceptedRunResponse(created.Run)
+		return s.acceptedRunResponse(created.Run)
 	}
 	run = created.Run
 	a := &active{run: run, spec: *spec, done: make(chan struct{})}
@@ -484,13 +494,18 @@ func (s *Service) create(req protocol.Request) protocol.Response {
 	s.launchLocked(func() { s.start(a) })
 	s.mu.Unlock()
 	s.notifyRunChange(run.ID)
-	return acceptedRunResponse(run)
+	return s.acceptedRunResponse(run)
 }
 
-func acceptedRunResponse(run model.Run) protocol.Response {
+func (s *Service) acceptedRunResponse(run model.Run) protocol.Response {
 	out := response()
 	clean := publicRun(run)
 	out.Run = &clean
+	if run.Receipt != nil && run.Receipt.EvidenceIncomplete {
+		if tombstone, err := s.store.GetTombstone(run.ID); err == nil {
+			out.Tombstone = toTombstoneSummary(&tombstone)
+		}
+	}
 	encoded, err := json.Marshal(out)
 	if err != nil || len(encoded) >= protocol.MaxFrame-(300<<10) {
 		return failure("response-too-large", "Run metadata exceeds the IPC response limit")
@@ -879,26 +894,34 @@ func (w *capture) WriteObserved(data []byte, observedAt time.Time) (int, error) 
 }
 
 func (s *Service) inspect(id string) protocol.Response {
-	run, err := s.store.Get(id)
+	run, tombstone, err := s.loadRunForInspection(id)
 	if err != nil {
-		return failure("run-not-found", "Run not found")
+		if errors.Is(err, store.ErrRunNotFound) {
+			return failure("run-not-found", "Run not found")
+		}
+		return failure("storage-failure", "Run could not be read")
 	}
 	out := response()
 	clean := publicRun(run)
 	out.Run = &clean
+	out.Tombstone = toTombstoneSummary(tombstone)
 	return out
 }
 
 func (s *Service) await(ctx context.Context, id string) protocol.Response {
 	for {
-		run, err := s.store.Get(id)
+		run, tombstone, err := s.loadRunForInspection(id)
 		if err != nil {
-			return failure("run-not-found", "Run not found")
+			if errors.Is(err, store.ErrRunNotFound) {
+				return failure("run-not-found", "Run not found")
+			}
+			return failure("storage-failure", "Run could not be read")
 		}
 		if run.State == model.Terminal || run.State == model.Uncertain {
 			out := response()
 			clean := publicRun(run)
 			out.Run = &clean
+			out.Tombstone = toTombstoneSummary(tombstone)
 			return out
 		}
 		s.mu.RLock()
@@ -921,7 +944,10 @@ func (s *Service) events(req protocol.Request) protocol.Response {
 	}
 	events, from, gap, err := s.store.Events(req.RunID, req.After, int(req.Limit))
 	if err != nil {
-		return failure("run-not-found", "Run not found")
+		if errors.Is(err, store.ErrRunNotFound) {
+			return s.missingRunFailure(req.RunID, "Run or event history not found")
+		}
+		return failure("storage-failure", "event history could not be read")
 	}
 	out := response()
 	out.RetainedFrom = from
@@ -956,7 +982,13 @@ func (s *Service) output(req protocol.Request) protocol.Response {
 			// its live attachment has been removed. The attachment cannot be
 			// renewed, but no live input authority is granted by this read.
 			run, readErr := s.store.Get(req.RunID)
-			if readErr != nil || (run.State != model.Terminal && run.State != model.Uncertain) {
+			if errors.Is(readErr, store.ErrRunNotFound) {
+				return s.missingRunFailure(req.RunID, "Run or output not found")
+			}
+			if readErr != nil {
+				return failure("storage-failure", "Run could not be read")
+			}
+			if run.State != model.Terminal && run.State != model.Uncertain {
 				return failure("attachment-expired", err.Error())
 			}
 		}
@@ -973,7 +1005,10 @@ func (s *Service) output(req protocol.Request) protocol.Response {
 	}
 	data, from, observed, gap, err := s.store.ReadOutput(req.RunID, stream, req.Offset, int(req.Limit))
 	if err != nil {
-		return failure("run-not-found", "Run or output not found")
+		if errors.Is(err, store.ErrRunNotFound) {
+			return s.missingRunFailure(req.RunID, "Run or output not found")
+		}
+		return failure("storage-failure", "output could not be read")
 	}
 	out := response()
 	out.Data = base64.StdEncoding.EncodeToString(data)
@@ -985,6 +1020,17 @@ func (s *Service) output(req protocol.Request) protocol.Response {
 	}
 	_ = observed
 	return out
+}
+
+func (s *Service) missingRunFailure(id, message string) protocol.Response {
+	if tombstone, err := s.store.GetTombstone(id); err == nil {
+		out := failure("evidence-collected", "Detailed Run evidence was collected; inspect or await returns the retained tombstone")
+		out.Tombstone = toTombstoneSummary(&tombstone)
+		return out
+	} else if !errors.Is(err, store.ErrTombstoneNotFound) {
+		return failure("storage-failure", "Run retention evidence could not be read")
+	}
+	return failure("run-not-found", message)
 }
 
 func (s *Service) attach(req protocol.Request) protocol.Response {

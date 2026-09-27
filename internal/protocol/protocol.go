@@ -54,6 +54,8 @@ type Response struct {
 	Data                 string                    `json:"data,omitempty"`
 	Capabilities         *model.Capabilities       `json:"capabilities,omitempty"`
 	HostEnvelope         *model.HostEnvelopeStatus `json:"hostEnvelope,omitempty"`
+	Status               *model.RuntimeStatus      `json:"status,omitempty"`
+	Tombstone            *model.TombstoneSummary   `json:"tombstone,omitempty"`
 	AttachID             string                    `json:"attachId,omitempty"`
 	Telemetry            *model.TelemetryResponse  `json:"telemetry,omitempty"`
 	WriterToken          string                    `json:"writerToken,omitempty"`
