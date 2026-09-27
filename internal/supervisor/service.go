@@ -881,10 +881,15 @@ func (s *Service) signal(req protocol.Request) protocol.Response {
 	if p == nil {
 		return failure("backend-failure", "Run not started")
 	}
+	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: "signal.requested", ObservedAt: time.Now().UTC(), Body: map[string]any{"signal": req.Signal}}); err != nil {
+		return failure("storage-failure", err.Error())
+	}
 	if err := p.Signal(req.Signal); err != nil {
 		return failure("backend-failure", err.Error())
 	}
-	_, _ = s.store.AppendEvent(req.RunID, model.Event{Kind: "signal.delivered", ObservedAt: time.Now().UTC(), Body: map[string]any{"signal": req.Signal}})
+	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: "signal.delivered", ObservedAt: time.Now().UTC(), Body: map[string]any{"signal": req.Signal}}); err != nil {
+		return failure("storage-failure", err.Error())
+	}
 	return response()
 }
 
