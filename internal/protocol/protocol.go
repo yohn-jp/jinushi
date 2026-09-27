@@ -10,6 +10,7 @@ type Request struct {
 	RunID           string         `json:"runId,omitempty"`
 	AttachID        string         `json:"attachId,omitempty"`
 	Follow          bool           `json:"follow,omitempty"`
+	Cursor          string         `json:"cursor,omitempty"`
 	Spec            *model.RunSpec `json:"spec,omitempty"`
 	After           uint64         `json:"after,omitempty"`
 	Offset          int64          `json:"offset,omitempty"`
@@ -32,6 +33,7 @@ type Response struct {
 	Version      int                 `json:"version"`
 	Run          *model.Run          `json:"run,omitempty"`
 	Runs         []model.Run         `json:"runs,omitempty"`
+	NextCursor   string              `json:"nextCursor"`
 	Events       []model.Event       `json:"events,omitempty"`
 	RetainedFrom uint64              `json:"retainedFrom,omitempty"`
 	Gap          bool                `json:"gap,omitempty"`

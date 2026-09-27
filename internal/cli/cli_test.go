@@ -68,6 +68,72 @@ func TestRunForwardsArgumentBoundaries(t *testing.T) {
 	}
 }
 
+func TestListForwardsPageCursorAndLimitAndExposesNextCursor(t *testing.T) {
+	stateDir := t.TempDir()
+	requestReceived := make(chan protocol.Request, 1)
+	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+		requestReceived <- request
+		return protocol.Response{
+			Version:    model.ProtocolVersion,
+			Runs:       []model.Run{{ID: "run_page_item", State: model.Running}},
+			NextCursor: "run_page_item",
+		}
+	})
+	var stdout, stderr bytes.Buffer
+	code := Main(context.Background(), []string{"list", "--state-dir", stateDir, "--cursor", "run_before", "--limit", "17"}, &stdout, &stderr, nil)
+	if code != 0 {
+		t.Fatalf("list exit = %d; stderr=%s", code, stderr.String())
+	}
+	request := <-requestReceived
+	if request.Op != "list" || request.Cursor != "run_before" || request.Limit != 17 {
+		t.Fatalf("list request = %#v; want cursor=run_before limit=17", request)
+	}
+	var response protocol.Response
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatalf("list output is not JSON: %v; output=%s", err, stdout.String())
+	}
+	if response.NextCursor != "run_page_item" || len(response.Runs) != 1 || response.Runs[0].ID != "run_page_item" {
+		t.Fatalf("list JSON response = %#v", response)
+	}
+}
+
+func TestListDefaultsPageLimitAndRejectsNonPositiveLimit(t *testing.T) {
+	stateDir := t.TempDir()
+	requestReceived := make(chan protocol.Request, 1)
+	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+		requestReceived <- request
+		return protocol.Response{Version: model.ProtocolVersion}
+	})
+	var stdout, stderr bytes.Buffer
+	code := Main(context.Background(), []string{"list", "--state-dir", stateDir}, &stdout, &stderr, nil)
+	if code != 0 {
+		t.Fatalf("default list exit = %d; stderr=%s", code, stderr.String())
+	}
+	request := <-requestReceived
+	if request.Cursor != "" || request.Limit != 64 {
+		t.Fatalf("default list request = %#v; want empty cursor and limit=64", request)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &fields); err != nil {
+		t.Fatalf("list output is not JSON: %v", err)
+	}
+	if _, ok := fields["nextCursor"]; !ok {
+		t.Fatalf("default JSON omitted nextCursor: %s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Main(context.Background(), []string{"list", "--state-dir", stateDir, "--limit", "0"}, &stdout, &stderr, nil)
+	if code != 2 || !strings.Contains(stderr.String(), "--limit must be positive") {
+		t.Fatalf("invalid list limit returned %d; stderr=%s", code, stderr.String())
+	}
+	select {
+	case request := <-requestReceived:
+		t.Fatalf("invalid list limit reached the supervisor: %#v", request)
+	default:
+	}
+}
+
 func TestAwaitProjectsOnlyExitedRunCode(t *testing.T) {
 	cases := []struct {
 		name    string

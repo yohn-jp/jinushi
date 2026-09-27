@@ -191,13 +191,18 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 
 func listCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs, stateDir, human := commonFlags("list", args, stderr)
+	cursor := fs.String("cursor", "", "return Runs after this Run ID")
+	limit := fs.Int64("limit", 64, "maximum Runs to return in this page")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if len(fs.Args()) != 0 {
 		return usageError(stderr, "list takes no positional arguments")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "list"}, *human, stdout, stderr, false)
+	if *limit <= 0 {
+		return usageError(stderr, "--limit must be positive")
+	}
+	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "list", Cursor: *cursor, Limit: *limit}, *human, stdout, stderr, false)
 	return code
 }
 
@@ -909,7 +914,7 @@ func printUsage(w io.Writer) {
 Usage:
   jinushi supervisor [--state-dir DIR]
   jinushi run [options] -- executable [args...]
-  jinushi list
+  jinushi list [--cursor RUN_ID] [--limit N]
   jinushi inspect <run-id>
   jinushi await <run-id>
   jinushi events [--after SEQ] [--follow] <run-id>
