@@ -5,23 +5,26 @@ import "github.com/yohn-jp/jinushi/internal/model"
 const MaxFrame = 1 << 20
 
 type Request struct {
-	Version         int            `json:"version"`
-	Op              string         `json:"op"`
-	RunID           string         `json:"runId,omitempty"`
-	AttachID        string         `json:"attachId,omitempty"`
-	Follow          bool           `json:"follow,omitempty"`
-	Cursor          string         `json:"cursor,omitempty"`
-	Spec            *model.RunSpec `json:"spec,omitempty"`
-	After           uint64         `json:"after,omitempty"`
-	Offset          int64          `json:"offset,omitempty"`
-	Limit           int64          `json:"limit,omitempty"`
-	Stream          string         `json:"stream,omitempty"`
-	Data            string         `json:"data,omitempty"`
-	Signal          string         `json:"signal,omitempty"`
-	Rows            int            `json:"rows,omitempty"`
-	Cols            int            `json:"cols,omitempty"`
-	LeaseGeneration uint64         `json:"leaseGeneration,omitempty"`
-	LeaseMs         int64          `json:"leaseMs,omitempty"`
+	Version            int            `json:"version"`
+	Op                 string         `json:"op"`
+	RunID              string         `json:"runId,omitempty"`
+	SubmissionID       string         `json:"submissionId,omitempty"`
+	RequestID          string         `json:"requestId,omitempty"`
+	ExpectedGeneration uint64         `json:"expectedGeneration,omitempty"`
+	AttachID           string         `json:"attachId,omitempty"`
+	Follow             bool           `json:"follow,omitempty"`
+	Cursor             string         `json:"cursor,omitempty"`
+	Spec               *model.RunSpec `json:"spec,omitempty"`
+	After              uint64         `json:"after,omitempty"`
+	Offset             int64          `json:"offset,omitempty"`
+	Limit              int64          `json:"limit,omitempty"`
+	Stream             string         `json:"stream,omitempty"`
+	Data               string         `json:"data,omitempty"`
+	Signal             string         `json:"signal,omitempty"`
+	Rows               int            `json:"rows,omitempty"`
+	Cols               int            `json:"cols,omitempty"`
+	LeaseGeneration    uint64         `json:"leaseGeneration,omitempty"`
+	LeaseMs            int64          `json:"leaseMs,omitempty"`
 }
 
 type Failure struct {
