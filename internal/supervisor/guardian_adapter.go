@@ -36,7 +36,19 @@ func newGuardedExecutor(root string, config Config) (*guardedExecutor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &guardedExecutor{root: root, executable: exe, native: PlatformBackendFactory()(), config: config}, nil
+	native := PlatformBackendFactory()()
+	hostEnvelope := configuredHostEnvelope(config)
+	if hostEnvelope != (model.HostEnvelopeConfig{}) {
+		if configurator, ok := native.(interface {
+			ConfigureHostEnvelope(model.HostEnvelopeConfig) error
+		}); ok {
+			// An unavailable delegated cgroup is retained as explicit backend
+			// status. The supervisor remains available and rejects Runs whose
+			// configured host safety boundary cannot be enforced.
+			_ = configurator.ConfigureHostEnvelope(hostEnvelope)
+		}
+	}
+	return &guardedExecutor{root: root, executable: exe, native: native, config: config}, nil
 }
 
 func (g *guardedExecutor) Capabilities() model.Capabilities {
@@ -63,6 +75,10 @@ func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stder
 	defer cancel()
 	h, err := guardian.Start(ctx, g.executable, guardian.Config{
 		RunID: run.ID, Dir: g.runDir(run.ID), Spec: spec, MaxOutputBytes: max,
+		HostEnvelope: guardian.HostEnvelopeConfig{
+			MemoryBytes: g.config.HostMemoryBytes,
+			TaskCount:   g.config.HostTaskCount, MaxActiveRuns: g.config.MaxActiveRuns,
+		},
 		InitialLeaseExpiry: run.LeaseExpiry, LeaseGeneration: run.LeaseGeneration,
 		TerminationGraceMs: g.config.TerminationGraceMs, SampleIntervalMs: g.config.SampleIntervalMs,
 	})

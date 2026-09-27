@@ -19,56 +19,11 @@ const hostCgroupName = "jinushi-workload-v1"
 
 var ErrHostEnvelopeAdmission = errors.New("Linux host safety envelope rejected Run admission")
 
-// HostEnvelopeConfig contains hard physical workload ceilings. Zero disables
-// an individual ceiling. TaskCount follows cgroup v2 pids semantics and
-// counts kernel tasks, including threads.
-type HostEnvelopeConfig struct {
-	MemoryBytes   int64 `json:"memoryBytes,omitempty"`
-	TaskCount     int64 `json:"taskCount,omitempty"`
-	MaxActiveRuns int64 `json:"maxActiveRuns,omitempty"`
-}
-
-// HostEnvelopeCapabilities reports only physical host-envelope features.
-// It does not make or expose workload scheduling recommendations.
-type HostEnvelopeCapabilities struct {
-	WorkloadRoot         bool `json:"workloadRoot"`
-	MemoryEnforcement    bool `json:"memoryEnforcement"`
-	TaskCountEnforcement bool `json:"taskCountEnforcement"`
-	ActiveRunEnforcement bool `json:"activeRunEnforcement"`
-	MemoryTelemetry      bool `json:"memoryTelemetry"`
-	TaskTelemetry        bool `json:"taskTelemetry"`
-	PressureTelemetry    bool `json:"pressureTelemetry"`
-}
-
-// HostPressure stores PSI averages as milli-percent (for example, 1250 is
-// 1.250%) and cumulative pressure time in microseconds. Metric.Status keeps
-// unsupported and unavailable observations distinct from measured zero.
-type HostPressure struct {
-	Status                 string       `json:"status"`
-	SomeAvg10MilliPercent  model.Metric `json:"someAvg10MilliPercent"`
-	SomeAvg60MilliPercent  model.Metric `json:"someAvg60MilliPercent"`
-	SomeAvg300MilliPercent model.Metric `json:"someAvg300MilliPercent"`
-	SomeTotalUsec          model.Metric `json:"someTotalUsec"`
-	FullAvg10MilliPercent  model.Metric `json:"fullAvg10MilliPercent"`
-	FullAvg60MilliPercent  model.Metric `json:"fullAvg60MilliPercent"`
-	FullAvg300MilliPercent model.Metric `json:"fullAvg300MilliPercent"`
-	FullTotalUsec          model.Metric `json:"fullTotalUsec"`
-}
-
-// HostEnvelopeStatus is a point-in-time physical observation for the
-// aggregate workload boundary. It intentionally contains no scheduling data.
-type HostEnvelopeStatus struct {
-	Status         string                   `json:"status"`
-	Config         HostEnvelopeConfig       `json:"config"`
-	Capabilities   HostEnvelopeCapabilities `json:"capabilities"`
-	ActiveRuns     model.Metric             `json:"activeRuns"`
-	MemoryBytes    model.Metric             `json:"memoryBytes"`
-	TaskCount      model.Metric             `json:"taskCount"`
-	MemoryPressure HostPressure             `json:"memoryPressure"`
-	CPUPressure    HostPressure             `json:"cpuPressure"`
-	IOPressure     HostPressure             `json:"ioPressure"`
-	Reason         string                   `json:"reason,omitempty"`
-}
+// Host-envelope API types are shared with the runtime status protocol.
+type HostEnvelopeConfig = model.HostEnvelopeConfig
+type HostEnvelopeCapabilities = model.HostEnvelopeCapabilities
+type HostPressure = model.HostPressure
+type HostEnvelopeStatus = model.HostEnvelopeStatus
 
 // HostAdmissionError is returned before process establishment when an
 // observed aggregate physical ceiling has no remaining capacity, or when the
@@ -91,6 +46,10 @@ func (e *HostAdmissionError) Error() string {
 }
 
 func (*HostAdmissionError) Unwrap() error { return ErrHostEnvelopeAdmission }
+
+// HostAdmissionFailureCode lets the Guardian retain a machine-readable
+// admission rejection when a competing physical start wins after preflight.
+func (*HostAdmissionError) HostAdmissionFailureCode() string { return "host-envelope-admission" }
 
 type hostCgroup struct {
 	location cgroupLocation
@@ -186,6 +145,26 @@ func (b *Backend) HostEnvelopeStatus() HostEnvelopeStatus {
 		return unavailableHostStatus("unsupported", b.hostFailure, b.hostConfig)
 	}
 	return b.host.status(b.hostConfig)
+}
+
+// ValidateHostAdmission performs a non-reserving preflight for supervisor
+// feedback. Start repeats the same physical checks while holding the shared
+// admission lock, which is the authority across independent Guardian backends.
+func (b *Backend) ValidateHostAdmission() error {
+	b.hostMu.Lock()
+	defer b.hostMu.Unlock()
+	if !b.hostConfigured {
+		return nil
+	}
+	if b.host == nil {
+		return fmt.Errorf("%w: configured Linux host envelope is unavailable: %s", ErrUnsupported, b.hostFailure)
+	}
+	release, err := b.host.lockAdmission()
+	if err != nil {
+		return &HostAdmissionError{Resource: "workload-root", Limit: 1, Reason: err.Error()}
+	}
+	defer release()
+	return b.host.checkAdmission(b.hostConfig)
 }
 
 func unavailableHostStatus(status, reason string, config HostEnvelopeConfig) HostEnvelopeStatus {

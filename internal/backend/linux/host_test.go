@@ -73,6 +73,9 @@ func TestHostEnvelopeDelegationAndCrossBackendAdmission(t *testing.T) {
 		if status.Status != "unsupported" || status.ActiveRuns.Status != "unsupported" {
 			t.Fatalf("unsupported delegation was not explicit in status: %+v", status)
 		}
+		if err := first.ValidateHostAdmission(); !errors.Is(err, ErrUnsupported) {
+			t.Fatalf("configured unsupported envelope must fail preflight admission, got %v", err)
+		}
 		_, startErr := first.Start(hostSleepSpec(t), nil, nil)
 		if !errors.Is(startErr, ErrHostEnvelopeAdmission) {
 			t.Fatalf("configured unsupported envelope must fail Run admission, got %v", startErr)
@@ -103,6 +106,11 @@ func TestHostEnvelopeDelegationAndCrossBackendAdmission(t *testing.T) {
 		_, _ = process.Terminate(0)
 		_, _ = process.Wait()
 		t.Fatalf("active physical Run was not observed in the workload root: %+v", status.ActiveRuns)
+	}
+	if err := second.ValidateHostAdmission(); !errors.Is(err, ErrHostEnvelopeAdmission) {
+		_, _ = process.Terminate(0)
+		_, _ = process.Wait()
+		t.Fatalf("independent backend preflight bypassed active Run ceiling, got %v", err)
 	}
 	secondProcess, secondErr := second.Start(hostSleepSpec(t), nil, nil)
 	if secondProcess != nil {

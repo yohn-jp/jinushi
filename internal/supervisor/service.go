@@ -303,12 +303,12 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 	}
 	switch req.Op {
 	case "status":
-		return response()
+		return s.hostEnvelopeResponse(response())
 	case "capabilities":
 		caps := s.backend.Capabilities()
 		out := response()
 		out.Capabilities = &caps
-		return out
+		return s.hostEnvelopeResponse(out)
 	case "run":
 		return s.create(req)
 	case "list":
@@ -404,6 +404,9 @@ func (s *Service) create(req protocol.Request) protocol.Response {
 		if err := validator.ValidateLimits(spec.Limits); err != nil {
 			return failure("unsupported-capability", err.Error())
 		}
+	}
+	if f := s.validateHostAdmission(); f != nil {
+		return protocol.Response{Version: model.ProtocolVersion, Error: f}
 	}
 	// Guardian adds launch metadata to the accepted spec before sending it
 	// over its own bounded channel. Leave headroom before accepting the Run.

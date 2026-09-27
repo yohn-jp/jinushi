@@ -118,9 +118,13 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 		state.markNoStartTerminal("cancelled", "lease-expired")
 		return nil
 	}
-	process, err := selected.Start(config.Spec, stdout, stderr)
+	process, err := startBackendWithHostEnvelope(selected, config.HostEnvelope, config.Spec, stdout, stderr)
 	if err != nil {
 		state.controlMu.Unlock()
+		if reason := hostEnvelopeStartupFailureReason(err); reason != "" {
+			state.markStartupFailure(reason)
+			return nil
+		}
 		var uncertain *backend.UncertainError
 		if errors.As(err, &uncertain) {
 			state.markUncertainWithOwnership(uncertain.Ownership, "backend-start-cleanup-unproven")
