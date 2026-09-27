@@ -3,6 +3,7 @@ package supervisor
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -137,6 +138,26 @@ func publicRun(run model.Run) model.Run {
 		run.Ownership = &own
 	}
 	return run
+}
+
+func (s *Service) populateReceipt(run model.Run, receipt *model.Receipt) {
+	// validSpec rejects NUL in argv, making this ordered encoding unambiguous.
+	identity := sha256.Sum256([]byte(strings.Join(run.Spec.Argv, "\x00")))
+	receipt.AcceptedArgvSHA256 = fmt.Sprintf("%x", identity)
+	receipt.Capabilities = s.backend.Capabilities()
+	if !receipt.Output.HistoryComplete {
+		receipt.EvidenceIncomplete = true
+	}
+	for _, metric := range []model.Metric{
+		receipt.Resources.MemoryBytes, receipt.Resources.PeakMemoryBytes,
+		receipt.Resources.CPUTimeNs, receipt.Resources.ProcessCount,
+		receipt.Resources.PeakProcessCount,
+	} {
+		if metric.Status == "unavailable" || metric.Status == "" {
+			receipt.EvidenceIncomplete = true
+			break
+		}
+	}
 }
 
 func validSpec(spec *model.RunSpec, caps model.Capabilities, config Config) *protocol.Failure {
@@ -520,6 +541,7 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 	}
 	a.run.FinishedAt = &now
 	a.run.Receipt = &model.Receipt{Version: model.ProtocolVersion, RunID: a.run.ID, Outcome: outcome, ExitCode: exit.code, Signal: exit.signal, StartedAt: a.run.StartedAt, FinishedAt: now, Resources: a.run.Resources, Output: a.run.Output, TerminationRequested: a.run.TerminationReason != "", Forced: forced, Cleanup: cleanup}
+	s.populateReceipt(a.run, a.run.Receipt)
 	if err := s.transition(a, model.Terminal, "run.terminal", map[string]any{"outcome": outcome}); err != nil {
 		a.run.State = model.Uncertain
 		close(a.done)
@@ -1077,6 +1099,7 @@ func (s *Service) reconcile() error {
 					}
 					run.Receipt = &model.Receipt{Version: 1, RunID: run.ID, Outcome: outcome, ExitCode: result.exit.code, Signal: result.exit.signal, StartedAt: run.StartedAt, FinishedAt: now, Resources: run.Resources, Output: run.Output, Cleanup: "complete"}
 				}
+				s.populateReceipt(run, run.Receipt)
 				if _, err := s.store.Update(run, &model.Event{Kind: "run.terminal", ObservedAt: now}); err != nil {
 					return err
 				}
