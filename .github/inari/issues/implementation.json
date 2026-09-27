@@ -1,0 +1,236 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "implementation",
+  "name": "Implementation",
+  "description": "One-session execution contract for work derived from one or more source Issues",
+  "title": "impl: ",
+  "labels": ["implementation"],
+  "sections": [
+    {
+      "id": "repository",
+      "kind": "input",
+      "type": "string",
+      "label": "Repository identity",
+      "description": "JSON object containing repositoryHost, repositoryId, and optional owner/name repository locator",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "sources",
+      "kind": "input",
+      "type": "string",
+      "label": "Source Issues",
+      "description": "One canonical IssueReference JSON object per line",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "objective",
+      "kind": "input",
+      "type": "string",
+      "label": "Objective",
+      "description": "The concrete outcome for this one implementation session",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "non_goals",
+      "kind": "input",
+      "type": "string",
+      "label": "Non-goals",
+      "description": "Explicit boundaries; use one item per line",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "architecture_decision",
+      "kind": "input",
+      "type": "string",
+      "label": "Architecture decision",
+      "description": "The implementation design selected for this contract",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "affected_components",
+      "kind": "input",
+      "type": "string",
+      "label": "Affected components",
+      "description": "Semantic components or roles affected; one item per line when applicable",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "invariants",
+      "kind": "input",
+      "type": "string",
+      "label": "Invariants",
+      "description": "Behavioral and architectural truths that must remain true",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "compatibility_constraints",
+      "kind": "input",
+      "type": "string",
+      "label": "Compatibility constraints",
+      "description": "Compatibility, migration, security, or performance constraints when applicable",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "readonly_scope",
+      "kind": "input",
+      "type": "string",
+      "label": "READONLY scope",
+      "description": "Readable repository-relative paths or globs; one per line. This never grants WRITE.",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "write_scope",
+      "kind": "input",
+      "type": "string",
+      "label": "WRITE scope",
+      "description": "Explicit writable repository-relative paths or globs; one per line. Empty means no WRITE.",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "create_scope",
+      "kind": "input",
+      "type": "string",
+      "label": "CREATE scope",
+      "description": "Paths that may be created; never inferred from WRITE",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "delete_scope",
+      "kind": "input",
+      "type": "string",
+      "label": "DELETE scope",
+      "description": "Paths that may be deleted; never inferred from WRITE",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "deny_scope",
+      "kind": "input",
+      "type": "string",
+      "label": "DENY / exclusions",
+      "description": "Explicit exclusions; DENY always overrides broader allowlists",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "prohibited_operations",
+      "kind": "input",
+      "type": "string",
+      "label": "Prohibited operations",
+      "description": "Operations outside the session contract; one per line",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "immutable_areas",
+      "kind": "input",
+      "type": "string",
+      "label": "Immutable areas",
+      "description": "Areas that must remain unchanged; one per line",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "prerequisites",
+      "kind": "input",
+      "type": "string",
+      "label": "Prerequisites",
+      "description": "Dependencies or conditions required before implementation",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance_criteria",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Verifiable outcomes; one item per line",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "targeted_tests",
+      "kind": "input",
+      "type": "string",
+      "label": "Targeted tests",
+      "description": "Tests to run or an explicit `none`; one item per line",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "required_checks",
+      "kind": "input",
+      "type": "string",
+      "label": "Required checks",
+      "description": "Repository checks required before completion or an explicit `none`",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "postconditions",
+      "kind": "input",
+      "type": "string",
+      "label": "Observable postconditions",
+      "description": "Observable state expected after implementation or an explicit `none`",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "base_branch",
+      "kind": "input",
+      "type": "string",
+      "label": "Base branch",
+      "description": "Branch from which the implementation is based",
+      "required": true,
+      "element": "input"
+    },
+    {
+      "id": "base_revision",
+      "kind": "input",
+      "type": "string",
+      "label": "Base revision",
+      "description": "Known base commit revision; leave empty when it cannot yet be known",
+      "required": false,
+      "element": "input"
+    },
+    {
+      "id": "base_freshness",
+      "kind": "input",
+      "type": "string",
+      "label": "Base freshness",
+      "description": "Provider or workflow freshness input, when known",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "implementation_branch",
+      "kind": "input",
+      "type": "string",
+      "label": "Implementation branch",
+      "description": "Canonical branch identity when already decided",
+      "required": false,
+      "element": "input"
+    },
+    {
+      "id": "dependencies",
+      "kind": "input",
+      "type": "string",
+      "label": "Execution dependencies",
+      "description": "One canonical IssueReference JSON object per line when execution depends on other Issues",
+      "required": false,
+      "element": "textarea"
+    }
+  ]
+}
