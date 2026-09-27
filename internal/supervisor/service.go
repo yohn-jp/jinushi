@@ -46,6 +46,7 @@ type reconcileResult struct {
 	process           physical
 	receipt           *model.Receipt
 	ownership         *model.Ownership
+	effective         *model.Capabilities
 	state             model.State
 	terminationReason string
 	lease             leaseState
@@ -146,7 +147,7 @@ func initialResources(c model.Capabilities, sampleIntervalMs int64) model.Resour
 		}
 		return model.Metric{Status: "unsupported"}
 	}
-	return model.Resources{MemoryBytes: metric(c.MemoryTelemetry), PeakMemoryBytes: metric(c.MemoryTelemetry), CPUTimeNs: metric(c.CPUTelemetry), ProcessCount: metric(c.ProcessTelemetry), PeakProcessCount: metric(c.ProcessTelemetry), SampleIntervalMs: sampleIntervalMs}
+	return model.Resources{MemoryBytes: metric(c.MemoryTelemetry), PeakMemoryBytes: metric(c.MemoryTelemetry), CPUTimeNs: metric(c.CPUTelemetry), ProcessCount: metric(c.ProcessTelemetry), PeakProcessCount: metric(c.ProcessTelemetry), TaskCount: metric(c.ProcessTelemetry), PeakTaskCount: metric(c.ProcessTelemetry), SampleIntervalMs: sampleIntervalMs}
 }
 
 func normalizeResources(r model.Resources, c model.Capabilities, sampleIntervalMs int64) model.Resources {
@@ -166,6 +167,12 @@ func normalizeResources(r model.Resources, c model.Capabilities, sampleIntervalM
 	if r.PeakProcessCount.Status == "" {
 		r.PeakProcessCount = defaults.PeakProcessCount
 	}
+	if r.TaskCount.Status == "" {
+		r.TaskCount = defaults.TaskCount
+	}
+	if r.PeakTaskCount.Status == "" {
+		r.PeakTaskCount = defaults.PeakTaskCount
+	}
 	return r
 }
 
@@ -184,14 +191,20 @@ func (s *Service) populateReceipt(run model.Run, receipt *model.Receipt) {
 	// validSpec rejects NUL in argv, making this ordered encoding unambiguous.
 	identity := sha256.Sum256([]byte(strings.Join(run.Spec.Argv, "\x00")))
 	receipt.AcceptedArgvSHA256 = fmt.Sprintf("%x", identity)
-	receipt.Capabilities = s.backend.Capabilities()
+	if run.EffectiveCapabilities != nil {
+		copy := *run.EffectiveCapabilities
+		copy.Signals = append([]string(nil), copy.Signals...)
+		receipt.EffectiveCapabilities = &copy
+		receipt.Capabilities = copy
+	}
 	if !receipt.Output.HistoryComplete || run.ResourceGap {
 		receipt.EvidenceIncomplete = true
 	}
 	for _, metric := range []model.Metric{
 		receipt.Resources.MemoryBytes, receipt.Resources.PeakMemoryBytes,
 		receipt.Resources.CPUTimeNs, receipt.Resources.ProcessCount,
-		receipt.Resources.PeakProcessCount,
+		receipt.Resources.PeakProcessCount, receipt.Resources.TaskCount,
+		receipt.Resources.PeakTaskCount,
 	} {
 		if metric.Status == "unavailable" || metric.Status == "" {
 			receipt.EvidenceIncomplete = true
@@ -240,10 +253,10 @@ func validSpec(spec *model.RunSpec, caps model.Capabilities, config Config) *pro
 	if spec.Lifetime.Mode == "lease-bound" && (spec.Lifetime.LeaseMs < 1000 || spec.Lifetime.LeaseMs > config.MaxWallTimeMs) {
 		return &protocol.Failure{Code: "invalid-request", Message: "invalid lease duration"}
 	}
-	if spec.Limits.MemoryBytes < 0 || spec.Limits.CPUQuotaPercent < 0 || spec.Limits.ProcessCount < 0 || spec.Limits.WallTimeMs < 0 || spec.Limits.OutputBytes < 0 {
+	if spec.Limits.MemoryBytes < 0 || spec.Limits.CPUQuotaPercent < 0 || spec.Limits.ProcessCount < 0 || spec.Limits.TaskCount < 0 || spec.Limits.WallTimeMs < 0 || spec.Limits.OutputBytes < 0 {
 		return &protocol.Failure{Code: "invalid-request", Message: "negative limit"}
 	}
-	if spec.Limits.OutputBytes > config.MaxOutputBytes || spec.Limits.WallTimeMs > config.MaxWallTimeMs || spec.Limits.MemoryBytes > config.MaxMemoryBytes || spec.Limits.ProcessCount > config.MaxProcessCount {
+	if spec.Limits.OutputBytes > config.MaxOutputBytes || spec.Limits.WallTimeMs > config.MaxWallTimeMs || spec.Limits.MemoryBytes > config.MaxMemoryBytes || spec.Limits.ProcessCount > config.MaxProcessCount || spec.Limits.TaskCount > config.MaxTaskCount {
 		return &protocol.Failure{Code: "invalid-request", Message: "limit exceeds supervisor ceiling"}
 	}
 	if spec.Interactive && !caps.PTY {
@@ -257,6 +270,9 @@ func validSpec(spec *model.RunSpec, caps model.Capabilities, config Config) *pro
 	}
 	if spec.Limits.ProcessCount > 0 && !caps.ProcessCountEnforcement {
 		return &protocol.Failure{Code: "unsupported-capability", Message: "process-count enforcement unavailable"}
+	}
+	if spec.Limits.TaskCount > 0 && !caps.TaskCountEnforcement {
+		return &protocol.Failure{Code: "unsupported-capability", Message: "task-count enforcement unavailable"}
 	}
 	if len(spec.Correlation) > 16 {
 		return &protocol.Failure{Code: "invalid-request", Message: "too many correlation labels"}
@@ -410,7 +426,7 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 	return accepted
 }
 
-func (s *Service) transition(a *active, state model.State, kind string, body map[string]any) error {
+func (s *Service) transition(a *active, state model.State, kind model.EventKind, body map[string]any) error {
 	next := a.run
 	next.State = state
 	next.Generation++
@@ -447,6 +463,9 @@ func (s *Service) start(a *active) {
 		var cleanTerminal *cleanStartTerminal
 		if errors.As(err, &cleanTerminal) {
 			receipt := cleanTerminal.receipt
+			a.mu.Lock()
+			a.run.EffectiveCapabilities = cleanTerminal.effective
+			a.mu.Unlock()
 			s.finish(a, receipt.Outcome, exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: receipt.Outcome, finishedAt: receipt.FinishedAt, terminationRequested: receipt.TerminationRequested, forced: receipt.Forced, receipt: &receipt}, receipt.Forced, receipt.Cleanup)
 			return
 		}
@@ -466,11 +485,14 @@ func (s *Service) start(a *active) {
 	a.process = p
 	own := p.Ownership()
 	a.run.Ownership = &own
+	if source, ok := p.(interface{ EffectiveCapabilities() *model.Capabilities }); ok {
+		a.run.EffectiveCapabilities = source.EffectiveCapabilities()
+	}
 	now := time.Now().UTC()
 	a.run.StartedAt = &now
-	state, kind := model.Running, "run.running"
+	state, kind := model.Running, model.EventRunRunning
 	if a.terminating {
-		state, kind = model.Terminating, "run.owned"
+		state, kind = model.Terminating, model.EventRunOwned
 	}
 	if err := s.transition(a, state, kind, map[string]any{"pid": own.PID}); err != nil {
 		a.mu.Unlock()
@@ -1131,14 +1153,14 @@ func (s *Service) requestTermination(a *active, reason string) (physical, error)
 	next.TerminationReason = reason
 	next.State = model.Terminating
 	next.Generation++
-	kind := "run.terminating"
+	kind := model.EventRunTerminating
 	body := map[string]any{"reason": reason}
 	if reason == "timed-out" {
-		kind = "limit.reached"
+		kind = model.EventLimitReached
 		body["limit"] = "wall-time"
 	}
 	if reason == "lease-expired" {
-		kind = "lease.expired"
+		kind = model.EventLeaseExpired
 	}
 	if _, err := s.store.Update(next, &model.Event{Kind: kind, ObservedAt: time.Now().UTC(), Body: body}); err != nil {
 		return nil, err
@@ -1334,6 +1356,9 @@ func (s *Service) reconcile() error {
 			if e == nil {
 				e = importLeaseState(&run, result.lease)
 				if e == nil {
+					if run.EffectiveCapabilities == nil {
+						run.EffectiveCapabilities = result.effective
+					}
 					resourceEvents = s.recoveredResourceEvents(&run, result)
 					if result.lastOutputAt != nil && (run.LastOutputAt == nil || result.lastOutputAt.After(*run.LastOutputAt)) {
 						run.LastOutputAt = result.lastOutputAt

@@ -22,7 +22,10 @@ type guardedExecutor struct {
 	config     Config
 }
 
-type cleanStartTerminal struct{ receipt model.Receipt }
+type cleanStartTerminal struct {
+	receipt   model.Receipt
+	effective *model.Capabilities
+}
 
 func (e *cleanStartTerminal) Error() string {
 	return "workload finished before ownership establishment: " + e.receipt.Outcome
@@ -69,6 +72,7 @@ func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stder
 	p := newGuardianPhysical(h, spec.Interactive, stdout, stderr)
 	if snap, obErr := h.Observe(ctx); obErr == nil && snap.Ownership != nil {
 		p.ownership = *snap.Ownership
+		p.effective = snap.EffectiveCapabilities
 	} else if obErr == nil && snap.State == model.Terminal && snap.Receipt != nil && snap.Receipt.Cleanup == "complete" {
 		if snap.Receipt.Outcome == "startup-failed" {
 			return nil, fmt.Errorf("workload startup failed")
@@ -76,7 +80,7 @@ func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stder
 		if err := p.syncOutput(0); err != nil {
 			return p, fmt.Errorf("import fast-terminal output: %w", err)
 		}
-		return nil, &cleanStartTerminal{receipt: *snap.Receipt}
+		return nil, &cleanStartTerminal{receipt: *snap.Receipt, effective: snap.EffectiveCapabilities}
 	}
 	if err != nil {
 		return p, err
@@ -132,7 +136,7 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 		if snap.LimitOutcome != "" {
 			outcome = snap.LimitOutcome
 		}
-		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
+		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
 	}
 	if snap.State != model.Running && snap.State != model.Terminating {
 		return reconcileResult{}, errors.New("guardian has no provable live Run state")
@@ -161,10 +165,11 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 	}
 	p := newReconciledGuardianPhysical(h, run, stdout, stderr)
 	p.ownership = *snap.Ownership
+	p.effective = snap.EffectiveCapabilities
 	if err := p.syncOutput(16); err != nil {
 		return reconcileResult{}, err
 	}
-	return reconcileResult{live: true, process: p, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
+	return reconcileResult{live: true, process: p, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
 }
 
 func newReconciledGuardianPhysical(h *guardian.Handle, run model.Run, stdout, stderr io.Writer) *guardianPhysical {
@@ -201,6 +206,7 @@ type guardianPhysical struct {
 	mu          sync.Mutex
 	h           *guardian.Handle
 	ownership   model.Ownership
+	effective   *model.Capabilities
 	interactive bool
 	stdout      io.Writer
 	stderr      io.Writer
@@ -214,6 +220,8 @@ func newGuardianPhysical(h *guardian.Handle, interactive bool, stdout, stderr io
 }
 
 func (p *guardianPhysical) Ownership() model.Ownership { return p.ownership }
+
+func (p *guardianPhysical) EffectiveCapabilities() *model.Capabilities { return p.effective }
 
 // syncOutput reads one chunk per stream in each pass. Live observation uses a
 // finite budget so a continuous producer cannot starve another stream or

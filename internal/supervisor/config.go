@@ -21,6 +21,7 @@ type Config struct {
 	MaxWallTimeMs       int64 `json:"maxWallTimeMs"`
 	MaxMemoryBytes      int64 `json:"maxMemoryBytes"`
 	MaxProcessCount     int64 `json:"maxProcessCount"`
+	MaxTaskCount        int64 `json:"maxTaskCount"`
 	EventRetentionCount int   `json:"eventRetentionCount"`
 	EventRetentionBytes int64 `json:"eventRetentionBytes"`
 }
@@ -30,7 +31,7 @@ func defaultConfig() Config {
 		SampleIntervalMs: 250, TerminationGraceMs: 2000,
 		DefaultOutputBytes: 1 << 20, MaxOutputBytes: 64 << 20,
 		MaxWallTimeMs:  int64((7 * 24 * time.Hour) / time.Millisecond),
-		MaxMemoryBytes: 1 << 40, MaxProcessCount: 4096,
+		MaxMemoryBytes: 1 << 40, MaxProcessCount: 4096, MaxTaskCount: 4096,
 		EventRetentionCount: 4096, EventRetentionBytes: 16 << 20,
 	}
 }
@@ -73,7 +74,7 @@ func loadConfig(root string) (Config, error) {
 	if config.MaxWallTimeMs < 1000 || config.MaxWallTimeMs > int64((30*24*time.Hour)/time.Millisecond) {
 		return Config{}, errors.New("invalid maxWallTimeMs")
 	}
-	if config.MaxMemoryBytes < 1 || config.MaxProcessCount < 1 {
+	if config.MaxMemoryBytes < 1 || config.MaxProcessCount < 1 || config.MaxTaskCount < 1 {
 		return Config{}, errors.New("invalid resource safety ceilings")
 	}
 	if config.EventRetentionCount < 16 || config.EventRetentionCount > 1000000 || config.EventRetentionBytes < 256<<10 || config.EventRetentionBytes > 1<<30 {
