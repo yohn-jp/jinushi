@@ -70,7 +70,7 @@ type physical interface {
 type executor interface {
 	Capabilities() model.Capabilities
 	Start(model.Run, model.RunSpec, io.Writer, io.Writer) (physical, error)
-	Reconcile(string, *model.Ownership, bool, io.Writer, io.Writer) (reconcileResult, error)
+	Reconcile(model.Run, io.Writer, io.Writer) (reconcileResult, error)
 }
 
 type active struct {
@@ -1185,7 +1185,7 @@ func (s *Service) reconcile() error {
 			if run.Spec.Interactive {
 				stdout.stream = "pty"
 			}
-			result, e := s.backend.Reconcile(run.ID, run.Ownership, run.Spec.Interactive, stdout, stderr)
+			result, e := s.backend.Reconcile(run, stdout, stderr)
 			refreshed, readErr := s.store.Get(run.ID)
 			if readErr != nil {
 				return readErr

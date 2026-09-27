@@ -77,10 +77,10 @@ func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stder
 	return p, nil
 }
 
-func (g *guardedExecutor) Reconcile(id string, owned *model.Ownership, interactive bool, stdout, stderr io.Writer) (reconcileResult, error) {
+func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (reconcileResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	h, err := guardian.Reattach(ctx, g.runDir(id), id)
+	h, err := guardian.Reattach(ctx, g.runDir(run.ID), run.ID)
 	if err != nil {
 		return reconcileResult{}, err
 	}
@@ -88,11 +88,14 @@ func (g *guardedExecutor) Reconcile(id string, owned *model.Ownership, interacti
 	if err != nil {
 		return reconcileResult{}, err
 	}
-	if owned != nil && (snap.Ownership == nil || *snap.Ownership != *owned) {
+	if run.Ownership != nil && (snap.Ownership == nil || *snap.Ownership != *run.Ownership) {
 		return reconcileResult{}, errors.New("durable ownership mismatch")
 	}
+	if err := validateOutputCursor(run.Output, snap.Output, run.Spec.Interactive); err != nil {
+		return reconcileResult{}, err
+	}
 	if snap.State == model.Terminal && snap.Receipt != nil && snap.Receipt.Cleanup == "complete" {
-		p := newGuardianPhysical(h, interactive, stdout, stderr)
+		p := newReconciledGuardianPhysical(h, run, stdout, stderr)
 		if err := p.syncOutput(); err != nil {
 			return reconcileResult{}, err
 		}
@@ -102,6 +105,9 @@ func (g *guardedExecutor) Reconcile(id string, owned *model.Ownership, interacti
 			outcome = snap.LimitOutcome
 		}
 		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap)}, nil
+	}
+	if snap.State != model.Running && snap.State != model.Terminating {
+		return reconcileResult{}, errors.New("guardian has no provable live Run state")
 	}
 	if snap.Ownership == nil {
 		return reconcileResult{}, errors.New("guardian ownership absent")
@@ -114,12 +120,36 @@ func (g *guardedExecutor) Reconcile(id string, owned *model.Ownership, interacti
 	if err != nil || !osEvidence.OwnershipProven || (osEvidence.State != model.Running && osEvidence.State != model.Terminating) {
 		return reconcileResult{}, errors.New("OS ownership not proven")
 	}
-	p := newGuardianPhysical(h, interactive, stdout, stderr)
+	p := newReconciledGuardianPhysical(h, run, stdout, stderr)
 	p.ownership = *snap.Ownership
 	if err := p.syncOutput(); err != nil {
 		return reconcileResult{}, err
 	}
 	return reconcileResult{live: true, process: p, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap)}, nil
+}
+
+func newReconciledGuardianPhysical(h *guardian.Handle, run model.Run, stdout, stderr io.Writer) *guardianPhysical {
+	p := newGuardianPhysical(h, run.Spec.Interactive, stdout, stderr)
+	if run.Spec.Interactive {
+		p.offsets["pty"] = run.Output.PTY.ObservedBytes
+	} else {
+		p.offsets["stdout"] = run.Output.Stdout.ObservedBytes
+		p.offsets["stderr"] = run.Output.Stderr.ObservedBytes
+	}
+	return p
+}
+
+func validateOutputCursor(stored, guardianOutput model.Output, interactive bool) error {
+	if interactive {
+		if stored.PTY.ObservedBytes > guardianOutput.PTY.ObservedBytes {
+			return errors.New("durable PTY output cursor exceeds guardian observation")
+		}
+		return nil
+	}
+	if stored.Stdout.ObservedBytes > guardianOutput.Stdout.ObservedBytes || stored.Stderr.ObservedBytes > guardianOutput.Stderr.ObservedBytes {
+		return errors.New("durable stdio output cursor exceeds guardian observation")
+	}
+	return nil
 }
 
 func leaseFromSnapshot(snap guardian.Snapshot) leaseState {
