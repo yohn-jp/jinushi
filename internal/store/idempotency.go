@@ -40,7 +40,7 @@ const (
 
 	RequestIDMaxBytes         = 128
 	ControlRequestWindow      = 24 * time.Hour
-	MaxControlRequestsPerRun  = 256
+	MaxControlRequestsPerRun  = 8192
 	MaxControlRequestsRuntime = 100_000
 	maxControlFailureCode     = 64
 	maxControlFailureMessage  = 256
@@ -290,7 +290,11 @@ func submissionRunTombstone(run model.Run) model.Run {
 	receipt.Resources = compactResources(receipt.Resources)
 	receipt.Output = compactOutputHistory(receipt.Output)
 	receipt.EventHistoryComplete = false
-	receipt.EventRetainedFrom = receipt.EventLastSeq + 1
+	if receipt.EventLastSeq < math.MaxUint64 {
+		receipt.EventRetainedFrom = receipt.EventLastSeq + 1
+	} else {
+		receipt.EventRetainedFrom = math.MaxUint64
+	}
 	receipt.EvidenceIncomplete = true
 	stub.Resources = receipt.Resources
 	stub.Output = receipt.Output

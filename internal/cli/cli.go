@@ -603,7 +603,7 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 					}
 					controlSendMu.Lock()
 					request := protocol.Request{Op: "input", RunID: runID, AttachID: attachID, Stream: "pty", Data: base64.StdEncoding.EncodeToString(input), RequestID: requestID, ExpectedGeneration: controlGeneration.Load()}
-					response, callErr := ipc.Call(attachCtx, stateDir, request)
+					response, callErr := callAttachControl(attachCtx, stateDir, request, &controlGeneration)
 					if response.Run != nil {
 						updateControlGeneration(&controlGeneration, response.Run.Generation)
 					}
@@ -746,6 +746,23 @@ func updateControlGeneration(generation *atomic.Uint64, value uint64) {
 	}
 }
 
+// A concurrent control can advance the Run while an attachment is reading
+// input. A stale-generation rejection has not claimed the request identity,
+// so retrying that same identity after inspection cannot duplicate input.
+func callAttachControl(ctx context.Context, stateDir string, request protocol.Request, generation *atomic.Uint64) (protocol.Response, error) {
+	response, err := ipc.Call(ctx, stateDir, request)
+	if err != nil || response.Error == nil || response.Error.Code != "stale-generation" {
+		return response, err
+	}
+	current, err := ipc.Call(ctx, stateDir, protocol.Request{Op: "inspect", RunID: request.RunID})
+	if err != nil || current.Error != nil || current.Run == nil {
+		return response, err
+	}
+	updateControlGeneration(generation, current.Run.Generation)
+	request.ExpectedGeneration = current.Run.Generation
+	return ipc.Call(ctx, stateDir, request)
+}
+
 func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, generation *atomic.Uint64, sendMu *sync.Mutex, stderr io.Writer) {
 	rows, cols, ok := terminalDimensions(os.Stdin)
 	if !ok {
@@ -769,7 +786,7 @@ func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, 
 			return
 		}
 		sendMu.Lock()
-		response, err := ipc.Call(ctx, stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: attachID, Rows: newRows, Cols: newCols, RequestID: requestID, ExpectedGeneration: generation.Load()})
+		response, err := callAttachControl(ctx, stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: attachID, Rows: newRows, Cols: newCols, RequestID: requestID, ExpectedGeneration: generation.Load()}, generation)
 		if response.Run != nil {
 			updateControlGeneration(generation, response.Run.Generation)
 		}

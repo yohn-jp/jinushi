@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,9 +27,10 @@ import (
 )
 
 var (
-	jinushiBinary string
-	helperBinary  string
-	buildRoot     string
+	jinushiBinary    string
+	helperBinary     string
+	buildRoot        string
+	submissionSerial atomic.Uint64
 )
 
 func TestMain(m *testing.M) {
@@ -293,7 +295,10 @@ func (h *harness) cleanup() {
 	}
 	for i := len(h.runs) - 1; i >= 0; i-- {
 		id := h.runs[i]
-		_, _, _ = h.invoke(3*time.Second, "cancel", "--state-dir", h.stateDir, id)
+		_, _, current := h.invoke(3*time.Second, "inspect", "--state-dir", h.stateDir, id)
+		if current.Run != nil && current.Run.State != "terminal" && current.Run.State != "uncertain" {
+			_, _, _ = h.invoke(3*time.Second, "cancel", "--state-dir", h.stateDir, "--request-id", fmt.Sprintf("cleanup-%d", submissionSerial.Add(1)), "--expected-generation", strconv.FormatUint(current.Run.Generation, 10), id)
+		}
 		_, _, _ = h.invoke(8*time.Second, "await", "--state-dir", h.stateDir, id)
 	}
 	h.stopSupervisor(false)
@@ -336,7 +341,7 @@ func (h *harness) invoke(timeout time.Duration, args ...string) (int, []byte, re
 
 func (h *harness) run(args ...string) run {
 	h.t.Helper()
-	full := []string{"run", "--state-dir", h.stateDir, "--cwd", h.t.TempDir()}
+	full := []string{"run", "--state-dir", h.stateDir, "--submission-id", fmt.Sprintf("integration-%d", submissionSerial.Add(1)), "--cwd", h.t.TempDir()}
 	full = append(full, args...)
 	code, _, result := h.invoke(20*time.Second, full...)
 	if code != 0 || result.Error != nil || result.Run == nil || result.Run.ID == "" {
@@ -597,7 +602,7 @@ func TestGrandchildCancellationProvesTreeGone(t *testing.T) {
 	if !linuxProcessExecuting(pid) {
 		t.Fatalf("grandchild PID %d was not executing before cancellation", pid)
 	}
-	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, started.ID)
+	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, "--request-id", "grandchild-cancel", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
 	if code != 0 || canceled.Error != nil {
 		t.Fatalf("cancel Run: exit=%d response=%+v", code, canceled)
 	}
@@ -654,7 +659,7 @@ func TestContinuousStdoutFloodDoesNotStarveStderrAndCancelsTree(t *testing.T) {
 		t.Fatalf("stderr marker was not fully observed within the bounded stream: %+v", whileFlooding.Output.Stderr)
 	}
 
-	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, started.ID)
+	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, "--request-id", "stdout-flood-cancel", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
 	if code != 0 || canceled.Error != nil {
 		t.Fatalf("cancel output flood Run: exit=%d response=%+v", code, canceled)
 	}
@@ -691,16 +696,27 @@ func TestEventJournalReportsCompactionGap(t *testing.T) {
 	const deliveries = 4600
 	errorsFound := make(chan error, workers)
 	var wg sync.WaitGroup
+	var controlMu sync.Mutex
+	generation := h.inspect(started.ID).Generation
 	for worker := 0; worker < workers; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < deliveries/workers; i++ {
+				controlMu.Lock()
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				_, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "signal", RunID: started.ID, Signal: "SIGUSR1"})
+				result, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "signal", RunID: started.ID, Signal: "SIGUSR1", RequestID: fmt.Sprintf("signal-%d", generation), ExpectedGeneration: generation})
 				cancel()
+				if err == nil && result.Error == nil && result.Run != nil {
+					generation = result.Run.Generation
+				}
+				controlMu.Unlock()
 				if err != nil {
 					errorsFound <- err
+					return
+				}
+				if result.Error != nil || result.Run == nil {
+					errorsFound <- fmt.Errorf("signal response: %+v", result)
 					return
 				}
 			}
@@ -750,7 +766,7 @@ func TestPTYAttachReconnectResizeAndInput(t *testing.T) {
 		reconnected.stop()
 		t.Fatalf("reconnected attachment was not accepted: %v; stdout=%q stderr=%q", err, reconnected.stdout.String(), reconnected.stderr.String())
 	}
-	code, _, resized := h.invoke(5*time.Second, "resize", "--state-dir", h.stateDir, "--rows", "40", "--cols", "100", started.ID)
+	code, _, resized := h.invoke(5*time.Second, "resize", "--state-dir", h.stateDir, "--rows", "40", "--cols", "100", "--request-id", "pty-resize", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
 	if code != 0 || resized.Error != nil {
 		t.Fatalf("resize PTY: exit=%d response=%+v", code, resized)
 	}
@@ -844,12 +860,12 @@ func TestCloseInputDeliversEOFToRealRun(t *testing.T) {
 	started := h.run("--", "/bin/sh", "-c", "cat; printf EOF")
 	h.waitUntil("stdin-reading Run to enter running state", 10*time.Second, func() bool { return h.inspect(started.ID).State == "running" })
 
-	code, _, input := h.invoke(5*time.Second, "input", "--state-dir", h.stateDir, started.ID, "payload-before-eof")
+	code, _, input := h.invoke(5*time.Second, "input", "--state-dir", h.stateDir, "--request-id", "stdin-payload", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID, "payload-before-eof")
 	if code != 0 || input.Error != nil {
 		t.Fatalf("write stdin through production CLI: exit=%d response=%+v", code, input)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	closed, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "close-input", RunID: started.ID})
+	closed, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "close-input", RunID: started.ID, RequestID: "stdin-close", ExpectedGeneration: input.Run.Generation})
 	cancel()
 	if err != nil || closed.Error != nil {
 		t.Fatalf("close stdin through production local protocol: response=%+v err=%v", closed, err)
@@ -876,7 +892,7 @@ func TestSupervisorCrashRestartReconcilesLiveRun(t *testing.T) {
 	if reconciled.State != "running" {
 		t.Fatalf("restart failed to reconnect the still-owned execution: %+v", reconciled)
 	}
-	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, started.ID)
+	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, "--request-id", "reconciled-cancel", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
 	if code != 0 || canceled.Error != nil {
 		t.Fatalf("cancel reconciled Run: exit=%d response=%+v", code, canceled)
 	}
@@ -1428,7 +1444,7 @@ func TestLeaseRenewalAfterRestartSurvivesOriginalExpiry(t *testing.T) {
 	if recovered.State != "running" || recovered.LeaseGeneration != renewed.LeaseGeneration || recovered.LeaseExpiry == nil || !recovered.LeaseExpiry.Equal(*renewed.LeaseExpiry) {
 		t.Fatalf("renewed lease evidence did not survive a second Supervisor restart: %+v, want generation=%d expiry=%s", recovered, renewed.LeaseGeneration, renewed.LeaseExpiry)
 	}
-	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, started.ID)
+	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, "--request-id", "renewed-lease-cancel", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
 	if code != 0 || canceled.Error != nil {
 		t.Fatalf("cancel renewed lease Run: exit=%d response=%+v", code, canceled)
 	}
