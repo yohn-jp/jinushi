@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/yohn-jp/jinushi/internal/ipc"
+	"github.com/yohn-jp/jinushi/internal/model"
 	"github.com/yohn-jp/jinushi/internal/protocol"
 )
 
@@ -540,16 +541,15 @@ func TestEventsFollowStreamsLiveRunThroughTerminalMarker(t *testing.T) {
 		}
 		return record
 	}
-	first := decodeRecord(readLine(8 * time.Second))
-	if first.Type != "event" || first.Event.RunID != started.ID || first.Event.Seq <= after ||
-		(first.Event.Kind != "resource.sample" && first.Event.Kind != "resource.unavailable") {
-		t.Fatalf("follow did not stream a new live Run event after sequence %d: %+v", after, first)
-	}
 	if current := h.inspect(started.ID); current.State != "running" {
 		t.Fatalf("follow did not attach while the Run was still active: state=%s", current.State)
 	}
 	if err := os.WriteFile(releasePath, []byte("release"), 0600); err != nil {
 		t.Fatalf("release held Run: %v", err)
+	}
+	first := decodeRecord(readLine(8 * time.Second))
+	if first.Type != "event" || first.Event.RunID != started.ID || first.Event.Seq <= after || first.Event.Kind != "output.chunk" {
+		t.Fatalf("follow did not stream new output evidence after sequence %d: %+v", after, first)
 	}
 
 	lastSeq := first.Event.Seq
@@ -1086,7 +1086,6 @@ func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) 
 		t.Fatalf("read reconciled lifecycle journal: %+v", journal.Error)
 	}
 	var gapEvent *event
-	var resourceSamples []*event
 	var lastPhysicalOutput *event
 	for i := range journal.Events {
 		current := &journal.Events[i]
@@ -1094,7 +1093,7 @@ func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) 
 		case "resource.gap":
 			gapEvent = current
 		case "resource.sample":
-			resourceSamples = append(resourceSamples, current)
+			t.Fatalf("high-rate telemetry appeared in the lifecycle journal: %+v", current)
 		case "output.chunk":
 			if current.data()["stream"] == "stdout" {
 				var body struct {
@@ -1148,27 +1147,21 @@ func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) 
 			t.Fatalf("resource.gap latest metric %s has no explicit evidence status: %+v", name, sampled)
 		}
 	}
-	var sampleBody struct {
-		Resources resources `json:"resources"`
-	}
-	var sampleEvent *event
-	for _, current := range resourceSamples {
-		if current.ObservedAt.Equal(gapBody.To) {
-			sampleEvent = current
+	telemetry := queryTelemetryAt(t, h, started.ID, gapBody.To)
+	var matchingSample *model.TelemetrySample
+	for i := range telemetry.Samples {
+		if telemetry.Samples[i].ObservedAt.Equal(gapBody.To) {
+			matchingSample = &telemetry.Samples[i]
 			break
 		}
 	}
-	if sampleEvent == nil || gapEvent.Seq >= sampleEvent.Seq {
-		t.Fatalf("resource.gap was not followed by its matching resource.sample event: gap=%+v samples=%+v", gapEvent, resourceSamples)
-	}
-	encodedSample, err := json.Marshal(sampleEvent.data())
-	if err != nil || json.Unmarshal(encodedSample, &sampleBody) != nil {
-		t.Fatalf("decode resource.sample body: body=%v err=%v", sampleEvent.data(), err)
+	if matchingSample == nil {
+		t.Fatalf("resource.gap had no matching separately persisted telemetry sample: gap=%+v telemetry=%+v", gapBody, telemetry)
 	}
 	encodedLatest, _ := json.Marshal(gapBody.LatestResources)
-	encodedSampled, _ := json.Marshal(sampleBody.Resources)
-	if !sampleEvent.ObservedAt.Equal(gapBody.To) || !bytes.Equal(encodedLatest, encodedSampled) {
-		t.Fatalf("resource.sample did not carry the latest gap snapshot at its physical timestamp: sample=%+v gap=%+v", sampleEvent, gapBody)
+	encodedSampled, _ := json.Marshal(matchingSample.Resources)
+	if !matchingSample.ObservedAt.Equal(gapBody.To) || !bytes.Equal(encodedLatest, encodedSampled) {
+		t.Fatalf("separate telemetry query did not carry the latest gap snapshot at its physical timestamp: sample=%+v gap=%+v", matchingSample, gapBody)
 	}
 	if lastPhysicalOutput == nil || !lastPhysicalOutput.ObservedAt.Equal(*reconciled.LastOutputAt) || lastPhysicalOutput.ObservedAt.Before(supervisorDownAt) || !lastPhysicalOutput.ObservedAt.Before(restartStartedAt) {
 		t.Fatalf("output.chunk timestamp does not match the physical pre-restart write: event=%+v LastOutputAt=%v downtime=[%s,%s)", lastPhysicalOutput, reconciled.LastOutputAt, supervisorDownAt, restartStartedAt)
@@ -1543,4 +1536,20 @@ func waitEventCount(h *harness, id, kind string, count int, timeout time.Duratio
 		time.Sleep(25 * time.Millisecond)
 	}
 	return fmt.Errorf("timed out waiting for %d event(s) of kind %s", count, kind)
+}
+
+func queryTelemetryAt(t *testing.T, h *harness, runID string, at time.Time) model.TelemetryResponse {
+	t.Helper()
+	response := callSupervisor(t, h, protocol.Request{
+		Version: model.ProtocolVersion,
+		Op:      "telemetry",
+		RunID:   runID,
+		TelemetryQuery: &model.TelemetryQuery{
+			RunID: runID, From: &at, To: &at, Resolution: model.TelemetryRaw, Limit: 16,
+		},
+	})
+	if response.Error != nil || response.Telemetry == nil {
+		t.Fatalf("query telemetry at %s: response=%+v", at, response)
+	}
+	return *response.Telemetry
 }
