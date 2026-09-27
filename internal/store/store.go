@@ -234,10 +234,25 @@ func (s *Store) List() ([]model.Run, error) {
 // Update atomically persists a Run snapshot and an optional lifecycle event.
 // Run identity, accepted specification, and creation time are immutable.
 func (s *Store) Update(run model.Run, event *model.Event) (*model.Event, error) {
+	var events []model.Event
+	if event != nil {
+		events = append(events, *event)
+	}
+	appended, err := s.UpdateWithEvents(run, events)
+	if err != nil || len(appended) == 0 {
+		return nil, err
+	}
+	return &appended[0], nil
+}
+
+// UpdateWithEvents atomically persists a Run snapshot and zero or more ordered
+// events. Event sequences are assigned in the same transaction as the Run
+// update and terminal receipt event-range stamp.
+func (s *Store) UpdateWithEvents(run model.Run, events []model.Event) ([]model.Event, error) {
 	if err := validateRun(run); err != nil {
 		return nil, err
 	}
-	var appended *model.Event
+	appended := make([]model.Event, 0, len(events))
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		runs := tx.Bucket([]byte(runsBucketName))
 		previousBytes := runs.Get([]byte(run.ID))
@@ -266,12 +281,12 @@ func (s *Store) Update(run model.Run, event *model.Event) (*model.Event, error) 
 		if previous.Receipt != nil && !reflect.DeepEqual(previous.Receipt, run.Receipt) {
 			return fmt.Errorf("%w: terminal receipt is immutable", ErrInvalidRun)
 		}
-		if event != nil {
-			copy, err := s.appendEventTx(tx, run.ID, *event, run.State != model.Terminal)
+		for _, event := range events {
+			copy, err := s.appendEventTx(tx, run.ID, event, run.State != model.Terminal)
 			if err != nil {
 				return err
 			}
-			appended = &copy
+			appended = append(appended, copy)
 		}
 		if run.State == model.Terminal {
 			meta, err := readEventMetaTx(tx, run.ID)

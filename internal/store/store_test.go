@@ -113,7 +113,7 @@ func TestLifecycleUpdateAndEventCommitTogether(t *testing.T) {
 	}
 }
 
-func TestFailedLifecycleEventRollsBackRunUpdate(t *testing.T) {
+func TestFailedMultiEventLifecycleUpdateRollsBackEntireTransaction(t *testing.T) {
 	s, err := Open(t.TempDir()+"/state.db", Options{
 		EventRetentionCount: 8,
 		EventRetentionBytes: 512,
@@ -129,9 +129,9 @@ func TestFailedLifecycleEventRollsBackRunUpdate(t *testing.T) {
 	}
 	run.State = model.Running
 	run.Generation++
-	_, err = s.Update(run, &model.Event{
-		Kind: "run.started",
-		Body: map[string]any{"payload": bytes.Repeat([]byte("x"), 2048)},
+	_, err = s.UpdateWithEvents(run, []model.Event{
+		{Kind: "run.started"},
+		{Kind: "resource.sample", Body: map[string]any{"payload": bytes.Repeat([]byte("x"), 2048)}},
 	})
 	if !errors.Is(err, ErrEventTooLarge) {
 		t.Fatalf("Update error = %v, want ErrEventTooLarge", err)
@@ -149,6 +149,60 @@ func TestFailedLifecycleEventRollsBackRunUpdate(t *testing.T) {
 	}
 	if len(events) != 0 || retainedFrom != 1 || gap {
 		t.Fatalf("failed update persisted journal: events=%#v retainedFrom=%d gap=%v", events, retainedFrom, gap)
+	}
+}
+
+func TestUpdateWithEventsStampsFinalSequence(t *testing.T) {
+	s, err := Open(t.TempDir()+"/state.db", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	run, _, err := s.Create(testRun("run-multiple-terminal-events"), &model.Event{Kind: "run.accepted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.State = model.Running
+	run.Generation++
+	if _, err := s.UpdateWithEvents(run, []model.Event{{Kind: "run.started"}}); err != nil {
+		t.Fatal(err)
+	}
+	run.State = model.Terminal
+	run.Generation++
+	finishedAt := time.Now().UTC()
+	run.FinishedAt = &finishedAt
+	run.Receipt = &model.Receipt{
+		Version:    model.ProtocolVersion,
+		RunID:      run.ID,
+		Outcome:    "resource-limit",
+		FinishedAt: finishedAt,
+		Cleanup:    "complete",
+	}
+	appended, err := s.UpdateWithEvents(run, []model.Event{
+		{Kind: "limit.reached"},
+		{Kind: "lease.expired"},
+		{Kind: "run.terminal"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(appended) != 3 || appended[0].Seq != 3 || appended[1].Seq != 4 || appended[2].Seq != 5 {
+		t.Fatalf("multi-event append result = %#v", appended)
+	}
+	current, err := s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Receipt == nil || current.Receipt.EventFirstSeq != 1 || current.Receipt.EventLastSeq != 5 ||
+		current.Receipt.EventRetainedFrom != 1 || !current.Receipt.EventHistoryComplete || current.Receipt.EvidenceIncomplete {
+		t.Fatalf("terminal receipt range = %#v", current.Receipt)
+	}
+	events, retainedFrom, gap, err := s.Events(run.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gap || retainedFrom != 1 || len(events) != 5 || events[4].Seq != 5 || events[4].Kind != "run.terminal" {
+		t.Fatalf("multi-event journal = %#v retainedFrom=%d gap=%v", events, retainedFrom, gap)
 	}
 }
 
