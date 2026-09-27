@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 
@@ -17,6 +18,20 @@ import (
 // zero maxRetained uses the store-wide aggregate default. Run output counters
 // and spool chunks commit atomically.
 func (s *Store) AppendOutput(runID, stream string, data []byte, maxRetained int64) (model.OutputStream, error) {
+	return s.appendOutput(runID, stream, data, maxRetained, nil)
+}
+
+// AppendOutputWithEvent atomically records output and its typed journal event.
+// LastOutputAt is advanced to the event's observation time in the same
+// transaction. The event must have kind output.chunk.
+func (s *Store) AppendOutputWithEvent(runID, stream string, data []byte, maxRetained int64, event model.Event) (model.OutputStream, error) {
+	if err := prepareOutputEvent(&event, "output.chunk"); err != nil {
+		return model.OutputStream{}, err
+	}
+	return s.appendOutput(runID, stream, data, maxRetained, &event)
+}
+
+func (s *Store) appendOutput(runID, stream string, data []byte, maxRetained int64, event *model.Event) (model.OutputStream, error) {
 	if !validOutputStream(stream) || maxRetained < 0 {
 		return model.OutputStream{}, ErrInvalidOutput
 	}
@@ -108,6 +123,13 @@ func (s *Store) AppendOutput(runID, stream string, data []byte, maxRetained int6
 			Truncated:     newRetainedFrom > 0,
 		}
 		setRunOutput(&run, stream, result)
+		if event != nil {
+			appended, err := s.appendEventTx(tx, runID, *event, true)
+			if err != nil {
+				return err
+			}
+			setLastOutputAt(&run, appended.ObservedAt)
+		}
 		encoded, err := json.Marshal(run)
 		if err != nil {
 			return fmt.Errorf("encode Run output metadata: %w", err)
@@ -125,10 +147,26 @@ func (s *Store) AppendOutput(runID, stream string, data []byte, maxRetained int6
 // reports that output was compacted or lost before it could be imported.
 // Future Appends continue from observedBytes, and readers receive a gap.
 func (s *Store) RecordOutputGap(runID, stream string, observedBytes int64) error {
-	if !validOutputStream(stream) || observedBytes < 0 {
-		return ErrInvalidOutput
+	_, err := s.recordOutputGap(runID, stream, observedBytes, nil)
+	return err
+}
+
+// RecordOutputGapWithEvent atomically advances output metadata and appends its
+// typed journal event. LastOutputAt is advanced to the event's observation
+// time in the same transaction. The event must have kind output.gap.
+func (s *Store) RecordOutputGapWithEvent(runID, stream string, observedBytes int64, event model.Event) (model.OutputStream, error) {
+	if err := prepareOutputEvent(&event, "output.gap"); err != nil {
+		return model.OutputStream{}, err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.recordOutputGap(runID, stream, observedBytes, &event)
+}
+
+func (s *Store) recordOutputGap(runID, stream string, observedBytes int64, event *model.Event) (model.OutputStream, error) {
+	if !validOutputStream(stream) || observedBytes < 0 {
+		return model.OutputStream{}, ErrInvalidOutput
+	}
+	var result model.OutputStream
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		runs := tx.Bucket([]byte(runsBucketName))
 		raw := runs.Get([]byte(runID))
 		if raw == nil {
@@ -178,12 +216,19 @@ func (s *Store) RecordOutputGap(runID, stream string, observedBytes int64) error
 		if err := streamBucket.Put([]byte(outputMetaKey), encodedMeta); err != nil {
 			return fmt.Errorf("persist output metadata: %w", err)
 		}
-		result := model.OutputStream{
+		result = model.OutputStream{
 			ObservedBytes: observedBytes,
 			RetainedFrom:  observedBytes,
 			Truncated:     observedBytes > 0,
 		}
 		setRunOutput(&run, stream, result)
+		if event != nil {
+			appended, err := s.appendEventTx(tx, runID, *event, true)
+			if err != nil {
+				return err
+			}
+			setLastOutputAt(&run, appended.ObservedAt)
+		}
 		encodedRun, err := json.Marshal(run)
 		if err != nil {
 			return fmt.Errorf("encode Run output metadata: %w", err)
@@ -193,6 +238,24 @@ func (s *Store) RecordOutputGap(runID, stream string, observedBytes int64) error
 		}
 		return nil
 	})
+	return result, err
+}
+
+func prepareOutputEvent(event *model.Event, kind string) error {
+	if event.Kind != kind {
+		return fmt.Errorf("%w: expected kind %q", ErrInvalidEvent, kind)
+	}
+	if event.ObservedAt.IsZero() {
+		event.ObservedAt = time.Now().UTC()
+	}
+	return nil
+}
+
+func setLastOutputAt(run *model.Run, observedAt time.Time) {
+	if run.LastOutputAt == nil || observedAt.After(*run.LastOutputAt) {
+		lastOutputAt := observedAt
+		run.LastOutputAt = &lastOutputAt
+	}
 }
 
 // ReadOutput reads retained bytes starting at offset. If older output has been

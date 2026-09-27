@@ -522,6 +522,151 @@ func TestRecordOutputGapPreservesAbsoluteOffsets(t *testing.T) {
 	}
 }
 
+func TestAtomicOutputWritesPersistMetadataAndJournalEvent(t *testing.T) {
+	s, err := Open(t.TempDir()+"/state.db", Options{
+		OutputChunkBytes:    3,
+		OutputReadBytes:     64,
+		OutputRetainedBytes: 96,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	run, accepted, err := s.Create(testRun("run-output-events"), &model.Event{Kind: "run.accepted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted == nil || accepted.Seq != 1 {
+		t.Fatalf("accepted event = %#v", accepted)
+	}
+
+	chunkAt := time.Date(2026, 9, 27, 1, 2, 3, 0, time.UTC)
+	chunkMeta, err := s.AppendOutputWithEvent(run.ID, "stdout", []byte("0123456789"), 24, model.Event{
+		Kind:       "output.chunk",
+		ObservedAt: chunkAt,
+		Body:       map[string]any{"stream": "stdout", "observedBytes": 10},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chunkMeta.ObservedBytes != 10 || chunkMeta.RetainedBytes != 8 || chunkMeta.RetainedFrom != 2 || !chunkMeta.Truncated {
+		t.Fatalf("appended output metadata = %#v", chunkMeta)
+	}
+	current, err := s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Output.Stdout != chunkMeta || current.LastOutputAt == nil || !current.LastOutputAt.Equal(chunkAt) {
+		t.Fatalf("Run after output chunk = output %#v lastOutputAt %v", current.Output, current.LastOutputAt)
+	}
+	data, retainedFrom, observed, gap, err := s.ReadOutput(run.ID, "stdout", 0, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "23456789" || retainedFrom != 2 || observed != 10 || !gap {
+		t.Fatalf("read output chunk = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
+	}
+
+	gapAt := chunkAt.Add(-time.Second)
+	gapMeta, err := s.RecordOutputGapWithEvent(run.ID, "stdout", 100, model.Event{
+		Kind:       "output.gap",
+		ObservedAt: gapAt,
+		Body:       map[string]any{"stream": "stdout", "observedBytes": 100},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gapMeta.ObservedBytes != 100 || gapMeta.RetainedBytes != 0 || gapMeta.RetainedFrom != 100 || !gapMeta.Truncated {
+		t.Fatalf("gap output metadata = %#v", gapMeta)
+	}
+	current, err = s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Output.Stdout != gapMeta || current.LastOutputAt == nil || !current.LastOutputAt.Equal(chunkAt) {
+		t.Fatalf("Run after output gap = output %#v lastOutputAt %v", current.Output, current.LastOutputAt)
+	}
+	stderrMeta, err := s.AppendOutputWithEvent(run.ID, "stderr", []byte("x"), 24, model.Event{Kind: "output.chunk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stderrMeta.ObservedBytes != 1 {
+		t.Fatalf("stderr output metadata = %#v", stderrMeta)
+	}
+	events, eventRetainedFrom, eventGap, err := s.Events(run.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eventRetainedFrom != 1 || eventGap || len(events) != 4 || events[1].Seq != 2 || events[1].Kind != "output.chunk" ||
+		!events[1].ObservedAt.Equal(chunkAt) || events[2].Seq != 3 || events[2].Kind != "output.gap" || !events[2].ObservedAt.Equal(gapAt) ||
+		events[3].Seq != 4 || events[3].Kind != "output.chunk" || events[3].ObservedAt.IsZero() {
+		t.Fatalf("output event sequence = %#v retainedFrom=%d gap=%v", events, eventRetainedFrom, eventGap)
+	}
+	current, err = s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLastOutputAt := chunkAt
+	if events[3].ObservedAt.After(wantLastOutputAt) {
+		wantLastOutputAt = events[3].ObservedAt
+	}
+	if current.LastOutputAt == nil || !current.LastOutputAt.Equal(wantLastOutputAt) {
+		t.Fatalf("LastOutputAt = %v, want maximum event timestamp %v", current.LastOutputAt, wantLastOutputAt)
+	}
+}
+
+func TestAtomicOutputWriteRollsBackWhenEventCannotBePersisted(t *testing.T) {
+	s, err := Open(t.TempDir()+"/state.db", Options{
+		EventRetentionBytes: 512,
+		MaxEventBytes:       256,
+		OutputChunkBytes:    4,
+		OutputReadBytes:     64,
+		OutputRetainedBytes: 96,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	run, _, err := s.Create(testRun("run-output-event-rollback"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := s.AppendOutput(run.ID, "stdout", []byte("baseline"), 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	largeEvent := func(kind string) model.Event {
+		return model.Event{Kind: kind, Body: map[string]any{"payload": bytes.Repeat([]byte("x"), 1024)}}
+	}
+	if _, err := s.AppendOutputWithEvent(run.ID, "stdout", []byte("lost"), 24, largeEvent("output.chunk")); !errors.Is(err, ErrEventTooLarge) {
+		t.Fatalf("oversized chunk event error = %v, want ErrEventTooLarge", err)
+	}
+	if _, err := s.RecordOutputGapWithEvent(run.ID, "stdout", 100, largeEvent("output.gap")); !errors.Is(err, ErrEventTooLarge) {
+		t.Fatalf("oversized gap event error = %v, want ErrEventTooLarge", err)
+	}
+	current, err := s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Output.Stdout != baseline || current.LastOutputAt != nil {
+		t.Fatalf("failed atomic write changed Run output/timestamp: %#v lastOutputAt=%v", current.Output, current.LastOutputAt)
+	}
+	data, retainedFrom, observed, gap, err := s.ReadOutput(run.ID, "stdout", 0, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "baseline" || retainedFrom != 0 || observed != 8 || gap {
+		t.Fatalf("failed atomic write changed spool: %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
+	}
+	events, eventRetainedFrom, eventGap, err := s.Events(run.ID, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 || eventRetainedFrom != 1 || eventGap {
+		t.Fatalf("failed atomic write changed journal: events=%#v retainedFrom=%d gap=%v", events, eventRetainedFrom, eventGap)
+	}
+}
+
 func testRun(id string) model.Run {
 	return model.Run{
 		ID:         id,
