@@ -648,6 +648,10 @@ func (s *Service) events(req protocol.Request) protocol.Response {
 	out.Events = events
 	out.RetainedFrom = from
 	out.Gap = gap
+	if run, err := s.store.Get(req.RunID); err == nil {
+		clean := publicRun(run)
+		out.Run = &clean
+	}
 	return out
 }
 
