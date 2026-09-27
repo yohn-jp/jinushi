@@ -452,13 +452,15 @@ type RunEventPayload struct {
 }
 
 type ControlEventPayload struct {
-	OperationID   string `json:"operationId,omitempty"`
-	Control       string `json:"control,omitempty"`
-	Action        string `json:"action,omitempty"`
-	Value         *int64 `json:"value,omitempty"`
-	PreviousValue *int64 `json:"previousValue,omitempty"`
-	Reason        string `json:"reason,omitempty"`
-	Outcome       string `json:"outcome,omitempty"`
+	OperationID       string `json:"operationId,omitempty"`
+	Control           string `json:"control,omitempty"`
+	Action            string `json:"action,omitempty"`
+	Value             *int64 `json:"value,omitempty"`
+	PreviousValue     *int64 `json:"previousValue,omitempty"`
+	Unlimited         *bool  `json:"unlimited,omitempty"`
+	PreviousUnlimited *bool  `json:"previousUnlimited,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+	Outcome           string `json:"outcome,omitempty"`
 }
 
 type SignalEventPayload struct {
