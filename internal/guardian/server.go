@@ -130,10 +130,12 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 	state.mu.Lock()
 	state.process = process
 	owner := process.Ownership()
+	effectiveCapabilities := effectiveCapabilities(selected, process, config.Spec.Interactive)
 	startedMono := time.Now()
 	startedAt := startedMono.UTC()
 	state.snapshot.State = model.Running
 	state.snapshot.Ownership = &owner
+	state.snapshot.EffectiveCapabilities = &effectiveCapabilities
 	state.snapshot.StartedAt = &startedAt
 	state.startedMono = startedMono
 	state.captureOutputEvidenceLocked()
@@ -437,6 +439,9 @@ func (s *runState) renewLease(expectedGeneration uint64, leaseMs int64) (Snapsho
 func (s *runState) monitor() {
 	sample := time.NewTicker(time.Duration(s.descriptor.SampleIntervalMs) * time.Millisecond)
 	defer sample.Stop()
+	// Guardian is the only process that owns the monotonic execution start
+	// instant. Keep deadline decisions in this loop instead of deriving them
+	// from the wall-clock StartedAt value in Supervisor.
 	deadline := time.NewTicker(50 * time.Millisecond)
 	defer deadline.Stop()
 	wait := make(chan struct{})
@@ -519,14 +524,11 @@ func (s *runState) sample() {
 	s.captureOutputEvidenceLocked()
 	err := s.persistLocked()
 	terminationReason := ""
-	if err == nil && s.snapshot.State == model.Running && !s.snapshot.Termination.Requested {
-		if s.snapshot.LimitOutcome != "" {
-			terminationReason = s.snapshot.LimitOutcome
-		} else if s.descriptor.Spec.Limits.WallTimeMs > 0 && !s.startedMono.IsZero() && time.Since(s.startedMono) >= time.Duration(s.descriptor.Spec.Limits.WallTimeMs)*time.Millisecond {
-			terminationReason = "timed-out"
-		} else if s.snapshot.LeaseExpiry != nil && !time.Now().Before(*s.snapshot.LeaseExpiry) {
-			terminationReason = "lease-expired"
-		}
+	if err == nil && s.snapshot.State == model.Running && !s.snapshot.Termination.Requested && s.snapshot.LimitOutcome != "" {
+		// Kernel resource-limit events are independent of wall-time and lease
+		// deadlines. Deadline enforcement remains centralized in
+		// enforceDeadlines, which consults Guardian's monotonic start instant.
+		terminationReason = s.snapshot.LimitOutcome
 	}
 	s.mu.Unlock()
 	if terminationReason != "" {
@@ -607,6 +609,9 @@ func (s *runState) finish(exit backend.Exit) bool {
 		TerminationRequested: s.snapshot.Termination.Requested,
 		Forced:               s.snapshot.Termination.Forced,
 		Cleanup:              "complete",
+	}
+	if s.snapshot.EffectiveCapabilities != nil {
+		receipt.Capabilities = *s.snapshot.EffectiveCapabilities
 	}
 	s.snapshot.Receipt = &receipt
 	if err := s.persistLocked(); err != nil {
@@ -731,6 +736,18 @@ func (s *runState) persistLocked() error { return writeSnapshot(s.descriptor.Dir
 func (s *runState) waitForTerminal() error {
 	<-s.terminal
 	return nil
+}
+
+func effectiveCapabilities(selected backend.Backend, process backend.Process, interactive bool) model.Capabilities {
+	capabilities := selected.Capabilities()
+	if effective, ok := process.(interface{ EffectiveCapabilities() model.Capabilities }); ok {
+		capabilities = effective.EffectiveCapabilities()
+	} else {
+		capabilities.Backend = process.Ownership().Backend
+		capabilities.PTY = interactive && capabilities.PTY
+	}
+	capabilities.Signals = append([]string(nil), capabilities.Signals...)
+	return capabilities
 }
 
 func writeResponse(conn net.Conn, response rpcResponse) {

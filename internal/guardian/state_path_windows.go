@@ -1,4 +1,4 @@
-//go:build !windows && !linux
+//go:build windows
 
 package guardian
 
@@ -19,21 +19,11 @@ func openStateDirectory(path string) (*os.File, error) {
 }
 
 func openStateFile(path string, flags int, mode os.FileMode) (*os.File, error) {
-	if info, err := os.Lstat(filepath.Dir(path)); err != nil {
-		return nil, err
-	} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, os.ErrInvalid
-	}
 	return os.OpenFile(path, flags, mode)
 }
 
 func atomicWriteState(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
-	parent, err := openStateDirectory(dir)
-	if err != nil {
-		return err
-	}
-	defer parent.Close()
 	tmp, err := os.CreateTemp(dir, ".guardian-*tmp")
 	if err != nil {
 		return err
@@ -55,26 +45,5 @@ func atomicWriteState(path string, data []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	return parent.Sync()
-}
-
-func secureDir(path string) error {
-	dir, err := openStateDirectory(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Chmod(0700)
-}
-
-func syncDir(path string) error {
-	dir, err := openStateDirectory(path)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	return os.Rename(tmpPath, path)
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestLongRunDirectoryUsesPrivateShortControlSocket(t *testing.T) {
@@ -76,5 +77,49 @@ func TestLongRunDirectoryUsesPrivateShortControlSocket(t *testing.T) {
 	cleanupControl(runDir)
 	if _, err := os.Lstat(endpointDir); !os.IsNotExist(err) {
 		t.Fatalf("shortened per-Run control directory was not removed: %v", err)
+	}
+}
+
+func TestControlListenerFailsClosedWhenRunDirectoryIsReplaced(t *testing.T) {
+	root := t.TempDir()
+	runDir := filepath.Join(root, "run")
+	if err := os.Mkdir(runDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := listenControl(runDir)
+	if err != nil {
+		t.Fatalf("listen on Run directory: %v", err)
+	}
+	defer listener.Close()
+	moved := filepath.Join(root, "original-run")
+	if err := os.Rename(runDir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(runDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if conn, err := dialControl(ctx, runDir); err == nil {
+		_ = conn.Close()
+		t.Fatal("dial connected through a replacement Run directory")
+	}
+	if _, err := os.Lstat(filepath.Join(moved, "jinushi.sock")); err != nil {
+		t.Fatalf("pinned listener socket was lost after path replacement: %v", err)
+	}
+}
+
+func TestControlListenerRejectsSymlinkEndpoint(t *testing.T) {
+	runDir := t.TempDir()
+	server, err := net.Listen("unix", filepath.Join(t.TempDir(), "other.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	if err := os.Symlink(server.Addr().String(), filepath.Join(runDir, "jinushi.sock")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := listenControl(runDir); err == nil {
+		t.Fatal("listener accepted a symlink at the control endpoint")
 	}
 }

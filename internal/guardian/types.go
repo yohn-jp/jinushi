@@ -63,6 +63,7 @@ type Snapshot struct {
 	RunID                       string                    `json:"runId"`
 	State                       model.State               `json:"state"`
 	Ownership                   *model.Ownership          `json:"ownership,omitempty"`
+	EffectiveCapabilities       *model.Capabilities       `json:"effectiveCapabilities,omitempty"`
 	Resources                   model.Resources           `json:"resources"`
 	LastResourceSampleAt        *time.Time                `json:"lastResourceSampleAt,omitempty"`
 	LastOutputAt                *time.Time                `json:"lastOutputAt,omitempty"`

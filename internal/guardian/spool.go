@@ -42,7 +42,7 @@ func openSpool(dir string, maxBytes int64) (*spool, error) {
 	}
 	for _, name := range []string{"stdout", "stderr", "pty"} {
 		path := filepath.Join(dir, name+".out")
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		f, err := openStateFile(path, os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
 			_ = s.closeFiles()
 			return nil, fmt.Errorf("guardian: open %s spool: %w", name, err)

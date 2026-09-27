@@ -40,7 +40,7 @@ func writeDescriptor(d privateDescriptor) error {
 		return fmt.Errorf("guardian: encode descriptor: %w", err)
 	}
 	path := filepath.Join(d.Dir, descriptorName)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	f, err := openStateFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return ErrAlreadyStarted
@@ -62,7 +62,7 @@ func writeDescriptor(d privateDescriptor) error {
 
 func readDescriptor(dir, runID string) (privateDescriptor, error) {
 	path := filepath.Join(dir, descriptorName)
-	f, err := os.Open(path)
+	f, err := openStateFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return privateDescriptor{}, err
 	}
@@ -90,12 +90,12 @@ func writeSnapshot(dir string, snapshot Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("guardian: encode status: %w", err)
 	}
-	return atomicWrite(filepath.Join(dir, statusName), data, 0600)
+	return atomicWriteState(filepath.Join(dir, statusName), data, 0600)
 }
 
 func readSnapshot(dir string) (Snapshot, error) {
 	path := filepath.Join(dir, statusName)
-	f, err := os.Open(path)
+	f, err := openStateFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -116,31 +116,4 @@ func readSnapshot(dir string) (Snapshot, error) {
 		return Snapshot{}, errors.New("guardian: unsupported status version")
 	}
 	return s, nil
-}
-
-func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".guardian-*tmp")
-	if err != nil {
-		return fmt.Errorf("guardian: create temporary state: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err = tmp.Chmod(mode); err == nil {
-		_, err = tmp.Write(data)
-	}
-	if err == nil {
-		err = tmp.Sync()
-	}
-	closeErr := tmp.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("guardian: write temporary state: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("guardian: replace state: %w", err)
-	}
-	return syncDir(dir)
 }

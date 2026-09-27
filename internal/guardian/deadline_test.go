@@ -2,6 +2,7 @@ package guardian
 
 import (
 	"errors"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +17,23 @@ type deadlineProcess struct {
 	terminationResult *backend.TerminationResult
 	terminationErr    error
 	observeErr        error
+}
+
+type capabilityProcess struct {
+	deadlineProcess
+	effective model.Capabilities
+}
+
+func (p *capabilityProcess) EffectiveCapabilities() model.Capabilities { return p.effective }
+
+type capabilityBackend struct{ capabilities model.Capabilities }
+
+func (b *capabilityBackend) Capabilities() model.Capabilities { return b.capabilities }
+func (*capabilityBackend) Start(model.RunSpec, io.Writer, io.Writer) (backend.Process, error) {
+	return nil, errors.New("not used")
+}
+func (*capabilityBackend) Reconcile(model.Ownership) (backend.ReconcileResult, error) {
+	return backend.ReconcileResult{}, errors.New("not used")
 }
 
 func (*deadlineProcess) Ownership() model.Ownership  { return model.Ownership{Backend: "test"} }
@@ -86,6 +104,10 @@ func TestGuardianDeadlinesUseConfiguredTerminationGrace(t *testing.T) {
 			test.setup(state)
 			if err := state.persist(); err != nil {
 				t.Fatal(err)
+			}
+			state.sample()
+			if len(process.graceCalls) != 0 {
+				t.Fatalf("sample path enforced a deadline: calls=%v", process.graceCalls)
 			}
 
 			state.enforceDeadlines()
@@ -288,6 +310,46 @@ func TestResourceObservationTimestampAndIntervalPersist(t *testing.T) {
 		t.Fatalf("offline output replay timestamp = %v, snapshot timestamp = %v", chunk.LastWriteAt, first.OutputLastWriteAt["stdout"])
 	}
 }
+
+func TestTerminalReceiptUsesPerExecutionCapabilities(t *testing.T) {
+	dir := t.TempDir()
+	spool, err := openSpool(filepath.Join(dir, "spool"), 3<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.close()
+	host := model.Capabilities{Backend: "linux", PTY: true, MemoryEnforcement: true, ProcessCountEnforcement: true, Signals: []string{"TERM", "KILL"}}
+	effective := model.Capabilities{Backend: "linux", PTY: false, MemoryEnforcement: false, ProcessCountEnforcement: false, Signals: []string{"TERM", "KILL"}}
+	process := &capabilityProcess{effective: effective}
+	state := &runState{
+		descriptor: launchConfig{Dir: dir, SampleIntervalMs: 100},
+		spool:      spool,
+		process:    process,
+		terminal:   make(chan struct{}),
+		snapshot: Snapshot{
+			Version: ProtocolVersion, RunID: "run_effective_caps", State: model.Running,
+			EffectiveCapabilities: ptrCapabilities(effective),
+			Resources:             unavailableResources(),
+		},
+	}
+	selected := &capabilityBackend{capabilities: host}
+	derived := effectiveCapabilities(selected, process, false)
+	if derived.Backend != effective.Backend || derived.PTY || derived.MemoryEnforcement || derived.ProcessCountEnforcement {
+		t.Fatalf("derived capabilities = %+v, want per-Run capabilities %+v", derived, effective)
+	}
+	if !state.finish(backend.Exit{Outcome: "exited", FinishedAt: time.Now().UTC()}) {
+		t.Fatal("finish failed to persist terminal receipt")
+	}
+	snapshot, err := readSnapshot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Receipt == nil || snapshot.Receipt.Capabilities.Backend != "linux" || snapshot.Receipt.Capabilities.PTY || snapshot.Receipt.Capabilities.MemoryEnforcement || snapshot.Receipt.Capabilities.ProcessCountEnforcement {
+		t.Fatalf("receipt did not preserve actual capabilities: %+v", snapshot.Receipt)
+	}
+}
+
+func ptrCapabilities(value model.Capabilities) *model.Capabilities { return &value }
 
 func TestUnavailableCurrentPreservesUnsupportedAndDoesNotReuseMeasuredCPU(t *testing.T) {
 	previous := model.Resources{
