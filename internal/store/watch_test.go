@@ -65,6 +65,60 @@ func TestWatchPageReconnectAndRestart(t *testing.T) {
 	}
 }
 
+func TestStoreEventAppendAtomicallyIndexesWatchEvent(t *testing.T) {
+	s := openWatchTestStore(t, filepath.Join(t.TempDir(), "store.db"))
+	t.Cleanup(func() { _ = s.Close() })
+	for _, id := range []string{"run-a", "run-b"} {
+		run := model.Run{ID: id, State: model.Accepted}
+		event := model.Event{
+			Kind: model.EventRunAccepted,
+			Payload: &model.EventPayload{Run: &model.RunEventPayload{
+				State: model.Accepted,
+			}},
+		}
+		if _, appended, err := s.Create(run, &event); err != nil || appended == nil {
+			t.Fatalf("create %s: event=%+v err=%v", id, appended, err)
+		}
+	}
+	page, err := s.WatchPage("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 2 || page.Events[0].Event.RunID != "run-a" || page.Events[1].Event.RunID != "run-b" {
+		t.Fatalf("durably indexed events = %v", watchRunIDs(page.Events))
+	}
+	if page.Events[0].Event.Seq != 1 || page.Events[1].Event.Seq != 1 {
+		t.Fatalf("per-Run sequences changed in global index: %d, %d", page.Events[0].Event.Seq, page.Events[1].Event.Seq)
+	}
+}
+
+func TestWatchIndexFailureRollsBackPerRunJournalAndRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	options := Options{MaxEventBytes: 300 << 10, EventRetentionBytes: 300 << 10}
+	s, err := Open(path, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	event := model.Event{
+		Kind: model.EventRunAccepted,
+		Body: map[string]any{"boundedFixture": strings.Repeat("x", 270<<10)},
+	}
+	if _, _, err := s.Create(model.Run{ID: "run-rollback", State: model.Accepted}, &event); err == nil {
+		t.Fatal("oversized watch event was accepted")
+	}
+	if _, err := s.Get("run-rollback"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("Run after failed atomic append: %v", err)
+	}
+	page, err := s.WatchPage("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 0 || page.Watermark != "" {
+		t.Fatalf("watch index retained rolled-back event: %+v", page)
+	}
+}
+
 func TestWatchPageReportsEvictionGap(t *testing.T) {
 	s := openWatchTestStore(t, filepath.Join(t.TempDir(), "store.db"))
 	t.Cleanup(func() { _ = s.Close() })

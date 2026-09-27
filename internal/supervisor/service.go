@@ -339,6 +339,8 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 		return s.await(ctx, req.RunID)
 	case "events":
 		return s.events(req)
+	case "watch":
+		return s.watch(req)
 	case "output":
 		return s.output(req)
 	case "attach":

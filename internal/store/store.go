@@ -523,6 +523,11 @@ func (s *Store) appendEventTx(tx *bolt.Tx, runID string, event model.Event, pres
 	if err := journal.Put([]byte(eventMetaKey), metaBytes); err != nil {
 		return model.Event{}, fmt.Errorf("persist event metadata: %w", err)
 	}
+	// Keep the global watch index in the same bbolt transaction as the
+	// per-Run journal so subscribers never observe a partial event commit.
+	if err := appendWatchEventTx(tx, event); err != nil {
+		return model.Event{}, err
+	}
 	return event, nil
 }
 
