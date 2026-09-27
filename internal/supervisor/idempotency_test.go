@@ -131,6 +131,8 @@ type controlTestPhysical struct {
 	inputCalls  int
 	input       []byte
 	inputErr    error
+	inputStart  chan struct{}
+	inputResume chan struct{}
 	signalCalls int
 	resizeCalls int
 	closeCalls  int
@@ -149,6 +151,10 @@ func (*controlTestPhysical) Terminate(time.Duration) (terminationResult, error) 
 	return terminationResult{complete: true}, nil
 }
 func (p *controlTestPhysical) WriteInput(data []byte) error {
+	if p.inputStart != nil {
+		close(p.inputStart)
+		<-p.inputResume
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.inputCalls++
@@ -185,12 +191,23 @@ func newControlTestService(t *testing.T, p physical) (*Service, *store.Store) {
 	return svc, db
 }
 
+func acquireControlTestWriter(t *testing.T, svc *Service, runID, attachID string) string {
+	t.Helper()
+	response := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "writer-acquire", RunID: runID, AttachID: attachID})
+	if response.Error != nil || response.WriterToken == "" || response.WriterLeaseExpiresAt == nil {
+		t.Fatalf("writer acquire response = %+v", response.Error)
+	}
+	return response.WriterToken
+}
+
 func TestInputRetryAndConcurrentReplayWriteBytesOnce(t *testing.T) {
 	p := &controlTestPhysical{}
 	svc, db := newControlTestService(t, p)
+	writerToken := acquireControlTestWriter(t, svc, "run_control_test", "writer-input")
 	request := protocol.Request{
 		Version: model.ProtocolVersion, Op: "input", RunID: "run_control_test", Stream: "stdin",
 		Data: base64.StdEncoding.EncodeToString([]byte("payload-once")), RequestID: "input-identity", ExpectedGeneration: 1,
+		WriterToken: writerToken,
 	}
 	responses := make([]protocol.Response, 2)
 	var workers sync.WaitGroup
@@ -235,6 +252,7 @@ func TestInputRetryAndConcurrentReplayWriteBytesOnce(t *testing.T) {
 	svc.mu.Lock()
 	delete(svc.active, request.RunID)
 	svc.mu.Unlock()
+	svc.writerLeases.ClearRun(request.RunID)
 	terminalReplay := svc.Handle(context.Background(), request)
 	if terminalReplay.Error != nil || terminalReplay.Run == nil || terminalReplay.Run.State != model.Terminal {
 		t.Fatalf("post-terminal replay = %+v", terminalReplay.Error)
@@ -247,9 +265,11 @@ func TestInputRetryAndConcurrentReplayWriteBytesOnce(t *testing.T) {
 func TestUncertainInputResultCannotBeRepeated(t *testing.T) {
 	p := &controlTestPhysical{inputErr: errors.New("ambiguous physical write")}
 	svc, _ := newControlTestService(t, p)
+	writerToken := acquireControlTestWriter(t, svc, "run_control_test", "writer-uncertain")
 	request := protocol.Request{
 		Version: model.ProtocolVersion, Op: "input", RunID: "run_control_test", Stream: "pty",
 		Data: base64.StdEncoding.EncodeToString([]byte("once")), RequestID: "ambiguous-input", ExpectedGeneration: 1,
+		WriterToken: writerToken,
 	}
 	first := svc.Handle(context.Background(), request)
 	second := svc.Handle(context.Background(), request)
@@ -275,9 +295,11 @@ func TestPendingInputReplayAfterServiceRestartCannotBeRepeated(t *testing.T) {
 	p := &controlTestPhysical{inputErr: errors.New("ambiguous physical write")}
 	firstService := newService(root, db, controlTestExecutor{}, defaultConfig())
 	firstService.active[run.ID] = &active{run: run, spec: run.Spec, process: p, done: make(chan struct{})}
+	writerToken := acquireControlTestWriter(t, firstService, run.ID, "writer-restart")
 	req := protocol.Request{
 		Version: model.ProtocolVersion, Op: "input", RunID: run.ID, Stream: "stdin",
 		Data: base64.StdEncoding.EncodeToString([]byte("one-shot")), RequestID: "restart-input", ExpectedGeneration: run.Generation,
+		WriterToken: writerToken,
 	}
 	first := firstService.Handle(context.Background(), req)
 	if first.Error == nil || first.Error.Code != "control-uncertain" || p.inputCalls != 1 {

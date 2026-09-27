@@ -189,12 +189,12 @@ func TestWriterLeaseHandoffWaitsForValidatedMutation(t *testing.T) {
 	}()
 	<-mutationEntered
 
-	// The gate must retain the manager lock for the entire physical mutation,
-	// preventing detach/reconnect from handing ownership to another writer.
-	if manager.mu.TryLock() {
-		manager.mu.Unlock()
-		t.Fatal("writer lock was released while physical mutation was in progress")
+	// The global map lock must stay available during a blocked physical write;
+	// only this Run's entry lock serializes detach/reconnect.
+	if !manager.mu.TryLock() {
+		t.Fatal("global writer lease map lock was held during physical mutation")
 	}
+	manager.mu.Unlock()
 	detachStarted := make(chan struct{})
 	detachDone := make(chan struct{})
 	go func() {
@@ -206,7 +206,7 @@ func TestWriterLeaseHandoffWaitsForValidatedMutation(t *testing.T) {
 	select {
 	case <-detachDone:
 		t.Fatal("detach completed before the validated mutation returned")
-	default:
+	case <-time.After(20 * time.Millisecond):
 	}
 
 	close(finishMutation)
@@ -223,6 +223,65 @@ func TestWriterLeaseHandoffWaitsForValidatedMutation(t *testing.T) {
 	}
 	if err := manager.Validate("run_1", newLease.Token); err != nil {
 		t.Fatalf("new writer token after handoff: %v", err)
+	}
+}
+
+func TestWriterLeaseBlockedMutationDoesNotBlockOtherRuns(t *testing.T) {
+	manager, _ := newTestWriterLeaseManager(t, time.Minute)
+	blocked, err := manager.Acquire("run_a", "writer_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	independent, err := manager.Acquire("run_b", "writer_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutationEntered := make(chan struct{})
+	finishMutation := make(chan struct{})
+	var finishOnce sync.Once
+	finish := func() { finishOnce.Do(func() { close(finishMutation) }) }
+	defer finish()
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- manager.WithValidatedWriter("run_a", blocked.Token, func() error {
+			close(mutationEntered)
+			<-finishMutation
+			return nil
+		})
+	}()
+	<-mutationEntered
+
+	renewDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Renew("run_b", "writer_b", independent.Token)
+		renewDone <- err
+	}()
+	select {
+	case err := <-renewDone:
+		if err != nil {
+			t.Fatalf("renew independent Run writer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Run A mutation stalled Run B writer renewal")
+	}
+
+	acquireDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Acquire("run_c", "writer_c")
+		acquireDone <- err
+	}()
+	select {
+	case err := <-acquireDone:
+		if err != nil {
+			t.Fatalf("acquire unrelated Run writer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Run A mutation stalled Run C writer acquisition")
+	}
+
+	finish()
+	if err := <-mutationDone; err != nil {
+		t.Fatalf("blocked Run A mutation: %v", err)
 	}
 }
 

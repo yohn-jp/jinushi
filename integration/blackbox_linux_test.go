@@ -761,14 +761,14 @@ func TestPTYAttachReconnectResizeAndInput(t *testing.T) {
 		t.Fatalf("PTY detach changed Run lifetime: state=%s", inspected.State)
 	}
 
+	code, _, resized := h.invoke(5*time.Second, "resize", "--state-dir", h.stateDir, "--rows", "40", "--cols", "100", "--request-id", "pty-resize", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
+	if code != 0 || resized.Error != nil {
+		t.Fatalf("resize PTY: exit=%d response=%+v", code, resized)
+	}
 	reconnected := startAttach(t, h, started.ID)
 	if err := waitEventCount(h, started.ID, "pty.attached", 2, 8*time.Second); err != nil {
 		reconnected.stop()
 		t.Fatalf("reconnected attachment was not accepted: %v; stdout=%q stderr=%q", err, reconnected.stdout.String(), reconnected.stderr.String())
-	}
-	code, _, resized := h.invoke(5*time.Second, "resize", "--state-dir", h.stateDir, "--rows", "40", "--cols", "100", "--request-id", "pty-resize", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
-	if code != 0 || resized.Error != nil {
-		t.Fatalf("resize PTY: exit=%d response=%+v", code, resized)
 	}
 	if _, err := reconnected.input.Write([]byte("hello from reconnected client\n")); err != nil {
 		t.Fatalf("write PTY input: %v", err)
@@ -865,7 +865,13 @@ func TestCloseInputDeliversEOFToRealRun(t *testing.T) {
 		t.Fatalf("write stdin through production CLI: exit=%d response=%+v", code, input)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	closed, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "close-input", RunID: started.ID, RequestID: "stdin-close", ExpectedGeneration: input.Run.Generation})
+	writer, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "writer-acquire", RunID: started.ID, AttachID: "stdin-close-owner"})
+	if err != nil || writer.Error != nil || writer.WriterToken == "" {
+		cancel()
+		t.Fatalf("acquire stdin writer lease: response=%+v err=%v", writer, err)
+	}
+	closed, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "close-input", RunID: started.ID, AttachID: "stdin-close-owner", WriterToken: writer.WriterToken, RequestID: "stdin-close", ExpectedGeneration: input.Run.Generation})
+	_, _ = ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "writer-release", RunID: started.ID, AttachID: "stdin-close-owner", WriterToken: writer.WriterToken})
 	cancel()
 	if err != nil || closed.Error != nil {
 		t.Fatalf("close stdin through production local protocol: response=%+v err=%v", closed, err)

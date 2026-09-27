@@ -457,7 +457,7 @@ func closeInputCommand(ctx context.Context, args []string, stdout, stderr io.Wri
 	if len(fs.Args()) != 1 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
 		return usageError(stderr, "close-input requires a Run ID, --request-id, and positive --expected-generation")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "close-input", RunID: fs.Arg(0), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr, false)
+	_, code := writerControlAndRender(ctx, *stateDir, protocol.Request{Op: "close-input", RunID: fs.Arg(0), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr)
 	return code
 }
 
@@ -763,7 +763,28 @@ func attachCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return 1
 	}
 	defer detachAttachment(ctx, *stateDir, runID, response.AttachID, stderr)
-	if termRows > 0 && termCols > 0 {
+	writer, err := acquireWriterLease(ctx, *stateDir, runID, response.AttachID)
+	if err != nil {
+		fmt.Fprintf(stderr, "writer acquire: %v\n", err)
+		return 1
+	}
+	writerToken := ""
+	var writerExpiry *time.Time
+	if writer.Error != nil {
+		if writer.Error.Code != "writer-conflict" {
+			fmt.Fprintf(stderr, "writer acquire: %s: %s\n", writer.Error.Code, writer.Error.Message)
+			return 1
+		}
+		fmt.Fprintln(stderr, "attach is read-only; another observer holds the input writer lease")
+	} else {
+		if writer.WriterToken == "" || writer.WriterLeaseExpiresAt == nil {
+			fmt.Fprintln(stderr, "writer acquire response did not include a token and expiry")
+			return 1
+		}
+		writerToken = writer.WriterToken
+		writerExpiry = writer.WriterLeaseExpiresAt
+	}
+	if writerToken != "" && termRows > 0 && termCols > 0 {
 		if response.Run == nil || response.Run.Generation == 0 {
 			fmt.Fprintln(stderr, "attach response did not include the current Run generation")
 			return 1
@@ -773,7 +794,9 @@ func attachCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 			fmt.Fprintf(stderr, "resize identity: %v\n", err)
 			return 1
 		}
-		resize, err := ipc.Call(ctx, *stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: response.AttachID, Rows: termRows, Cols: termCols, RequestID: requestID, ExpectedGeneration: response.Run.Generation})
+		var generation atomic.Uint64
+		generation.Store(response.Run.Generation)
+		resize, err := callAttachControl(ctx, *stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: response.AttachID, WriterToken: writerToken, Rows: termRows, Cols: termCols, RequestID: requestID, ExpectedGeneration: response.Run.Generation}, &generation)
 		if err != nil {
 			fmt.Fprintf(stderr, "resize: %v\n", err)
 			return 1
@@ -786,7 +809,7 @@ func attachCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 			response.Run = resize.Run
 		}
 	}
-	return attachLoop(ctx, *stateDir, runID, response.AttachID, *human, stdinReader{}, stdout, stderr, response.Run, terminal && termRows > 0 && termCols > 0)
+	return attachLoopWithWriter(ctx, *stateDir, runID, response.AttachID, writerToken, writerExpiry, *human, stdinReader{}, stdout, stderr, response.Run, terminal && termRows > 0 && termCols > 0)
 }
 
 // stdinReader is replaceable in tests while Main uses process stdin.
@@ -794,16 +817,44 @@ type stdinReader struct{}
 
 func (stdinReader) Read(p []byte) (int, error) { return os.Stdin.Read(p) }
 
+type synchronizedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (w *synchronizedWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.w.Write(data)
+}
+
 func attachLoop(ctx context.Context, stateDir, runID, attachID string, human bool, stdin io.Reader, stdout, stderr io.Writer, initial *model.Run, terminal bool) int {
+	return attachLoopWithWriter(ctx, stateDir, runID, attachID, "", nil, human, stdin, stdout, stderr, initial, terminal)
+}
+
+func attachLoopWithWriter(ctx context.Context, stateDir, runID, attachID, writerToken string, writerExpiry *time.Time, human bool, stdin io.Reader, stdout, stderr io.Writer, initial *model.Run, terminal bool) int {
 	attachCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	safeStderr := &synchronizedWriter{w: stderr}
+	writerCtx, cancelWriter := context.WithCancel(attachCtx)
+	defer cancelWriter()
 	var controlGeneration atomic.Uint64
 	var controlSendMu sync.Mutex
 	if initial != nil {
 		controlGeneration.Store(initial.Generation)
 	}
-	if terminal {
-		go watchTerminalResize(attachCtx, stateDir, runID, attachID, &controlGeneration, &controlSendMu, stderr)
+	var writerActive atomic.Bool
+	writerLost := make(chan string, 1)
+	var writerLostCh <-chan string
+	if writerToken != "" {
+		writerActive.Store(true)
+		writerLostCh = writerLost
+		go renewWriterLease(writerCtx, stateDir, runID, attachID, writerToken, writerExpiry, writerLost)
+	}
+	attachmentLost := make(chan string, 1)
+	go renewAttachmentLease(attachCtx, stateDir, runID, attachID, attachmentLost)
+	if terminal && writerToken != "" {
+		go watchTerminalResize(writerCtx, stateDir, runID, attachID, writerToken, &controlGeneration, &controlSendMu, writerLost, safeStderr)
 	}
 	inputDone := make(chan struct{})
 	detachRequested := make(chan struct{})
@@ -819,30 +870,30 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 					input = input[:detachAt]
 					close(detachRequested)
 				}
-				if len(input) > 0 {
+				if len(input) > 0 && writerActive.Load() {
 					requestID, err := newControlRequestID()
 					if err != nil {
-						fmt.Fprintf(stderr, "attach input identity: %v\n", err)
+						fmt.Fprintf(safeStderr, "attach input identity: %v\n", err)
 						return
 					}
 					controlSendMu.Lock()
-					request := protocol.Request{Op: "input", RunID: runID, AttachID: attachID, Stream: "pty", Data: base64.StdEncoding.EncodeToString(input), RequestID: requestID, ExpectedGeneration: controlGeneration.Load()}
-					response, callErr := callAttachControl(attachCtx, stateDir, request, &controlGeneration)
+					request := protocol.Request{Op: "input", RunID: runID, AttachID: attachID, WriterToken: writerToken, Stream: "pty", Data: base64.StdEncoding.EncodeToString(input), RequestID: requestID, ExpectedGeneration: controlGeneration.Load()}
+					response, callErr := callAttachControl(writerCtx, stateDir, request, &controlGeneration)
 					if response.Run != nil {
 						updateControlGeneration(&controlGeneration, response.Run.Generation)
 					}
 					controlSendMu.Unlock()
 					if callErr != nil {
-						if attachCtx.Err() == nil {
-							fmt.Fprintf(stderr, "attach input: %v\n", callErr)
+						if writerCtx.Err() == nil {
+							signalWriterLost(writerLost, "input failed: "+callErr.Error())
 						}
 						return
 					}
 					if response.Error != nil {
-						fmt.Fprintf(stderr, "attach input: %s: %s\n", response.Error.Code, response.Error.Message)
+						signalWriterLost(writerLost, "input failed: "+response.Error.Code+": "+response.Error.Message)
 						return
 					}
-					if attachCtx.Err() != nil {
+					if writerCtx.Err() != nil {
 						return
 					}
 				}
@@ -862,79 +913,79 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 			offset = stream.RetainedFrom
 		}
 	}
+	followCtx, cancelFollow := context.WithCancel(attachCtx)
+	defer cancelFollow()
+	followDone := make(chan error, 1)
+	var finalRun *model.Run
+	go func() {
+		followDone <- ipc.Follow(followCtx, stateDir, protocol.Request{Op: "output", RunID: runID, AttachID: attachID, Stream: "pty", Offset: int64(offset), Limit: outputChunkSize, Follow: true}, func(response protocol.Response) error {
+			if response.Error != nil {
+				return fmt.Errorf("%s: %s", response.Error.Code, response.Error.Message)
+			}
+			if response.Gap {
+				fmt.Fprintf(safeStderr, "output history gap; retained output starts at byte %d\n", response.RetainedFrom)
+			}
+			if response.Run != nil {
+				updateControlGeneration(&controlGeneration, response.Run.Generation)
+				if response.Run.State == model.Terminal || response.Run.State == model.Uncertain {
+					copy := *response.Run
+					finalRun = &copy
+				}
+			}
+			data, err := base64.StdEncoding.DecodeString(response.Data)
+			if err != nil {
+				return fmt.Errorf("decode PTY output: %w", err)
+			}
+			if len(data) > 0 {
+				if _, err := stdout.Write(data); err != nil {
+					return fmt.Errorf("write PTY output: %w", err)
+				}
+			}
+			return nil
+		})
+	}()
+	inputDoneCh := (<-chan struct{})(inputDone)
 	for {
-		if attachCtx.Err() != nil {
-			return 0
-		}
-		response, err := ipc.Call(attachCtx, stateDir, protocol.Request{Op: "output", RunID: runID, AttachID: attachID, Stream: "pty", Offset: offset, Limit: outputChunkSize})
-		if err != nil {
-			if attachCtx.Err() != nil {
-				return 0
-			}
-			fmt.Fprintf(stderr, "attach output: %v\n", err)
-			return 1
-		}
-		if response.Error != nil {
-			fmt.Fprintf(stderr, "attach output: %s: %s\n", response.Error.Code, response.Error.Message)
-			return 1
-		}
-		if response.Gap {
-			fmt.Fprintf(stderr, "output history gap; retained output starts at byte %d\n", response.RetainedFrom)
-			offset = int64(response.RetainedFrom)
-		}
-		if response.Run != nil {
-			updateControlGeneration(&controlGeneration, response.Run.Generation)
-		}
-		data, err := base64.StdEncoding.DecodeString(response.Data)
-		if err != nil {
-			fmt.Fprintf(stderr, "decode PTY output: %v\n", err)
-			return 1
-		}
-		if len(data) > 0 {
-			if _, err := stdout.Write(data); err != nil {
-				fmt.Fprintf(stderr, "write PTY output: %v\n", err)
-				return 1
-			}
-			offset += int64(len(data))
-			continue
-		}
-		inspection, err := ipc.Call(attachCtx, stateDir, protocol.Request{Op: "inspect", RunID: runID})
-		if err != nil {
-			if attachCtx.Err() != nil {
-				return 0
-			}
-			fmt.Fprintf(stderr, "attach inspect: %v\n", err)
-			return 1
-		}
-		if inspection.Error != nil {
-			fmt.Fprintf(stderr, "attach inspect: %s: %s\n", inspection.Error.Code, inspection.Error.Message)
-			return 1
-		}
-		if inspection.Run != nil && (inspection.Run.State == model.Terminal || inspection.Run.State == model.Uncertain) {
-			if human {
-				renderResponse(stderr, inspection, true)
-			}
-			if inspection.Run.State == model.Uncertain {
-				fmt.Fprintln(stderr, "attach: Run physical state is uncertain")
-				return 1
-			}
-			return 0
-		}
-		if inspection.Run != nil {
-			updateControlGeneration(&controlGeneration, inspection.Run.Generation)
-		}
-		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-attachCtx.Done():
-			timer.Stop()
+			cancelFollow()
 			return 0
 		case <-detachRequested:
-			timer.Stop()
+			cancelFollow()
 			return 0
-		case <-inputDone:
+		case <-inputDoneCh:
 			// EOF only detaches stdin; output remains observable until terminal.
-			inputDone = nil
-		case <-timer.C:
+			inputDoneCh = nil
+		case reason := <-writerLostCh:
+			fmt.Fprintf(safeStderr, "attach writer lease lost; input disabled: %s\n", reason)
+			writerActive.Store(false)
+			cancelWriter()
+			releaseWriterLease(stateDir, protocol.Request{RunID: runID, AttachID: attachID}, writerToken)
+			writerLostCh = nil
+		case reason := <-attachmentLost:
+			fmt.Fprintf(safeStderr, "attach lease lost: %s\n", reason)
+			cancelFollow()
+			return 1
+		case err := <-followDone:
+			if err != nil {
+				if attachCtx.Err() != nil {
+					return 0
+				}
+				fmt.Fprintf(safeStderr, "attach output follow: %v\n", err)
+				return 1
+			}
+			if finalRun == nil {
+				fmt.Fprintln(safeStderr, "attach output subscription ended before terminal state")
+				return 1
+			}
+			if human {
+				renderResponse(safeStderr, protocol.Response{Version: model.ProtocolVersion, Run: finalRun}, true)
+			}
+			if finalRun.State == model.Uncertain {
+				fmt.Fprintln(safeStderr, "attach: Run physical state is uncertain")
+				return 1
+			}
+			return 0
 		}
 	}
 }
@@ -962,6 +1013,167 @@ func detachAttachment(ctx context.Context, stateDir, runID, attachID string, std
 	}
 }
 
+func acquireWriterLease(ctx context.Context, stateDir, runID, ownerID string) (protocol.Response, error) {
+	request := protocol.Request{Op: "writer-acquire", RunID: runID, AttachID: ownerID}
+	var response protocol.Response
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		response, err = ipc.Call(ctx, stateDir, request)
+		if err == nil || ctx.Err() != nil {
+			return response, err
+		}
+		if attempt == 0 {
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return protocol.Response{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return response, err
+}
+
+func renewWriterLease(ctx context.Context, stateDir, runID, ownerID, token string, expiry *time.Time, lost chan<- string) {
+	currentExpiry := time.Now().Add(writerLeaseRenewFallback)
+	if expiry != nil {
+		currentExpiry = *expiry
+	}
+	for {
+		delay := time.Until(currentExpiry) / 2
+		if delay < 100*time.Millisecond {
+			delay = 100 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		request := protocol.Request{Op: "writer-renew", RunID: runID, AttachID: ownerID, WriterToken: token}
+		var response protocol.Response
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			response, err = ipc.Call(ctx, stateDir, request)
+			if err == nil || ctx.Err() != nil {
+				break
+			}
+			if attempt == 0 {
+				timer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			signalWriterLost(lost, "supervisor unavailable: "+err.Error())
+			return
+		}
+		if response.Error != nil {
+			signalWriterLost(lost, response.Error.Code+": "+response.Error.Message)
+			return
+		}
+		if response.WriterToken != token || response.WriterLeaseExpiresAt == nil {
+			signalWriterLost(lost, "invalid writer renewal response")
+			return
+		}
+		currentExpiry = *response.WriterLeaseExpiresAt
+	}
+}
+
+func signalWriterLost(lost chan<- string, reason string) {
+	select {
+	case lost <- reason:
+	default:
+	}
+}
+
+// The supervisor attachment is a 10-second lease. This heartbeat only
+// maintains attachment membership; output itself is delivered by ipc.Follow.
+const attachmentRenewInterval = 5 * time.Second
+
+func renewAttachmentLease(ctx context.Context, stateDir, runID, attachID string, lost chan<- string) {
+	ticker := time.NewTicker(attachmentRenewInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		request := protocol.Request{Op: "attach-renew", RunID: runID, AttachID: attachID}
+		var response protocol.Response
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			response, err = ipc.Call(ctx, stateDir, request)
+			if err == nil || ctx.Err() != nil {
+				break
+			}
+			if attempt == 0 {
+				timer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		reason := ""
+		if err != nil {
+			reason = "supervisor unavailable: " + err.Error()
+		} else if response.Error != nil {
+			reason = response.Error.Code + ": " + response.Error.Message
+		}
+		if reason != "" {
+			signalWriterLost(lost, reason)
+			return
+		}
+	}
+}
+
+const writerLeaseRenewFallback = 10 * time.Second
+
+func writerControlAndRender(ctx context.Context, stateDir string, request protocol.Request, human bool, stdout, stderr io.Writer) (protocol.Response, int) {
+	ownerID := request.RequestID
+	request.AttachID = ownerID
+	lease, err := acquireWriterLease(ctx, stateDir, request.RunID, ownerID)
+	if err != nil || lease.Error != nil {
+		return renderCallResult(lease, err, human, stdout, stderr, false)
+	}
+	if lease.WriterToken == "" || lease.WriterLeaseExpiresAt == nil {
+		if lease.WriterToken != "" {
+			releaseWriterLease(stateDir, request, lease.WriterToken)
+		}
+		failure := protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "invalid-writer-response", Message: "writer acquire response omitted its token or expiry"}}
+		return renderCallResult(failure, nil, human, stdout, stderr, false)
+	}
+	request.WriterToken = lease.WriterToken
+	var generation atomic.Uint64
+	generation.Store(request.ExpectedGeneration)
+	response, callErr := callAttachControl(ctx, stateDir, request, &generation)
+	releaseWriterLease(stateDir, request, lease.WriterToken)
+	return renderCallResult(response, callErr, human, stdout, stderr, false)
+}
+
+func releaseWriterLease(stateDir string, request protocol.Request, token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = ipc.Call(ctx, stateDir, protocol.Request{Op: "writer-release", RunID: request.RunID, AttachID: request.AttachID, WriterToken: token})
+}
+
 func updateControlGeneration(generation *atomic.Uint64, value uint64) {
 	for current := generation.Load(); value > current; current = generation.Load() {
 		if generation.CompareAndSwap(current, value) {
@@ -987,7 +1199,7 @@ func callAttachControl(ctx context.Context, stateDir string, request protocol.Re
 	return ipc.Call(ctx, stateDir, request)
 }
 
-func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, generation *atomic.Uint64, sendMu *sync.Mutex, stderr io.Writer) {
+func watchTerminalResize(ctx context.Context, stateDir, runID, attachID, writerToken string, generation *atomic.Uint64, sendMu *sync.Mutex, lost chan<- string, stderr io.Writer) {
 	rows, cols, ok := terminalDimensions(os.Stdin)
 	if !ok {
 		return
@@ -1010,19 +1222,23 @@ func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, 
 			return
 		}
 		sendMu.Lock()
-		response, err := callAttachControl(ctx, stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: attachID, Rows: newRows, Cols: newCols, RequestID: requestID, ExpectedGeneration: generation.Load()}, generation)
+		response, err := callAttachControl(ctx, stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: attachID, WriterToken: writerToken, Rows: newRows, Cols: newCols, RequestID: requestID, ExpectedGeneration: generation.Load()}, generation)
 		if response.Run != nil {
 			updateControlGeneration(generation, response.Run.Generation)
 		}
 		sendMu.Unlock()
 		if err != nil {
 			if ctx.Err() == nil {
-				fmt.Fprintf(stderr, "resize: %v\n", err)
+				signalWriterLost(lost, "resize failed: "+err.Error())
 			}
 			return
 		}
 		if response.Error != nil {
-			fmt.Fprintf(stderr, "resize: %s: %s\n", response.Error.Code, response.Error.Message)
+			if response.Error.Code == "writer-stale" || response.Error.Code == "writer-token-required" {
+				signalWriterLost(lost, "resize failed: "+response.Error.Code+": "+response.Error.Message)
+			} else {
+				fmt.Fprintf(stderr, "resize: %s: %s\n", response.Error.Code, response.Error.Message)
+			}
 			return
 		}
 		rows, cols = newRows, newCols
@@ -1083,7 +1299,7 @@ func inputCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if len(fs.Args()) != 2 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
 		return usageError(stderr, "input requires a Run ID, text, --request-id, and positive --expected-generation")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "input", RunID: fs.Arg(0), Stream: *stream, Data: base64.StdEncoding.EncodeToString([]byte(fs.Arg(1))), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr, false)
+	_, code := writerControlAndRender(ctx, *stateDir, protocol.Request{Op: "input", RunID: fs.Arg(0), Stream: *stream, Data: base64.StdEncoding.EncodeToString([]byte(fs.Arg(1))), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr)
 	return code
 }
 
@@ -1099,7 +1315,7 @@ func resizeCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if len(fs.Args()) != 1 || *rows <= 0 || *cols <= 0 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
 		return usageError(stderr, "resize requires a Run ID, positive --rows and --cols, --request-id, and positive --expected-generation")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "resize", RunID: fs.Arg(0), Rows: *rows, Cols: *cols, RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr, false)
+	_, code := writerControlAndRender(ctx, *stateDir, protocol.Request{Op: "resize", RunID: fs.Arg(0), Rows: *rows, Cols: *cols, RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr)
 	return code
 }
 
@@ -1113,6 +1329,10 @@ func commonFlags(name string, args []string, stderr io.Writer) (*flag.FlagSet, *
 
 func requestAndRender(ctx context.Context, stateDir string, request protocol.Request, human bool, stdout, stderr io.Writer, forceJSON bool) (protocol.Response, int) {
 	response, err := ipc.Call(ctx, stateDir, request)
+	return renderCallResult(response, err, human, stdout, stderr, forceJSON)
+}
+
+func renderCallResult(response protocol.Response, err error, human bool, stdout, stderr io.Writer, forceJSON bool) (protocol.Response, int) {
 	if err != nil {
 		response = protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: requestErrorCode(err), Message: err.Error()}}
 		if !human || forceJSON {

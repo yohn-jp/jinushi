@@ -98,6 +98,7 @@ type Service struct {
 	backend      executor
 	root         string
 	config       Config
+	writerLeases *WriterLeaseManager
 	mu           sync.RWMutex
 	submissionMu sync.Mutex
 	active       map[string]*active
@@ -109,14 +110,19 @@ type Service struct {
 }
 
 func newService(root string, db *store.Store, backend executor, config Config) *Service {
+	writerLeases, err := NewWriterLeaseManager(DefaultWriterLeaseTTL)
+	if err != nil {
+		panic("invalid default writer lease duration: " + err.Error())
+	}
 	return &Service{
-		root:     root,
-		store:    db,
-		backend:  backend,
-		config:   config,
-		active:   make(map[string]*active),
-		stop:     make(chan struct{}),
-		notifier: newRuntimeNotifier(),
+		root:         root,
+		store:        db,
+		backend:      backend,
+		config:       config,
+		writerLeases: writerLeases,
+		active:       make(map[string]*active),
+		stop:         make(chan struct{}),
+		notifier:     newRuntimeNotifier(),
 	}
 }
 
@@ -356,6 +362,14 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 		return s.attach(req)
 	case "detach":
 		return s.detach(req)
+	case "writer-acquire":
+		return s.writerAcquire(req)
+	case "writer-renew":
+		return s.writerRenew(req)
+	case "writer-release":
+		return s.writerRelease(req)
+	case "attach-renew":
+		return s.attachmentRenew(req)
 	case "input":
 		return s.input(req)
 	case "close-input":
@@ -701,8 +715,8 @@ func (s *Service) sample(a *active) {
 
 func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool, cleanup string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
+		a.mu.Unlock()
 		return
 	}
 	priorReason := a.run.TerminationReason
@@ -746,15 +760,21 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 	if err := s.persistRunEvents(next, events); err != nil {
 		a.run.State = model.Uncertain
 		close(a.done)
+		runID := a.run.ID
+		a.mu.Unlock()
+		s.writerLeases.ClearRun(runID)
 		s.mu.Lock()
-		delete(s.active, a.run.ID)
+		delete(s.active, runID)
 		s.mu.Unlock()
 		return
 	}
 	a.run = next
 	close(a.done)
+	runID := a.run.ID
+	a.mu.Unlock()
+	s.writerLeases.ClearRun(runID)
 	s.mu.Lock()
-	delete(s.active, a.run.ID)
+	delete(s.active, runID)
 	s.mu.Unlock()
 }
 
@@ -773,15 +793,18 @@ func terminalEvents(now time.Time, exitOutcome, reason, priorReason string) []mo
 
 func (s *Service) markUncertain(a *active, reason string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
+		a.mu.Unlock()
 		return
 	}
 	a.run.Attachments = 0
 	_ = s.transition(a, model.Uncertain, model.EventRunUncertain, model.RunEventPayload{Reason: reason})
 	close(a.done)
+	runID := a.run.ID
+	a.mu.Unlock()
+	s.writerLeases.ClearRun(runID)
 	s.mu.Lock()
-	delete(s.active, a.run.ID)
+	delete(s.active, runID)
 	s.mu.Unlock()
 }
 
@@ -994,7 +1017,7 @@ func (s *Service) attach(req protocol.Request) protocol.Response {
 	if a.attachments == nil {
 		a.attachments = make(map[string]time.Time)
 	}
-	a.attachments[id] = time.Now().Add(10 * time.Second)
+	a.attachments[id] = time.Now().Add(attachmentLeaseTTL)
 	a.mu.Unlock()
 	req.Stream = "pty"
 	out = s.output(req)
@@ -1010,20 +1033,24 @@ func (s *Service) detach(req protocol.Request) protocol.Response {
 	a := s.active[req.RunID]
 	s.mu.RUnlock()
 	if a == nil {
+		s.writerLeases.Detach(req.RunID, req.AttachID)
 		return response()
 	}
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if _, ok := a.attachments[req.AttachID]; !ok {
+		a.mu.Unlock()
 		return response()
 	}
 	next := a.run
 	next.Attachments--
 	if err := s.persistRunEvent(next, &model.Event{Kind: model.EventPTYDetached, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{PTY: &model.PTYEventPayload{Attachments: next.Attachments}}}); err != nil {
+		a.mu.Unlock()
 		return failure("storage-failure", err.Error())
 	}
 	a.run = next
 	delete(a.attachments, req.AttachID)
+	a.mu.Unlock()
+	s.writerLeases.Detach(req.RunID, req.AttachID)
 	return response()
 }
 
@@ -1040,14 +1067,18 @@ func (s *Service) renewAttachment(runID, id string) error {
 	if !ok || time.Now().After(expiry) {
 		return errors.New("attachment expired")
 	}
-	a.attachments[id] = time.Now().Add(10 * time.Second)
+	a.attachments[id] = time.Now().Add(attachmentLeaseTTL)
 	return nil
 }
 
 func (s *Service) sweepAttachments(a *active) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	runID := a.run.ID
+	a.mu.Unlock()
+	s.sweepWriterLease(runID)
+	a.mu.Lock()
 	if len(a.attachments) == 0 {
+		a.mu.Unlock()
 		return
 	}
 	now := time.Now()
@@ -1058,18 +1089,26 @@ func (s *Service) sweepAttachments(a *active) {
 		}
 	}
 	if expired == 0 {
+		a.mu.Unlock()
 		return
 	}
 	next := a.run
 	next.Attachments -= expired
 	if err := s.persistRunEvent(next, &model.Event{Kind: model.EventPTYAttachmentExpired, ObservedAt: now.UTC(), Payload: &model.EventPayload{PTY: &model.PTYEventPayload{Attachments: next.Attachments, Expired: expired}}}); err != nil {
+		a.mu.Unlock()
 		return
 	}
 	a.run = next
+	var expiredAttachments []string
 	for id, expiry := range a.attachments {
 		if now.After(expiry) {
 			delete(a.attachments, id)
+			expiredAttachments = append(expiredAttachments, id)
 		}
+	}
+	a.mu.Unlock()
+	for _, id := range expiredAttachments {
+		s.writerLeases.Detach(runID, id)
 	}
 }
 
@@ -1091,10 +1130,7 @@ func (s *Service) lookupActive(id string) (*active, protocol.Response) {
 }
 
 func (s *Service) input(req protocol.Request) protocol.Response {
-	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
-		if invalid := checkAttachmentLocked(a, req.AttachID); invalid != nil {
-			return nil, invalid
-		}
+	return s.mutateWriterControl(req, func(a *active) (func() error, *protocol.Failure) {
 		data, invalid := decodeInput(req)
 		if invalid != nil {
 			return nil, invalid
@@ -1108,7 +1144,7 @@ func (s *Service) input(req protocol.Request) protocol.Response {
 }
 
 func (s *Service) closeInput(req protocol.Request) protocol.Response {
-	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
+	return s.mutateWriterControl(req, func(a *active) (func() error, *protocol.Failure) {
 		if a.run.Spec.Interactive {
 			return nil, &protocol.Failure{Code: "unsupported-capability", Message: "PTY input cannot be half-closed"}
 		}
@@ -1121,10 +1157,7 @@ func (s *Service) closeInput(req protocol.Request) protocol.Response {
 }
 
 func (s *Service) resize(req protocol.Request) protocol.Response {
-	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
-		if invalid := checkAttachmentLocked(a, req.AttachID); invalid != nil {
-			return nil, invalid
-		}
+	return s.mutateWriterControl(req, func(a *active) (func() error, *protocol.Failure) {
 		if req.Rows < 1 || req.Cols < 1 || req.Rows > 65535 || req.Cols > 65535 {
 			return nil, &protocol.Failure{Code: "invalid-request", Message: "invalid terminal size"}
 		}

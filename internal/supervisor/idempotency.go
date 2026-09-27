@@ -74,6 +74,14 @@ func controlIdentityFor(req protocol.Request) controlIdentity {
 // after replay detection and under the active Run lock; it must validate and
 // return a closure that performs exactly one side effect.
 func (s *Service) mutateControl(req protocol.Request, prepare func(*active) (func() error, *protocol.Failure)) protocol.Response {
+	return s.mutateControlWithWriterGate(req, prepare, false)
+}
+
+func (s *Service) mutateWriterControl(req protocol.Request, prepare func(*active) (func() error, *protocol.Failure)) protocol.Response {
+	return s.mutateControlWithWriterGate(req, prepare, true)
+}
+
+func (s *Service) mutateControlWithWriterGate(req protocol.Request, prepare func(*active) (func() error, *protocol.Failure), requireWriter bool) protocol.Response {
 	if len(req.RequestID) == 0 || len(req.RequestID) > store.RequestIDMaxBytes || req.ExpectedGeneration == 0 {
 		return failure("invalid-request", "requestId and positive expectedGeneration are required")
 	}
@@ -96,6 +104,51 @@ func (s *Service) mutateControl(req protocol.Request, prepare func(*active) (fun
 		return controlStoreFailure(err)
 	} else if found {
 		return s.controlReplay(req.RunID, replay)
+	}
+
+	if requireWriter {
+		var claimed store.ControlBeginResult
+		var validationFailure *protocol.Failure
+		gateErr := s.writerLeases.WithValidatedWriter(req.RunID, req.WriterToken, func() error {
+			a.mu.Lock()
+			apply, invalid := prepare(a)
+			if invalid != nil {
+				validationFailure = invalid
+				a.mu.Unlock()
+				return nil
+			}
+			var err error
+			claimed, err = s.store.BeginControlRequest(req.RunID, req.RequestID, digest, req.ExpectedGeneration, time.Now().UTC())
+			if err != nil || !claimed.Created {
+				a.mu.Unlock()
+				return err
+			}
+			a.run.Generation = claimed.Run.Generation
+			a.mu.Unlock()
+			return apply()
+		})
+		if validationFailure != nil {
+			return protocol.Response{Version: model.ProtocolVersion, Error: validationFailure}
+		}
+		if !claimed.Created {
+			if errors.Is(gateErr, ErrWriterStale) || errors.Is(gateErr, ErrWriterTokenRequired) {
+				return writerLeaseFailure(gateErr)
+			}
+			if gateErr != nil {
+				return controlStoreFailure(gateErr)
+			}
+			return s.controlReplay(req.RunID, claimed.Request)
+		}
+		if gateErr != nil {
+			if finishErr := s.store.CompleteControlRequest(req.RunID, req.RequestID, store.ControlRequestUncertain, "control-uncertain", "physical mutation outcome is uncertain", time.Now().UTC()); finishErr != nil {
+				return failure("control-uncertain", "physical mutation outcome and durable disposition are uncertain")
+			}
+			return failure("control-uncertain", "physical mutation outcome is uncertain; retry will not repeat it")
+		}
+		if err := s.store.CompleteControlRequest(req.RunID, req.RequestID, store.ControlRequestSucceeded, "", "", time.Now().UTC()); err != nil {
+			return failure("control-uncertain", "physical mutation completed but its durable result is uncertain")
+		}
+		return s.controlSuccessResponse(req.RunID)
 	}
 
 	a.mu.Lock()
@@ -125,8 +178,12 @@ func (s *Service) mutateControl(req protocol.Request, prepare func(*active) (fun
 	if err := s.store.CompleteControlRequest(req.RunID, req.RequestID, store.ControlRequestSucceeded, "", "", time.Now().UTC()); err != nil {
 		return failure("control-uncertain", "physical mutation completed but its durable result is uncertain")
 	}
-	out = response()
-	if run, err := s.store.Get(req.RunID); err == nil {
+	return s.controlSuccessResponse(req.RunID)
+}
+
+func (s *Service) controlSuccessResponse(runID string) protocol.Response {
+	out := response()
+	if run, err := s.store.Get(runID); err == nil {
 		clean := publicRun(run)
 		out.Run = &clean
 	}
@@ -202,6 +259,6 @@ func checkAttachmentLocked(a *active, id string) *protocol.Failure {
 	if !ok || time.Now().After(expires) {
 		return &protocol.Failure{Code: "attachment-expired", Message: "attachment expired"}
 	}
-	a.attachments[id] = time.Now().Add(10 * time.Second)
+	a.attachments[id] = time.Now().Add(attachmentLeaseTTL)
 	return nil
 }

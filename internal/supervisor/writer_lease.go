@@ -43,15 +43,23 @@ type writerLeaseState struct {
 	expiresAt    time.Time
 }
 
+type writerLeaseEntry struct {
+	mu     sync.Mutex
+	lease  writerLeaseState
+	refs   int  // guarded by WriterLeaseManager.mu
+	retire bool // guarded by WriterLeaseManager.mu; used after terminal cleanup
+}
+
 // WriterLeaseManager tracks at most one interactive input writer for each Run.
 // Read-only observers do not use this manager and remain unrestricted.
 // Expired entries are removed lazily on access or by SweepExpired.
 type WriterLeaseManager struct {
-	mu     sync.Mutex
-	leases map[string]writerLeaseState
-	ttl    time.Duration
-	now    func() time.Time
-	random io.Reader
+	mu       sync.Mutex
+	leases   map[string]*writerLeaseEntry
+	ttl      time.Duration
+	now      func() time.Time
+	random   io.Reader
+	randomMu sync.Mutex
 }
 
 // NewWriterLeaseManager creates a manager with a fixed lease duration.
@@ -60,7 +68,7 @@ func NewWriterLeaseManager(ttl time.Duration) (*WriterLeaseManager, error) {
 		return nil, errors.New("writer lease duration must be positive")
 	}
 	return &WriterLeaseManager{
-		leases: make(map[string]writerLeaseState),
+		leases: make(map[string]*writerLeaseEntry),
 		ttl:    ttl,
 		now:    time.Now,
 		random: rand.Reader,
@@ -74,13 +82,15 @@ func (m *WriterLeaseManager) Acquire(runID, attachmentID string) (WriterLease, e
 	if runID == "" || attachmentID == "" {
 		return WriterLease{}, ErrWriterIdentityRequired
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	entry := m.entry(runID, true)
+	defer m.releaseEntry(runID, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
 	now := m.now()
-	if current, ok := m.leases[runID]; ok {
+	if current := entry.lease; current.token != "" {
 		if !now.Before(current.expiresAt) {
-			delete(m.leases, runID)
+			entry.lease = writerLeaseState{}
 		} else if current.attachmentID == attachmentID {
 			return WriterLease{Token: current.token, ExpiresAt: current.expiresAt}, nil
 		} else {
@@ -89,15 +99,18 @@ func (m *WriterLeaseManager) Acquire(runID, attachmentID string) (WriterLease, e
 	}
 
 	tokenBytes := make([]byte, writerTokenBytes)
+	m.randomMu.Lock()
 	if _, err := io.ReadFull(m.random, tokenBytes); err != nil {
+		m.randomMu.Unlock()
 		return WriterLease{}, err
 	}
+	m.randomMu.Unlock()
 	lease := writerLeaseState{
 		attachmentID: attachmentID,
 		token:        base64.RawURLEncoding.EncodeToString(tokenBytes),
 		expiresAt:    now.Add(m.ttl),
 	}
-	m.leases[runID] = lease
+	entry.lease = lease
 	return WriterLease{Token: lease.token, ExpiresAt: lease.expiresAt}, nil
 }
 
@@ -110,16 +123,21 @@ func (m *WriterLeaseManager) Renew(runID, attachmentID, token string) (WriterLea
 	if token == "" {
 		return WriterLease{}, ErrWriterTokenRequired
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	entry := m.entry(runID, false)
+	if entry == nil {
+		return WriterLease{}, ErrWriterStale
+	}
+	defer m.releaseEntry(runID, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
 	now := m.now()
-	current, ok := m.currentLocked(runID, now)
+	current, ok := currentWriterLease(&entry.lease, now)
 	if !ok || current.attachmentID != attachmentID || !sameWriterToken(current.token, token) {
 		return WriterLease{}, ErrWriterStale
 	}
 	current.expiresAt = now.Add(m.ttl)
-	m.leases[runID] = current
+	entry.lease = current
 	return WriterLease{Token: current.token, ExpiresAt: current.expiresAt}, nil
 }
 
@@ -132,14 +150,19 @@ func (m *WriterLeaseManager) Release(runID, attachmentID, token string) error {
 	if token == "" {
 		return ErrWriterTokenRequired
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	entry := m.entry(runID, false)
+	if entry == nil {
+		return ErrWriterStale
+	}
+	defer m.releaseEntry(runID, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
-	current, ok := m.currentLocked(runID, m.now())
+	current, ok := currentWriterLease(&entry.lease, m.now())
 	if !ok || current.attachmentID != attachmentID || !sameWriterToken(current.token, token) {
 		return ErrWriterStale
 	}
-	delete(m.leases, runID)
+	entry.lease = writerLeaseState{}
 	return nil
 }
 
@@ -154,20 +177,26 @@ func (m *WriterLeaseManager) Validate(runID, token string) error {
 	if token == "" {
 		return ErrWriterTokenRequired
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	entry := m.entry(runID, false)
+	if entry == nil {
+		return ErrWriterStale
+	}
+	defer m.releaseEntry(runID, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
-	current, ok := m.currentLocked(runID, m.now())
+	current, ok := currentWriterLease(&entry.lease, m.now())
 	if !ok || !sameWriterToken(current.token, token) {
 		return ErrWriterStale
 	}
 	return nil
 }
 
-// WithValidatedWriter verifies the current token and holds the manager lock
-// until mutation returns. This makes writer validation and the physical side
-// effect one serialized operation relative to acquire, renew, release, detach,
-// expiry, and Run cleanup. The callback must not call this manager.
+// WithValidatedWriter verifies the current token and holds that Run's entry
+// lock until mutation returns. This makes validation and the physical side
+// effect atomic relative to same-Run acquire, renew, release, detach, expiry,
+// and cleanup without blocking writer operations for other Runs. The callback
+// must not call this manager for the same Run.
 func (m *WriterLeaseManager) WithValidatedWriter(runID, token string, mutation func() error) error {
 	if runID == "" {
 		return ErrWriterIdentityRequired
@@ -178,10 +207,15 @@ func (m *WriterLeaseManager) WithValidatedWriter(runID, token string, mutation f
 	if mutation == nil {
 		return ErrWriterMutationRequired
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	entry := m.entry(runID, false)
+	if entry == nil {
+		return ErrWriterStale
+	}
+	defer m.releaseEntry(runID, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
-	current, ok := m.currentLocked(runID, m.now())
+	current, ok := currentWriterLease(&entry.lease, m.now())
 	if !ok || !sameWriterToken(current.token, token) {
 		return ErrWriterStale
 	}
@@ -194,11 +228,15 @@ func (m *WriterLeaseManager) Detach(runID, attachmentID string) {
 	if runID == "" || attachmentID == "" {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	current, ok := m.leases[runID]
-	if ok && current.attachmentID == attachmentID {
-		delete(m.leases, runID)
+	entry := m.entry(runID, false)
+	if entry == nil {
+		return
+	}
+	defer m.releaseEntry(runID, entry)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.lease.token != "" && entry.lease.attachmentID == attachmentID {
+		entry.lease = writerLeaseState{}
 	}
 }
 
@@ -208,9 +246,17 @@ func (m *WriterLeaseManager) ClearRun(runID string) {
 	if runID == "" {
 		return
 	}
+	entry := m.entry(runID, false)
+	if entry == nil {
+		return
+	}
+	entry.mu.Lock()
+	entry.lease = writerLeaseState{}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.leases, runID)
+	entry.retire = true
+	m.mu.Unlock()
+	entry.mu.Unlock()
+	m.releaseEntry(runID, entry)
 }
 
 // SweepExpired removes expired writer leases and returns the number removed.
@@ -218,28 +264,80 @@ func (m *WriterLeaseManager) ClearRun(runID string) {
 // loop; this manager starts no goroutines and does not affect Run ownership.
 func (m *WriterLeaseManager) SweepExpired() int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := m.now()
+	runIDs := make([]string, 0, len(m.leases))
+	for runID := range m.leases {
+		runIDs = append(runIDs, runID)
+	}
+	m.mu.Unlock()
 	expired := 0
-	for runID, lease := range m.leases {
-		if !now.Before(lease.expiresAt) {
-			delete(m.leases, runID)
+	for _, runID := range runIDs {
+		if m.SweepRun(runID) {
 			expired++
 		}
 	}
 	return expired
 }
 
-func (m *WriterLeaseManager) currentLocked(runID string, now time.Time) (writerLeaseState, bool) {
-	lease, ok := m.leases[runID]
-	if !ok {
+// SweepRun removes the expired lease for runID, if present. Calling this from
+// that Run's maintenance loop keeps cleanup proportional to active Runs.
+func (m *WriterLeaseManager) SweepRun(runID string) bool {
+	if runID == "" {
+		return false
+	}
+	entry := m.entry(runID, false)
+	if entry == nil {
+		return false
+	}
+	defer m.releaseEntry(runID, entry)
+	entry.mu.Lock()
+	expired := entry.lease.token != "" && !m.now().Before(entry.lease.expiresAt)
+	if expired {
+		entry.lease = writerLeaseState{}
+	}
+	empty := entry.lease.token == ""
+	if empty {
+		m.mu.Lock()
+		if entry.refs == 1 && m.leases[runID] == entry {
+			delete(m.leases, runID)
+		}
+		m.mu.Unlock()
+	}
+	entry.mu.Unlock()
+	return expired
+}
+
+func (m *WriterLeaseManager) entry(runID string, create bool) *writerLeaseEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.leases[runID]
+	if entry == nil && create {
+		entry = &writerLeaseEntry{}
+		m.leases[runID] = entry
+	}
+	if entry != nil {
+		entry.refs++
+	}
+	return entry
+}
+
+func (m *WriterLeaseManager) releaseEntry(runID string, entry *writerLeaseEntry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry.refs--
+	if entry.refs == 0 && entry.retire && m.leases[runID] == entry {
+		delete(m.leases, runID)
+	}
+}
+
+func currentWriterLease(lease *writerLeaseState, now time.Time) (writerLeaseState, bool) {
+	if lease.token == "" {
 		return writerLeaseState{}, false
 	}
 	if !now.Before(lease.expiresAt) {
-		delete(m.leases, runID)
+		*lease = writerLeaseState{}
 		return writerLeaseState{}, false
 	}
-	return lease, true
+	return *lease, true
 }
 
 func sameWriterToken(current, supplied string) bool {

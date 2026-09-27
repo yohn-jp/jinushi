@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +34,44 @@ func serveCLI(t *testing.T, stateDir string, handler ipc.Handler) {
 			}
 		case <-time.After(2 * time.Second):
 			t.Error("Serve did not stop")
+			listener.Close()
+		}
+	})
+}
+
+type idleFollowNotifier struct{}
+
+func (idleFollowNotifier) Subscribe(context.Context, protocol.Request) (ipc.Subscription, error) {
+	return idleFollowSubscription{}, nil
+}
+
+type idleFollowSubscription struct{}
+
+func (idleFollowSubscription) Wait(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (idleFollowSubscription) Close() {}
+
+func serveCLIWithNotifier(t *testing.T, stateDir string, handler ipc.Handler, notifier ipc.Notifier) {
+	t.Helper()
+	listener, err := ipc.Listen(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ipc.ServeWithNotifier(ctx, listener, handler, notifier) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				t.Errorf("ServeWithNotifier: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("ServeWithNotifier did not stop")
 			listener.Close()
 		}
 	})
@@ -188,19 +227,19 @@ func TestOutputDecodesArbitraryBytes(t *testing.T) {
 
 func TestAttachLoopStreamsPTYBytesWithoutControlJSON(t *testing.T) {
 	stateDir := t.TempDir()
-	var outputCalls int
+	var outputCalls atomic.Int32
 	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
-		if request.Op != "inspect" && request.AttachID != "attach_test" {
+		if request.AttachID != "attach_test" {
 			return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "bad-attachment", Message: request.AttachID}}
 		}
 		switch request.Op {
 		case "output":
-			outputCalls++
-			if outputCalls == 1 {
-				return protocol.Response{Version: model.ProtocolVersion, Data: base64.StdEncoding.EncodeToString([]byte("pty-bytes"))}
+			if request.Follow || request.Stream != "pty" {
+				return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "bad-output-request", Message: "follow handler request was not normalized"}}
 			}
-			return protocol.Response{Version: model.ProtocolVersion}
-		case "inspect":
+			if outputCalls.Add(1) == 1 {
+				return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running}, Data: base64.StdEncoding.EncodeToString([]byte("pty-bytes"))}
+			}
 			return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Terminal}}
 		default:
 			return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "unexpected-op", Message: request.Op}}
@@ -220,20 +259,65 @@ func TestAttachLoopStreamsPTYBytesWithoutControlJSON(t *testing.T) {
 func TestAttachLoopReturnsFailureForUncertainRun(t *testing.T) {
 	stateDir := t.TempDir()
 	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
-		switch request.Op {
-		case "output":
-			return protocol.Response{Version: model.ProtocolVersion}
-		case "inspect":
+		if request.Op == "output" {
 			return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Uncertain}}
-		default:
-			return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "unexpected-op", Message: request.Op}}
 		}
+		return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "unexpected-op", Message: request.Op}}
 	})
 	var stdout, stderr bytes.Buffer
 	initial := &model.Run{ID: "run_uncertain", Generation: 1, Spec: model.RunSpec{Interactive: true}}
 	code := attachLoop(context.Background(), stateDir, initial.ID, "attach_test", false, strings.NewReader(""), &stdout, &stderr, initial, false)
 	if code != 1 || !strings.Contains(stderr.String(), "uncertain") {
 		t.Fatalf("attachLoop exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestAttachLoopRenewsIdleAttachmentWithoutPollingOutput(t *testing.T) {
+	stateDir := t.TempDir()
+	var outputCalls, renewCalls atomic.Int32
+	serveCLIWithNotifier(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+		switch request.Op {
+		case "output":
+			outputCalls.Add(1)
+			return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running}}
+		case "attach-renew":
+			renewCalls.Add(1)
+			return protocol.Response{Version: model.ProtocolVersion}
+		default:
+			return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "unexpected-op", Message: request.Op}}
+		}
+	}, idleFollowNotifier{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	initial := &model.Run{ID: "run_idle", Generation: 1, State: model.Running, Spec: model.RunSpec{Interactive: true}}
+	done := make(chan int, 1)
+	go func() {
+		done <- attachLoop(ctx, stateDir, initial.ID, "attach_idle", false, strings.NewReader(""), &stdout, &stderr, initial, false)
+	}()
+	deadline := time.NewTimer(12 * time.Second)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for renewCalls.Load() < 2 {
+		select {
+		case <-deadline.C:
+			t.Fatalf("idle attachment was not renewed twice; renew calls=%d", renewCalls.Load())
+		case <-ticker.C:
+		}
+	}
+	if got := outputCalls.Load(); got != 1 {
+		t.Fatalf("idle output observation called output %d times; want one Follow snapshot", got)
+	}
+	cancel()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("attachLoop exit=%d stderr=%q", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("attachLoop did not stop after cancellation")
 	}
 }
 
@@ -337,41 +421,70 @@ func TestEventsFollowEmitsUncertainFinalRecordAndFails(t *testing.T) {
 
 func TestCloseInputUsesRunIdentity(t *testing.T) {
 	stateDir := t.TempDir()
-	requestReceived := make(chan protocol.Request, 1)
+	requestReceived := make(chan protocol.Request, 3)
 	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
 		requestReceived <- request
-		return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running}}
+		switch request.Op {
+		case "writer-acquire":
+			expires := time.Now().Add(writerLeaseRenewFallback)
+			return protocol.Response{Version: model.ProtocolVersion, WriterToken: "opaque-writer-token", WriterLeaseExpiresAt: &expires}
+		case "writer-release":
+			return protocol.Response{Version: model.ProtocolVersion}
+		case "close-input":
+			return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running}}
+		default:
+			return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "unexpected-op", Message: request.Op}}
+		}
 	})
 	var stdout, stderr bytes.Buffer
 	code := Main(context.Background(), []string{"close-input", "--state-dir", stateDir, "--request-id", "close-1", "--expected-generation", "3", "run_test"}, &stdout, &stderr, nil)
 	if code != 0 {
 		t.Fatalf("close-input exit = %d; stderr=%s", code, stderr.String())
 	}
-	request := <-requestReceived
-	if request.Op != "close-input" || request.RunID != "run_test" || request.RequestID != "close-1" || request.ExpectedGeneration != 3 {
-		t.Fatalf("unexpected close-input request: %#v", request)
+	acquire, closeInput, release := <-requestReceived, <-requestReceived, <-requestReceived
+	if acquire.Op != "writer-acquire" || acquire.RunID != "run_test" || acquire.AttachID != "close-1" {
+		t.Fatalf("unexpected acquire request: %#v", acquire)
+	}
+	if closeInput.Op != "close-input" || closeInput.RunID != "run_test" || closeInput.RequestID != "close-1" || closeInput.ExpectedGeneration != 3 || closeInput.WriterToken != "opaque-writer-token" {
+		t.Fatalf("unexpected close-input request: %#v", closeInput)
+	}
+	if release.Op != "writer-release" || release.AttachID != acquire.AttachID || release.WriterToken != closeInput.WriterToken {
+		t.Fatalf("unexpected writer release: %#v", release)
 	}
 }
 
 func TestPhysicalControlCommandsForwardRetryIdentity(t *testing.T) {
 	cases := []struct {
-		name string
-		args []string
-		op   string
+		name       string
+		args       []string
+		op         string
+		writerGate bool
 	}{
-		{name: "input", args: []string{"input", "--request-id", "retry-1", "--expected-generation", "5", "run_test", "bytes"}, op: "input"},
+		{name: "input", args: []string{"input", "--request-id", "retry-1", "--expected-generation", "5", "run_test", "bytes"}, op: "input", writerGate: true},
 		{name: "signal", args: []string{"signal", "--request-id", "retry-1", "--expected-generation", "5", "run_test", "USR1"}, op: "signal"},
 		{name: "cancel", args: []string{"cancel", "--request-id", "retry-1", "--expected-generation", "5", "run_test"}, op: "cancel"},
-		{name: "resize", args: []string{"resize", "--request-id", "retry-1", "--expected-generation", "5", "--rows", "24", "--cols", "80", "run_test"}, op: "resize"},
-		{name: "close-input", args: []string{"close-input", "--request-id", "retry-1", "--expected-generation", "5", "run_test"}, op: "close-input"},
+		{name: "resize", args: []string{"resize", "--request-id", "retry-1", "--expected-generation", "5", "--rows", "24", "--cols", "80", "run_test"}, op: "resize", writerGate: true},
+		{name: "close-input", args: []string{"close-input", "--request-id", "retry-1", "--expected-generation", "5", "run_test"}, op: "close-input", writerGate: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			stateDir := t.TempDir()
-			requestReceived := make(chan protocol.Request, 1)
+			requestReceived := make(chan protocol.Request, 3)
 			serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
-				requestReceived <- request
-				return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running, Generation: 6}}
+				switch request.Op {
+				case "writer-acquire":
+					requestReceived <- request
+					expires := time.Now().Add(writerLeaseRenewFallback)
+					return protocol.Response{Version: model.ProtocolVersion, WriterToken: "opaque-writer-token", WriterLeaseExpiresAt: &expires}
+				case "writer-release":
+					requestReceived <- request
+					return protocol.Response{Version: model.ProtocolVersion}
+				case "input", "resize", "close-input", "signal", "cancel":
+					requestReceived <- request
+					return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running, Generation: 6}}
+				default:
+					return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "unexpected-op", Message: request.Op}}
+				}
 			})
 			args := append([]string{tc.args[0], "--state-dir", stateDir}, tc.args[1:]...)
 			var stdout, stderr bytes.Buffer
@@ -379,9 +492,22 @@ func TestPhysicalControlCommandsForwardRetryIdentity(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("%s exit=%d stderr=%s", tc.name, code, stderr.String())
 			}
-			request := <-requestReceived
-			if request.Op != tc.op || request.RunID != "run_test" || request.RequestID != "retry-1" || request.ExpectedGeneration != 5 {
-				t.Fatalf("request = %+v", request)
+			if tc.writerGate {
+				acquire, request, release := <-requestReceived, <-requestReceived, <-requestReceived
+				if acquire.Op != "writer-acquire" || acquire.AttachID != "retry-1" {
+					t.Fatalf("writer acquire request = %+v", acquire)
+				}
+				if request.Op != tc.op || request.RunID != "run_test" || request.RequestID != "retry-1" || request.ExpectedGeneration != 5 || request.WriterToken != "opaque-writer-token" {
+					t.Fatalf("physical mutation request = %+v", request)
+				}
+				if release.Op != "writer-release" || release.WriterToken != request.WriterToken {
+					t.Fatalf("writer release request = %+v", release)
+				}
+			} else {
+				request := <-requestReceived
+				if request.Op != tc.op || request.RunID != "run_test" || request.RequestID != "retry-1" || request.ExpectedGeneration != 5 {
+					t.Fatalf("control request = %+v", request)
+				}
 			}
 		})
 	}
