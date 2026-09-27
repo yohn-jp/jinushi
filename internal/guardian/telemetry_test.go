@@ -165,6 +165,30 @@ func TestGuardianInputAndResizeActivityContainNoInputData(t *testing.T) {
 	}
 }
 
+func TestGuardianNoninteractiveInputActivityIsMeasured(t *testing.T) {
+	dir := t.TempDir()
+	process := &telemetryTestProcess{}
+	state := &runState{
+		descriptor: launchConfig{Dir: dir, RunID: "run_stdio_activity", Spec: model.RunSpec{Interactive: false}},
+		process:    process,
+		snapshot:   Snapshot{Version: ProtocolVersion, RunID: "run_stdio_activity", State: model.Running, Activity: initialActivity(false)},
+	}
+	input := []byte("stdio input")
+	if err := state.writeInput(input); err != nil {
+		t.Fatal(err)
+	}
+	activity := state.snapshot.Activity
+	if activity.InputBytes.Status != string(model.EvidenceMeasured) || activity.InputBytes.Value != int64(len(input)) {
+		t.Fatalf("stdio input byte evidence = %+v", activity.InputBytes)
+	}
+	if activity.InputWrites.Status != string(model.EvidenceMeasured) || activity.InputWrites.Value != 1 || activity.LastInputAt == nil {
+		t.Fatalf("stdio input write evidence = %+v", activity)
+	}
+	if activity.ResizeCount.Status != string(model.EvidenceUnsupported) {
+		t.Fatalf("noninteractive resize evidence = %+v; want unsupported", activity.ResizeCount)
+	}
+}
+
 func containsBytes(haystack, needle []byte) bool {
 	if len(needle) == 0 || len(haystack) < len(needle) {
 		return false

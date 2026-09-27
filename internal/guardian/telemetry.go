@@ -20,14 +20,15 @@ type processEvidenceSource interface {
 }
 
 func initialActivity(interactive bool) model.IOActivity {
-	status := string(model.EvidenceUnsupported)
+	inputStatus := string(model.EvidenceMeasured)
+	resizeStatus := string(model.EvidenceUnsupported)
 	if interactive {
-		status = string(model.EvidenceMeasured)
+		resizeStatus = string(model.EvidenceMeasured)
 	}
 	return model.IOActivity{
-		InputBytes:  model.Metric{Status: status},
-		InputWrites: model.Metric{Status: status},
-		ResizeCount: model.Metric{Status: status},
+		InputBytes:  model.Metric{Status: inputStatus},
+		InputWrites: model.Metric{Status: inputStatus},
+		ResizeCount: model.Metric{Status: resizeStatus},
 	}
 }
 
