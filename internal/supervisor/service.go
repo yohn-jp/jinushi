@@ -1079,6 +1079,9 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	if a.run.Spec.Lifetime.Mode != "lease-bound" {
 		return failure("invalid-request", "Run is detached")
 	}
+	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
+		return failure("already-terminal", "Run has reached a final state")
+	}
 	if a.run.LeaseExpiry != nil && time.Now().After(*a.run.LeaseExpiry) {
 		go s.terminate(a, "lease-expired")
 		return failure("lease-expired", "lease has expired")
@@ -1119,11 +1122,11 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	}
 	next := a.run
 	setLeaseState(&next, lease)
+	a.run = next
 	if _, err := s.store.Update(next, &model.Event{Kind: "lease.renewed", ObservedAt: time.Now().UTC()}); err != nil {
 		go s.markUncertain(a, "lease renewal durability failed")
 		return failure("storage-failure", err.Error())
 	}
-	a.run = next
 	out = response()
 	r := publicRun(a.run)
 	out.Run = &r
