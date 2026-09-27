@@ -331,6 +331,12 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 			return failure("unsupported-capability", err.Error())
 		}
 	}
+	// Guardian adds launch metadata to the accepted spec before sending it
+	// over its own bounded channel. Leave headroom before accepting the Run.
+	launchSpec, err := json.Marshal(spec)
+	if err != nil || len(launchSpec) >= protocol.MaxFrame-4096 {
+		return failure("response-too-large", "Run launch data exceeds the helper input limit")
+	}
 	if _, err := os.Stat(spec.Cwd); err != nil {
 		return failure("cwd-failure", "cwd unavailable")
 	}

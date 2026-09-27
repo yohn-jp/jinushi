@@ -152,6 +152,7 @@ type capabilities struct {
 	MemoryEnforcement       bool     `json:"memoryEnforcement"`
 	CPUQuotaEnforcement     bool     `json:"cpuQuotaEnforcement"`
 	ProcessCountEnforcement bool     `json:"processCountEnforcement"`
+	RestartReconciliation   string   `json:"restartReconciliation"`
 	Signals                 []string `json:"signals"`
 }
 
@@ -1236,7 +1237,7 @@ func TestMemoryLimitEnforcementWhenKernelDelegatesIt(t *testing.T) {
 
 func TestWritableCgroupTerminalReceiptRetainsFinalResourceCounters(t *testing.T) {
 	h := newHarness(t)
-	if caps := h.getCapabilities(); !caps.MemoryEnforcement {
+	if caps := h.getCapabilities(); !strings.Contains(caps.RestartReconciliation, "cgroup-v2") {
 		t.Skipf("writable cgroup v2 is unavailable on this host; capabilities: %+v", caps)
 	}
 	started := h.run("--", "/bin/sh", "-c", "sleep 0.3")

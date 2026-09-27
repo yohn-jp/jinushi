@@ -96,6 +96,33 @@ func TestOversizedAcceptedResponseDoesNotCreateRun(t *testing.T) {
 	}
 }
 
+func TestOversizedGuardianLaunchInputDoesNotCreateRun(t *testing.T) {
+	db, err := store.Open(t.TempDir()+"/state.db", store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	set := make(map[string]string)
+	for i := 0; i < 31; i++ {
+		set[fmt.Sprintf("JINUSHI_TEST_%02d", i)] = strings.Repeat("x", 32768)
+	}
+	set["JINUSHI_TEST_LAST"] = strings.Repeat("y", 31800)
+	spec := model.RunSpec{Argv: []string{"/bin/sh"}, Cwd: t.TempDir(), Environment: model.Environment{Set: set}}
+	request, err := json.Marshal(protocol.Request{Version: model.ProtocolVersion, Op: "run", Spec: &spec})
+	if err != nil || len(request) >= protocol.MaxFrame {
+		t.Fatalf("test request size=%d err=%v", len(request), err)
+	}
+	svc := newService(t.TempDir(), db, frameTestExecutor{}, defaultConfig())
+	resp := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "run", Spec: &spec})
+	if resp.Error == nil || resp.Error.Code != "response-too-large" {
+		t.Fatalf("oversized launch response=%+v", resp.Error)
+	}
+	runs, err := db.List()
+	if err != nil || len(runs) != 0 {
+		t.Fatalf("oversized launch persisted %d Runs: %v", len(runs), err)
+	}
+}
+
 func TestEventPagesBoundBytesAndResumeWithoutGap(t *testing.T) {
 	db, err := store.Open(t.TempDir()+"/state.db", store.Options{})
 	if err != nil {
