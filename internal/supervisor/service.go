@@ -441,7 +441,9 @@ func (s *Service) monitor(a *active) {
 			}
 			if strings.HasPrefix(limitOutcome, "resource-limit:") {
 				outcome = "resource-limit"
-				_, _ = s.store.AppendEvent(a.run.ID, model.Event{Kind: "limit.reached", ObservedAt: time.Now().UTC(), Body: map[string]any{"limit": strings.TrimPrefix(limitOutcome, "resource-limit:")}})
+				w.result.outcome = limitOutcome
+			} else if limitOutcome == "timed-out" || limitOutcome == "cancelled" {
+				outcome = limitOutcome
 			}
 			if reason != "" {
 				outcome = reason
@@ -535,6 +537,15 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
 		return
 	}
+	priorReason := a.run.TerminationReason
+	if priorReason == "" {
+		switch exit.outcome {
+		case "timed-out":
+			a.run.TerminationReason = "timed-out"
+		case "cancelled":
+			a.run.TerminationReason = "lease-expired"
+		}
+	}
 	a.run.Attachments = 0
 	now := time.Now().UTC()
 	if !exit.finishedAt.IsZero() {
@@ -547,7 +558,12 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 	a.run.FinishedAt = &now
 	a.run.Receipt = &model.Receipt{Version: model.ProtocolVersion, RunID: a.run.ID, Outcome: outcome, ExitCode: exit.code, Signal: exit.signal, StartedAt: a.run.StartedAt, FinishedAt: now, Resources: a.run.Resources, Output: a.run.Output, TerminationRequested: a.run.TerminationReason != "" || exit.terminationRequested, Forced: forced, Cleanup: cleanup}
 	s.populateReceipt(a.run, a.run.Receipt)
-	if err := s.transition(a, model.Terminal, "run.terminal", map[string]any{"outcome": outcome}); err != nil {
+	events := terminalEvents(now, exit.outcome, a.run.TerminationReason, priorReason)
+	events = append(events, model.Event{Kind: "run.terminal", ObservedAt: now, Body: map[string]any{"outcome": outcome}})
+	next := a.run
+	next.State = model.Terminal
+	next.Generation++
+	if _, err := s.store.UpdateWithEvents(next, events); err != nil {
 		a.run.State = model.Uncertain
 		close(a.done)
 		s.mu.Lock()
@@ -555,10 +571,24 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 		s.mu.Unlock()
 		return
 	}
+	a.run = next
 	close(a.done)
 	s.mu.Lock()
 	delete(s.active, a.run.ID)
 	s.mu.Unlock()
+}
+
+func terminalEvents(now time.Time, exitOutcome, reason, priorReason string) []model.Event {
+	if strings.HasPrefix(exitOutcome, "resource-limit:") {
+		return []model.Event{{Kind: "limit.reached", ObservedAt: now, Body: map[string]any{"limit": strings.TrimPrefix(exitOutcome, "resource-limit:")}}}
+	}
+	if priorReason == "" && reason == "timed-out" {
+		return []model.Event{{Kind: "limit.reached", ObservedAt: now, Body: map[string]any{"limit": "wall-time"}}}
+	}
+	if priorReason == "" && reason == "lease-expired" {
+		return []model.Event{{Kind: "lease.expired", ObservedAt: now}}
+	}
+	return nil
 }
 
 func (s *Service) markUncertain(a *active, reason string) {
@@ -1088,6 +1118,7 @@ func (s *Service) reconcile() error {
 				if refreshed, readErr := s.store.Get(run.ID); readErr == nil {
 					run = refreshed
 				}
+				priorReason := run.TerminationReason
 				now := time.Now().UTC()
 				run.State = model.Terminal
 				if run.Ownership == nil && result.ownership != nil {
@@ -1114,7 +1145,9 @@ func (s *Service) reconcile() error {
 					run.Receipt = &model.Receipt{Version: 1, RunID: run.ID, Outcome: outcome, ExitCode: result.exit.code, Signal: result.exit.signal, StartedAt: run.StartedAt, FinishedAt: now, Resources: run.Resources, Output: run.Output, Cleanup: "complete"}
 				}
 				s.populateReceipt(run, run.Receipt)
-				if _, err := s.store.Update(run, &model.Event{Kind: "run.terminal", ObservedAt: now}); err != nil {
+				events := terminalEvents(now, result.exit.outcome, run.TerminationReason, priorReason)
+				events = append(events, model.Event{Kind: "run.terminal", ObservedAt: now, Body: map[string]any{"outcome": run.Receipt.Outcome}})
+				if _, err := s.store.UpdateWithEvents(run, events); err != nil {
 					return err
 				}
 				continue
