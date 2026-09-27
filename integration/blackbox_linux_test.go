@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -109,18 +110,19 @@ type runOutput struct {
 }
 
 type receipt struct {
-	Outcome              string       `json:"outcome"`
-	ExitCode             *int         `json:"exitCode"`
-	Cleanup              string       `json:"cleanup"`
-	TerminationRequested bool         `json:"terminationRequested"`
-	AcceptedArgvSHA256   string       `json:"acceptedArgvSha256"`
-	Resources            resources    `json:"resources"`
-	Capabilities         capabilities `json:"capabilities"`
-	Output               runOutput    `json:"output"`
-	EventFirstSeq        uint64       `json:"eventFirstSeq"`
-	EventLastSeq         uint64       `json:"eventLastSeq"`
-	EventHistoryComplete bool         `json:"eventHistoryComplete"`
-	EvidenceIncomplete   bool         `json:"evidenceIncomplete"`
+	Outcome               string        `json:"outcome"`
+	ExitCode              *int          `json:"exitCode"`
+	Cleanup               string        `json:"cleanup"`
+	TerminationRequested  bool          `json:"terminationRequested"`
+	AcceptedArgvSHA256    string        `json:"acceptedArgvSha256"`
+	Resources             resources     `json:"resources"`
+	Capabilities          capabilities  `json:"capabilities"`
+	EffectiveCapabilities *capabilities `json:"effectiveCapabilities"`
+	Output                runOutput     `json:"output"`
+	EventFirstSeq         uint64        `json:"eventFirstSeq"`
+	EventLastSeq          uint64        `json:"eventLastSeq"`
+	EventHistoryComplete  bool          `json:"eventHistoryComplete"`
+	EvidenceIncomplete    bool          `json:"evidenceIncomplete"`
 }
 
 type resources struct {
@@ -129,21 +131,24 @@ type resources struct {
 	CPUTimeNs        metric `json:"cpuTimeNs"`
 	ProcessCount     metric `json:"processCount"`
 	PeakProcessCount metric `json:"peakProcessCount"`
+	TaskCount        metric `json:"taskCount"`
+	PeakTaskCount    metric `json:"peakTaskCount"`
 	SampleIntervalMs int64  `json:"sampleIntervalMs"`
 }
 
 type run struct {
-	ID                   string     `json:"runId"`
-	State                string     `json:"state"`
-	Generation           uint64     `json:"generation"`
-	Output               runOutput  `json:"output"`
-	Resources            resources  `json:"resources"`
-	LastOutputAt         *time.Time `json:"lastOutputAt"`
-	LastResourceSampleAt *time.Time `json:"lastResourceSampleAt"`
-	ResourceGap          bool       `json:"resourceGap"`
-	Receipt              *receipt   `json:"receipt"`
-	LeaseGeneration      uint64     `json:"leaseGeneration"`
-	LeaseExpiry          *time.Time `json:"leaseExpiry"`
+	ID                    string        `json:"runId"`
+	State                 string        `json:"state"`
+	Generation            uint64        `json:"generation"`
+	Output                runOutput     `json:"output"`
+	Resources             resources     `json:"resources"`
+	EffectiveCapabilities *capabilities `json:"effectiveCapabilities"`
+	LastOutputAt          *time.Time    `json:"lastOutputAt"`
+	LastResourceSampleAt  *time.Time    `json:"lastResourceSampleAt"`
+	ResourceGap           bool          `json:"resourceGap"`
+	Receipt               *receipt      `json:"receipt"`
+	LeaseGeneration       uint64        `json:"leaseGeneration"`
+	LeaseExpiry           *time.Time    `json:"leaseExpiry"`
 }
 
 type capabilities struct {
@@ -152,15 +157,29 @@ type capabilities struct {
 	MemoryEnforcement       bool     `json:"memoryEnforcement"`
 	CPUQuotaEnforcement     bool     `json:"cpuQuotaEnforcement"`
 	ProcessCountEnforcement bool     `json:"processCountEnforcement"`
+	TaskCountEnforcement    bool     `json:"taskCountEnforcement"`
 	RestartReconciliation   string   `json:"restartReconciliation"`
 	Signals                 []string `json:"signals"`
 }
 
 type event struct {
-	Seq        uint64         `json:"seq"`
-	Kind       string         `json:"kind"`
-	ObservedAt time.Time      `json:"observedAt"`
-	Body       map[string]any `json:"body"`
+	Seq        uint64                    `json:"seq"`
+	Kind       string                    `json:"kind"`
+	ObservedAt time.Time                 `json:"observedAt"`
+	Payload    map[string]map[string]any `json:"payload"`
+	Body       map[string]any            `json:"body"`
+}
+
+func (e event) data() map[string]any {
+	if e.Body != nil {
+		return e.Body
+	}
+	for _, key := range []string{"run", "control", "signal", "limit", "lease", "pty", "output", "resource", "resourceGap"} {
+		if body := e.Payload[key]; body != nil {
+			return body
+		}
+	}
+	return nil
 }
 
 type followedEvent struct {
@@ -379,6 +398,9 @@ func TestRunLifecycleStartupFailureAndExitReceipt(t *testing.T) {
 	}
 	if completed.Receipt.AcceptedArgvSHA256 == "" || completed.Receipt.Capabilities.Backend == "" || len(completed.Receipt.Capabilities.Signals) == 0 {
 		t.Fatalf("terminal receipt omitted accepted argv identity or backend capability evidence: %+v", completed.Receipt)
+	}
+	if completed.EffectiveCapabilities == nil || completed.Receipt.EffectiveCapabilities == nil || !reflect.DeepEqual(*completed.EffectiveCapabilities, *completed.Receipt.EffectiveCapabilities) || !reflect.DeepEqual(*completed.EffectiveCapabilities, completed.Receipt.Capabilities) {
+		t.Fatalf("terminal receipt did not preserve the Run's effective capabilities: run=%+v receipt=%+v", completed.EffectiveCapabilities, completed.Receipt)
 	}
 	_, _, eventResult := h.invoke(5*time.Second, "events", "--state-dir", h.stateDir, normal.ID)
 	if eventResult.Error != nil {
@@ -1054,13 +1076,13 @@ func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) 
 		case "resource.sample":
 			resourceSamples = append(resourceSamples, current)
 		case "output.chunk":
-			if current.Body["stream"] == "stdout" {
+			if current.data()["stream"] == "stdout" {
 				var body struct {
 					TimestampBasis string `json:"timestampBasis"`
 				}
-				encoded, err := json.Marshal(current.Body)
+				encoded, err := json.Marshal(current.data())
 				if err != nil || json.Unmarshal(encoded, &body) != nil {
-					t.Fatalf("decode output.chunk evidence: body=%v err=%v", current.Body, err)
+					t.Fatalf("decode output.chunk evidence: body=%v err=%v", current.data(), err)
 				}
 				if body.TimestampBasis != "stream-last-write" {
 					t.Fatalf("output.chunk used %q instead of physical stream write time: %+v", body.TimestampBasis, current)
@@ -1081,9 +1103,9 @@ func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) 
 		Reason          string    `json:"reason"`
 		LatestResources resources `json:"latestResources"`
 	}
-	encodedGap, err := json.Marshal(gapEvent.Body)
+	encodedGap, err := json.Marshal(gapEvent.data())
 	if err != nil || json.Unmarshal(encodedGap, &gapBody) != nil {
-		t.Fatalf("decode resource.gap body: body=%v err=%v", gapEvent.Body, err)
+		t.Fatalf("decode resource.gap body: body=%v err=%v", gapEvent.data(), err)
 	}
 	gapDuration := gapBody.To.Sub(gapBody.From)
 	if gapBody.From.Before(baselineSampleAt) || gapBody.From.After(baselineSampleAt.Add(2*sampleInterval)) || reconciled.LastResourceSampleAt.Before(gapBody.To) || gapDuration <= 2*sampleInterval || gapDuration > 30*sampleInterval {
@@ -1119,9 +1141,9 @@ func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) 
 	if sampleEvent == nil || gapEvent.Seq >= sampleEvent.Seq {
 		t.Fatalf("resource.gap was not followed by its matching resource.sample event: gap=%+v samples=%+v", gapEvent, resourceSamples)
 	}
-	encodedSample, err := json.Marshal(sampleEvent.Body)
+	encodedSample, err := json.Marshal(sampleEvent.data())
 	if err != nil || json.Unmarshal(encodedSample, &sampleBody) != nil {
-		t.Fatalf("decode resource.sample body: body=%v err=%v", sampleEvent.Body, err)
+		t.Fatalf("decode resource.sample body: body=%v err=%v", sampleEvent.data(), err)
 	}
 	encodedLatest, _ := json.Marshal(gapBody.LatestResources)
 	encodedSampled, _ := json.Marshal(sampleBody.Resources)
@@ -1430,7 +1452,7 @@ func containsEvent(events []event, kind string) bool {
 
 func containsLimitReachedEvent(events []event, limit string) bool {
 	for _, item := range events {
-		if item.Kind == "limit.reached" && item.Body["limit"] == limit {
+		if item.Kind == "limit.reached" && item.data()["limit"] == limit {
 			return true
 		}
 	}

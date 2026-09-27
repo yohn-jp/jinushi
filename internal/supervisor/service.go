@@ -415,7 +415,7 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 		s.mu.Unlock()
 		return failure("supervisor-closed", "supervisor is closing")
 	}
-	if _, _, err = s.store.Create(run, &model.Event{Kind: "run.accepted", ObservedAt: now}); err != nil {
+	if _, _, err = s.store.Create(run, &model.Event{Kind: model.EventRunAccepted, ObservedAt: now, Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Accepted, Generation: run.Generation}}}); err != nil {
 		s.mu.Unlock()
 		return failure("storage-failure", err.Error())
 	}
@@ -426,11 +426,13 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 	return accepted
 }
 
-func (s *Service) transition(a *active, state model.State, kind model.EventKind, body map[string]any) error {
+func (s *Service) transition(a *active, state model.State, kind model.EventKind, details model.RunEventPayload) error {
 	next := a.run
 	next.State = state
 	next.Generation++
-	if _, err := s.store.Update(next, &model.Event{Kind: kind, ObservedAt: time.Now().UTC(), Body: body}); err != nil {
+	details.State = state
+	details.Generation = next.Generation
+	if _, err := s.store.Update(next, &model.Event{Kind: kind, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Run: &details}}); err != nil {
 		return err
 	}
 	a.run = next
@@ -446,7 +448,7 @@ func (s *Service) start(a *active) {
 		s.finish(a, "cancelled", exitResult{}, false, "complete")
 		return
 	}
-	if err := s.transition(a, model.Starting, "run.starting", nil); err != nil {
+	if err := s.transition(a, model.Starting, model.EventRunStarting, model.RunEventPayload{}); err != nil {
 		a.mu.Unlock()
 		s.markUncertain(a, "storage failure before spawn")
 		return
@@ -494,7 +496,7 @@ func (s *Service) start(a *active) {
 	if a.terminating {
 		state, kind = model.Terminating, model.EventRunOwned
 	}
-	if err := s.transition(a, state, kind, map[string]any{"pid": own.PID}); err != nil {
+	if err := s.transition(a, state, kind, model.RunEventPayload{PID: own.PID}); err != nil {
 		a.mu.Unlock()
 		p.Terminate(time.Duration(s.config.TerminationGraceMs) * time.Millisecond)
 		s.markUncertain(a, "storage failure after spawn")
@@ -593,7 +595,8 @@ func (s *Service) sample(a *active) {
 				a.run.Resources.ProcessCount = model.Metric{Status: "unavailable"}
 			}
 			a.run.LastResourceSampleAt = &now
-			_, _ = s.store.Update(a.run, &model.Event{Kind: "resource.unavailable", ObservedAt: now})
+			resources := a.run.Resources
+			_, _ = s.store.Update(a.run, &model.Event{Kind: model.EventResourceUnavailable, ObservedAt: now, Payload: &model.EventPayload{Resource: &model.ResourceEventPayload{Resources: resources}}})
 		}
 		a.mu.Unlock()
 		return
@@ -626,7 +629,7 @@ func (s *Service) sample(a *active) {
 	}
 	a.run.Resources = r
 	a.run.LastResourceSampleAt = &now
-	_, _ = s.store.Update(a.run, &model.Event{Kind: "resource.sample", ObservedAt: now, Body: map[string]any{"resources": r}})
+	_, _ = s.store.Update(a.run, &model.Event{Kind: model.EventResourceSample, ObservedAt: now, Payload: &model.EventPayload{Resource: &model.ResourceEventPayload{Resources: r}}})
 }
 
 func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool, cleanup string) {
@@ -669,7 +672,7 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 	}
 	s.populateReceipt(a.run, a.run.Receipt)
 	events := terminalEvents(now, exit.outcome, a.run.TerminationReason, priorReason)
-	events = append(events, model.Event{Kind: "run.terminal", ObservedAt: now, Body: map[string]any{"outcome": outcome}})
+	events = append(events, model.Event{Kind: model.EventRunTerminal, ObservedAt: now, Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Terminal, Generation: a.run.Generation + 1, Outcome: outcome}}})
 	next := a.run
 	next.State = model.Terminal
 	next.Generation++
@@ -690,13 +693,13 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 
 func terminalEvents(now time.Time, exitOutcome, reason, priorReason string) []model.Event {
 	if strings.HasPrefix(exitOutcome, "resource-limit:") {
-		return []model.Event{{Kind: "limit.reached", ObservedAt: now, Body: map[string]any{"limit": strings.TrimPrefix(exitOutcome, "resource-limit:")}}}
+		return []model.Event{{Kind: model.EventLimitReached, ObservedAt: now, Payload: &model.EventPayload{Limit: &model.LimitEventPayload{Limit: strings.TrimPrefix(exitOutcome, "resource-limit:")}}}}
 	}
 	if priorReason == "" && reason == "timed-out" {
-		return []model.Event{{Kind: "limit.reached", ObservedAt: now, Body: map[string]any{"limit": "wall-time"}}}
+		return []model.Event{{Kind: model.EventLimitReached, ObservedAt: now, Payload: &model.EventPayload{Limit: &model.LimitEventPayload{Limit: "wall-time"}}}}
 	}
 	if priorReason == "" && reason == "lease-expired" {
-		return []model.Event{{Kind: "lease.expired", ObservedAt: now}}
+		return []model.Event{{Kind: model.EventLeaseExpired, ObservedAt: now, Payload: &model.EventPayload{Lease: &model.LeaseEventPayload{}}}}
 	}
 	return nil
 }
@@ -708,7 +711,7 @@ func (s *Service) markUncertain(a *active, reason string) {
 		return
 	}
 	a.run.Attachments = 0
-	_ = s.transition(a, model.Uncertain, "run.uncertain", map[string]any{"reason": reason})
+	_ = s.transition(a, model.Uncertain, model.EventRunUncertain, model.RunEventPayload{Reason: reason})
 	close(a.done)
 	s.mu.Lock()
 	delete(s.active, a.run.ID)
@@ -733,7 +736,7 @@ func (w *capture) RecordGapObserved(observed int64, observedAt time.Time) error 
 	}
 	w.a.mu.Lock()
 	defer w.a.mu.Unlock()
-	meta, err := w.s.store.RecordOutputGapWithEvent(w.a.run.ID, w.stream, observed, model.Event{Kind: "output.gap", ObservedAt: observedAt, Body: map[string]any{"stream": w.stream, "observedBytes": observed, "timestampBasis": basis}})
+	meta, err := w.s.store.RecordOutputGapWithEvent(w.a.run.ID, w.stream, observed, model.Event{Kind: model.EventOutputGap, ObservedAt: observedAt, Payload: &model.EventPayload{Output: &model.OutputEventPayload{Stream: w.stream, ObservedBytes: observed, TimestampBasis: basis}}})
 	if err != nil {
 		return err
 	}
@@ -767,7 +770,7 @@ func (w *capture) WriteObserved(data []byte, observedAt time.Time) (int, error) 
 	if max == 0 {
 		max = w.s.config.DefaultOutputBytes
 	}
-	meta, err := w.s.store.AppendOutputWithEvent(w.a.run.ID, w.stream, data, max, model.Event{Kind: "output.chunk", ObservedAt: observedAt, Body: map[string]any{"stream": w.stream, "bytes": len(data), "timestampBasis": basis}})
+	meta, err := w.s.store.AppendOutputWithEvent(w.a.run.ID, w.stream, data, max, model.Event{Kind: model.EventOutputChunk, ObservedAt: observedAt, Payload: &model.EventPayload{Output: &model.OutputEventPayload{Stream: w.stream, Bytes: int64(len(data)), TimestampBasis: basis}}})
 	if err != nil {
 		return 0, err
 	}
@@ -916,7 +919,7 @@ func (s *Service) attach(req protocol.Request) protocol.Response {
 	id = "att_" + strings.TrimPrefix(id, "run_")
 	next := a.run
 	next.Attachments++
-	if _, err := s.store.Update(next, &model.Event{Kind: "pty.attached", ObservedAt: time.Now().UTC()}); err != nil {
+	if _, err := s.store.Update(next, &model.Event{Kind: model.EventPTYAttached, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{PTY: &model.PTYEventPayload{Attachments: next.Attachments}}}); err != nil {
 		a.mu.Unlock()
 		return failure("storage-failure", err.Error())
 	}
@@ -949,7 +952,7 @@ func (s *Service) detach(req protocol.Request) protocol.Response {
 	}
 	next := a.run
 	next.Attachments--
-	if _, err := s.store.Update(next, &model.Event{Kind: "pty.detached", ObservedAt: time.Now().UTC()}); err != nil {
+	if _, err := s.store.Update(next, &model.Event{Kind: model.EventPTYDetached, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{PTY: &model.PTYEventPayload{Attachments: next.Attachments}}}); err != nil {
 		return failure("storage-failure", err.Error())
 	}
 	a.run = next
@@ -992,7 +995,7 @@ func (s *Service) sweepAttachments(a *active) {
 	}
 	next := a.run
 	next.Attachments -= expired
-	if _, err := s.store.Update(next, &model.Event{Kind: "pty.attachment-expired", ObservedAt: now.UTC(), Body: map[string]any{"count": expired}}); err != nil {
+	if _, err := s.store.Update(next, &model.Event{Kind: model.EventPTYAttachmentExpired, ObservedAt: now.UTC(), Payload: &model.EventPayload{PTY: &model.PTYEventPayload{Attachments: next.Attachments, Expired: expired}}}); err != nil {
 		return
 	}
 	a.run = next
@@ -1116,13 +1119,13 @@ func (s *Service) signal(req protocol.Request) protocol.Response {
 	if p == nil {
 		return failure("backend-failure", "Run not started")
 	}
-	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: "signal.requested", ObservedAt: time.Now().UTC(), Body: map[string]any{"signal": req.Signal}}); err != nil {
+	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: model.EventSignalRequested, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Signal: &model.SignalEventPayload{Signal: req.Signal}}}); err != nil {
 		return failure("storage-failure", err.Error())
 	}
 	if err := p.Signal(req.Signal); err != nil {
 		return failure("backend-failure", err.Error())
 	}
-	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: "signal.delivered", ObservedAt: time.Now().UTC(), Body: map[string]any{"signal": req.Signal}}); err != nil {
+	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: model.EventSignalDelivered, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Signal: &model.SignalEventPayload{Signal: req.Signal}}}); err != nil {
 		return failure("storage-failure", err.Error())
 	}
 	return response()
@@ -1153,16 +1156,21 @@ func (s *Service) requestTermination(a *active, reason string) (physical, error)
 	next.TerminationReason = reason
 	next.State = model.Terminating
 	next.Generation++
-	kind := model.EventRunTerminating
-	body := map[string]any{"reason": reason}
+	now := time.Now().UTC()
+	events := []model.Event{
+		{Kind: model.EventTerminationRequested, ObservedAt: now, Payload: &model.EventPayload{Control: &model.ControlEventPayload{Reason: reason}}},
+		{Kind: model.EventRunTerminating, ObservedAt: now, Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Terminating, Generation: next.Generation, Reason: reason}}},
+	}
 	if reason == "timed-out" {
-		kind = model.EventLimitReached
-		body["limit"] = "wall-time"
+		events = append(events, model.Event{Kind: model.EventLimitReached, ObservedAt: now, Payload: &model.EventPayload{Limit: &model.LimitEventPayload{Limit: "wall-time"}}})
 	}
 	if reason == "lease-expired" {
-		kind = model.EventLeaseExpired
+		events = append(events, model.Event{Kind: model.EventLeaseExpired, ObservedAt: now, Payload: &model.EventPayload{Lease: &model.LeaseEventPayload{Generation: next.LeaseGeneration, ExpiresAt: next.LeaseExpiry}}})
 	}
-	if _, err := s.store.Update(next, &model.Event{Kind: kind, ObservedAt: time.Now().UTC(), Body: body}); err != nil {
+	if reason == "cancelled" {
+		events = append(events, model.Event{Kind: model.EventCancelRequested, ObservedAt: now, Payload: &model.EventPayload{Control: &model.ControlEventPayload{Reason: reason}}})
+	}
+	if _, err := s.store.UpdateWithEvents(next, events); err != nil {
 		return nil, err
 	}
 	a.run = next
@@ -1252,7 +1260,7 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	next := a.run
 	setLeaseState(&next, lease)
 	a.run = next
-	if _, err := s.store.Update(next, &model.Event{Kind: "lease.renewed", ObservedAt: time.Now().UTC()}); err != nil {
+	if _, err := s.store.Update(next, &model.Event{Kind: model.EventLeaseRenewed, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Lease: &model.LeaseEventPayload{Generation: lease.generation, ExpiresAt: lease.expiry}}}); err != nil {
 		s.launch(func() { s.markUncertain(a, "lease renewal durability failed") })
 		return failure("storage-failure", err.Error())
 	}
@@ -1318,8 +1326,8 @@ func (s *Service) recoveredResourceEvents(run *model.Run, result reconcileResult
 	run.LastResourceSampleAt = result.lastSampleAt
 	run.ResourceGap = true
 	return []model.Event{
-		{Kind: "resource.gap", ObservedAt: time.Now().UTC(), Body: map[string]any{"from": from, "to": *result.lastSampleAt, "status": "unavailable", "reason": "supervisor-unavailable", "latestResources": latest}},
-		{Kind: "resource.sample", ObservedAt: *result.lastSampleAt, Body: map[string]any{"resources": latest}},
+		{Kind: model.EventResourceGap, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{ResourceGap: &model.ResourceGapEventPayload{From: &from, To: result.lastSampleAt, Status: "unavailable", Reason: "supervisor-unavailable", LatestResources: &latest}}},
+		{Kind: model.EventResourceSample, ObservedAt: *result.lastSampleAt, Payload: &model.EventPayload{Resource: &model.ResourceEventPayload{Resources: latest}}},
 	}
 }
 
@@ -1335,7 +1343,7 @@ func (s *Service) reconcile() error {
 		run.State = model.Reconciling
 		run.Generation++
 		run.Attachments = 0
-		if _, err := s.store.Update(run, &model.Event{Kind: "run.reconciling", ObservedAt: time.Now().UTC()}); err != nil {
+		if _, err := s.store.Update(run, &model.Event{Kind: model.EventRunReconciling, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Reconciling, Generation: run.Generation}}}); err != nil {
 			return err
 		}
 		{
@@ -1395,7 +1403,7 @@ func (s *Service) reconcile() error {
 				}
 				s.populateReceipt(run, run.Receipt)
 				events := append(resourceEvents, terminalEvents(now, result.exit.outcome, run.TerminationReason, priorReason)...)
-				events = append(events, model.Event{Kind: "run.terminal", ObservedAt: now, Body: map[string]any{"outcome": run.Receipt.Outcome}})
+				events = append(events, model.Event{Kind: model.EventRunTerminal, ObservedAt: now, Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Terminal, Generation: run.Generation, Outcome: run.Receipt.Outcome}}})
 				if _, err := s.store.UpdateWithEvents(run, events); err != nil {
 					return err
 				}
@@ -1417,7 +1425,7 @@ func (s *Service) reconcile() error {
 					a.run.State = model.Running
 				}
 				a.run.Generation++
-				events := append(resourceEvents, model.Event{Kind: "run.reconciled", ObservedAt: time.Now().UTC()})
+				events := append(resourceEvents, model.Event{Kind: model.EventRunReconciled, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Run: &model.RunEventPayload{State: a.run.State, Generation: a.run.Generation}}})
 				if _, err := s.store.UpdateWithEvents(a.run, events); err != nil {
 					return err
 				}
@@ -1433,7 +1441,7 @@ func (s *Service) reconcile() error {
 		}
 		run.State = model.Uncertain
 		run.Generation++
-		if _, err := s.store.Update(run, &model.Event{Kind: "run.uncertain", ObservedAt: time.Now().UTC(), Body: map[string]any{"reason": "ownership or outcome not proven"}}); err != nil {
+		if _, err := s.store.Update(run, &model.Event{Kind: model.EventRunUncertain, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Uncertain, Generation: run.Generation, Reason: "ownership or outcome not proven"}}}); err != nil {
 			return err
 		}
 	}
