@@ -73,6 +73,242 @@ type Resources struct {
 	SampleIntervalMs int64  `json:"sampleIntervalMs,omitempty"`
 }
 
+// EvidenceStatus distinguishes a measured zero from an observation that was
+// unavailable or a capability the backend does not support.
+type EvidenceStatus string
+
+const (
+	EvidenceMeasured    EvidenceStatus = "measured"
+	EvidenceUnavailable EvidenceStatus = "unavailable"
+	EvidenceUnsupported EvidenceStatus = "unsupported"
+)
+
+type ProcessMembership string
+
+const (
+	ProcessMembershipOwned       ProcessMembership = "owned"
+	ProcessMembershipOutside     ProcessMembership = "outside"
+	ProcessMembershipUnknown     ProcessMembership = "unknown"
+	ProcessMembershipUnsupported ProcessMembership = "unsupported"
+)
+
+type ProcessIdentity struct {
+	PID            int    `json:"pid"`
+	StartTimeTicks uint64 `json:"startTimeTicks"`
+}
+
+// ProcessEvidence is one bounded, point-in-time Linux process observation.
+// Comm is the kernel's short process name; argv and environment are never
+// included. StartTimeTicks disambiguates PID reuse within the current boot.
+type ProcessEvidence struct {
+	PID                  int               `json:"pid"`
+	StartTimeTicks       uint64            `json:"startTimeTicks"`
+	ParentPID            int               `json:"parentPid"`
+	ParentStartTimeTicks uint64            `json:"parentStartTimeTicks,omitempty"`
+	ParentObserved       bool              `json:"parentObserved"`
+	Membership           ProcessMembership `json:"membership"`
+	Comm                 string            `json:"comm,omitempty"`
+	State                string            `json:"state,omitempty"`
+	CPUTimeNs            Metric            `json:"cpuTimeNs"`
+	RSSBytes             Metric            `json:"rssBytes"`
+}
+
+type ProcessChangeKind string
+
+const (
+	ProcessStarted           ProcessChangeKind = "started"
+	ProcessExited            ProcessChangeKind = "exited"
+	ProcessMembershipChanged ProcessChangeKind = "membership-changed"
+)
+
+type ProcessEvidenceChange struct {
+	ObservedAt         time.Time         `json:"observedAt"`
+	Kind               ProcessChangeKind `json:"kind"`
+	Process            ProcessIdentity   `json:"process"`
+	PreviousMembership ProcessMembership `json:"previousMembership,omitempty"`
+	Membership         ProcessMembership `json:"membership,omitempty"`
+}
+
+// DeviceIOMetrics uses the kernel's stable major:minor device identity and
+// carries no caller-controlled path or device name.
+type DeviceIOMetrics struct {
+	Device          string `json:"device"`
+	ReadBytes       Metric `json:"readBytes"`
+	WriteBytes      Metric `json:"writeBytes"`
+	ReadOperations  Metric `json:"readOperations"`
+	WriteOperations Metric `json:"writeOperations"`
+}
+
+type IOMetrics struct {
+	ReadBytes              Metric            `json:"readBytes"`
+	WriteBytes             Metric            `json:"writeBytes"`
+	ReadOperations         Metric            `json:"readOperations"`
+	WriteOperations        Metric            `json:"writeOperations"`
+	Devices                []DeviceIOMetrics `json:"devices,omitempty"`
+	DeviceEvidenceStatus   EvidenceStatus    `json:"deviceEvidenceStatus"`
+	DeviceEvidenceComplete bool              `json:"deviceEvidenceComplete"`
+}
+
+// PressureMetrics stores PSI averages in basis points (100 = 1%) and the
+// kernel's cumulative stall time in microseconds. Unsupported lines retain an
+// explicit status instead of being projected to zero.
+type PressureMetrics struct {
+	SomeAvg10BasisPoints  Metric `json:"someAvg10BasisPoints"`
+	SomeAvg60BasisPoints  Metric `json:"someAvg60BasisPoints"`
+	SomeAvg300BasisPoints Metric `json:"someAvg300BasisPoints"`
+	SomeTotalUS           Metric `json:"someTotalUs"`
+	FullAvg10BasisPoints  Metric `json:"fullAvg10BasisPoints"`
+	FullAvg60BasisPoints  Metric `json:"fullAvg60BasisPoints"`
+	FullAvg300BasisPoints Metric `json:"fullAvg300BasisPoints"`
+	FullTotalUS           Metric `json:"fullTotalUs"`
+}
+
+type PSIMetrics struct {
+	CPU    PressureMetrics `json:"cpu"`
+	Memory PressureMetrics `json:"memory"`
+	IO     PressureMetrics `json:"io"`
+}
+
+type IOActivity struct {
+	InputBytes   Metric     `json:"inputBytes"`
+	InputWrites  Metric     `json:"inputWrites"`
+	ResizeCount  Metric     `json:"resizeCount"`
+	LastInputAt  *time.Time `json:"lastInputAt,omitempty"`
+	LastResizeAt *time.Time `json:"lastResizeAt,omitempty"`
+}
+
+type TelemetrySample struct {
+	Version                 int                     `json:"version"`
+	RunID                   string                  `json:"runId"`
+	Sequence                uint64                  `json:"sequence"`
+	ObservedAt              time.Time               `json:"observedAt"`
+	Resources               Resources               `json:"resources"`
+	IO                      IOMetrics               `json:"io"`
+	PSI                     PSIMetrics              `json:"psi"`
+	Activity                IOActivity              `json:"activity"`
+	Processes               []ProcessEvidence       `json:"processes,omitempty"`
+	ProcessChanges          []ProcessEvidenceChange `json:"processChanges,omitempty"`
+	ProcessEvidenceStatus   EvidenceStatus          `json:"processEvidenceStatus"`
+	ProcessEvidenceReason   string                  `json:"processEvidenceReason,omitempty"`
+	ProcessEvidenceComplete bool                    `json:"processEvidenceComplete"`
+}
+
+const TelemetrySchemaVersion = 1
+
+type TelemetryResolution string
+
+const (
+	TelemetryRaw       TelemetryResolution = "raw"
+	Telemetry10Seconds TelemetryResolution = "10s"
+	Telemetry1Minute   TelemetryResolution = "1m"
+	Telemetry10Minutes TelemetryResolution = "10m"
+)
+
+type MetricAggregate struct {
+	Min              Metric `json:"min"`
+	Max              Metric `json:"max"`
+	First            Metric `json:"first"`
+	Last             Metric `json:"last"`
+	Delta            Metric `json:"delta"`
+	Mean             Metric `json:"mean"`
+	Count            uint64 `json:"count"`
+	UnavailableCount uint64 `json:"unavailableCount"`
+	UnsupportedCount uint64 `json:"unsupportedCount"`
+}
+
+type AggregateResources struct {
+	MemoryBytes      MetricAggregate `json:"memoryBytes"`
+	PeakMemoryBytes  MetricAggregate `json:"peakMemoryBytes"`
+	CPUTimeNs        MetricAggregate `json:"cpuTimeNs"`
+	ProcessCount     MetricAggregate `json:"processCount"`
+	PeakProcessCount MetricAggregate `json:"peakProcessCount"`
+	TaskCount        MetricAggregate `json:"taskCount"`
+	PeakTaskCount    MetricAggregate `json:"peakTaskCount"`
+}
+
+type AggregateIOMetrics struct {
+	ReadBytes       MetricAggregate `json:"readBytes"`
+	WriteBytes      MetricAggregate `json:"writeBytes"`
+	ReadOperations  MetricAggregate `json:"readOperations"`
+	WriteOperations MetricAggregate `json:"writeOperations"`
+}
+
+type AggregatePressureMetrics struct {
+	SomeAvg10BasisPoints  MetricAggregate `json:"someAvg10BasisPoints"`
+	SomeAvg60BasisPoints  MetricAggregate `json:"someAvg60BasisPoints"`
+	SomeAvg300BasisPoints MetricAggregate `json:"someAvg300BasisPoints"`
+	SomeTotalUS           MetricAggregate `json:"someTotalUs"`
+	FullAvg10BasisPoints  MetricAggregate `json:"fullAvg10BasisPoints"`
+	FullAvg60BasisPoints  MetricAggregate `json:"fullAvg60BasisPoints"`
+	FullAvg300BasisPoints MetricAggregate `json:"fullAvg300BasisPoints"`
+	FullTotalUS           MetricAggregate `json:"fullTotalUs"`
+}
+
+type AggregatePSIMetrics struct {
+	CPU    AggregatePressureMetrics `json:"cpu"`
+	Memory AggregatePressureMetrics `json:"memory"`
+	IO     AggregatePressureMetrics `json:"io"`
+}
+
+type AggregateIOActivity struct {
+	InputBytes  MetricAggregate `json:"inputBytes"`
+	InputWrites MetricAggregate `json:"inputWrites"`
+	ResizeCount MetricAggregate `json:"resizeCount"`
+}
+
+type ProcessPeak struct {
+	ObservedAt time.Time       `json:"observedAt"`
+	Process    ProcessEvidence `json:"process"`
+}
+
+type TelemetryAggregate struct {
+	Version          int                     `json:"version"`
+	RunID            string                  `json:"runId"`
+	Resolution       TelemetryResolution     `json:"resolution"`
+	WindowStart      time.Time               `json:"windowStart"`
+	WindowEnd        time.Time               `json:"windowEnd"`
+	SampleCount      uint64                  `json:"sampleCount"`
+	Resources        AggregateResources      `json:"resources"`
+	IO               AggregateIOMetrics      `json:"io"`
+	PSI              AggregatePSIMetrics     `json:"psi"`
+	Activity         AggregateIOActivity     `json:"activity"`
+	ProcessPeaks     []ProcessPeak           `json:"processPeaks,omitempty"`
+	ProcessChanges   []ProcessEvidenceChange `json:"processChanges,omitempty"`
+	ChangeCount      uint64                  `json:"changeCount"`
+	EvidenceComplete bool                    `json:"evidenceComplete"`
+}
+
+type TelemetryGap struct {
+	From          time.Time           `json:"from"`
+	To            time.Time           `json:"to"`
+	Reason        string              `json:"reason"`
+	Metrics       []string            `json:"metrics,omitempty"`
+	Resolution    TelemetryResolution `json:"resolution,omitempty"`
+	DroppedPoints uint64              `json:"droppedPoints,omitempty"`
+}
+
+type TelemetryQuery struct {
+	RunID      string              `json:"runId"`
+	From       *time.Time          `json:"from,omitempty"`
+	To         *time.Time          `json:"to,omitempty"`
+	Resolution TelemetryResolution `json:"resolution,omitempty"`
+	Limit      int                 `json:"limit,omitempty"`
+	Cursor     string              `json:"cursor,omitempty"`
+}
+
+type TelemetryResponse struct {
+	Version         int                  `json:"version"`
+	RunID           string               `json:"runId"`
+	Samples         []TelemetrySample    `json:"samples,omitempty"`
+	Aggregates      []TelemetryAggregate `json:"aggregates,omitempty"`
+	Gaps            []TelemetryGap       `json:"gaps,omitempty"`
+	RawRetainedFrom *time.Time           `json:"rawRetainedFrom,omitempty"`
+	RetainedFrom    *time.Time           `json:"retainedFrom,omitempty"`
+	Resolution      TelemetryResolution  `json:"resolution,omitempty"`
+	HistoryComplete bool                 `json:"historyComplete"`
+	NextCursor      string               `json:"nextCursor,omitempty"`
+}
+
 type OutputStream struct {
 	ObservedBytes int64 `json:"observedBytes"`
 	RetainedBytes int64 `json:"retainedBytes"`
@@ -188,6 +424,8 @@ const (
 	EventSignalSent           EventKind = "signal.sent"
 	EventProcessExited        EventKind = "process.exited"
 	EventCancelRequested      EventKind = "cancel.requested"
+	EventControlChanged       EventKind = "control.changed"
+	EventControlRecovered     EventKind = "control.recovered"
 )
 
 // EventPayload is a versioned discriminated union. Exactly one branch should
@@ -214,7 +452,13 @@ type RunEventPayload struct {
 }
 
 type ControlEventPayload struct {
-	Reason string `json:"reason,omitempty"`
+	OperationID   string `json:"operationId,omitempty"`
+	Control       string `json:"control,omitempty"`
+	Action        string `json:"action,omitempty"`
+	Value         *int64 `json:"value,omitempty"`
+	PreviousValue *int64 `json:"previousValue,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	Outcome       string `json:"outcome,omitempty"`
 }
 
 type SignalEventPayload struct {
@@ -275,7 +519,8 @@ func IsCriticalEventKind(kind EventKind) bool {
 		EventRunReconciling, EventRunReconciled,
 		EventLeaseExpired, EventLeaseRenewed,
 		EventLimitReached, EventTerminationRequested, EventSignalSent,
-		EventProcessExited, EventCancelRequested:
+		EventProcessExited, EventCancelRequested,
+		EventControlChanged, EventControlRecovered:
 		return true
 	default:
 		return false
@@ -308,7 +553,8 @@ func (p EventPayload) Validate(kind EventKind) error {
 		EventRunTerminating, EventRunTerminal, EventRunUncertain,
 		EventRunReconciling, EventRunReconciled, EventProcessExited:
 		want = "run"
-	case EventTerminationRequested, EventCancelRequested:
+	case EventTerminationRequested, EventCancelRequested,
+		EventControlChanged, EventControlRecovered:
 		want = "control"
 	case EventSignalRequested, EventSignalDelivered, EventSignalSent:
 		want = "signal"
@@ -348,6 +594,9 @@ type Capabilities struct {
 	CPUTelemetry          bool     `json:"cpuTelemetry"`
 	ProcessTelemetry      bool     `json:"processTelemetry"`
 	TaskTelemetry         bool     `json:"taskTelemetry"`
+	CgroupFreeze          bool     `json:"cgroupFreeze"`
+	MemoryHighControl     bool     `json:"memoryHighControl"`
+	CPUQuotaControl       bool     `json:"cpuQuotaControl"`
 	RestartReconciliation string   `json:"restartReconciliation"`
 	Signals               []string `json:"signals"`
 }
