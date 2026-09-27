@@ -81,31 +81,49 @@ func TestLongRunDirectoryUsesPrivateShortControlSocket(t *testing.T) {
 }
 
 func TestControlListenerFailsClosedWhenRunDirectoryIsReplaced(t *testing.T) {
-	root := t.TempDir()
-	runDir := filepath.Join(root, "run")
-	if err := os.Mkdir(runDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	listener, err := listenControl(runDir)
-	if err != nil {
-		t.Fatalf("listen on Run directory: %v", err)
-	}
-	defer listener.Close()
-	moved := filepath.Join(root, "original-run")
-	if err := os.Rename(runDir, moved); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(runDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if conn, err := dialControl(ctx, runDir); err == nil {
-		_ = conn.Close()
-		t.Fatal("dial connected through a replacement Run directory")
-	}
-	if _, err := os.Lstat(filepath.Join(moved, "jinushi.sock")); err != nil {
-		t.Fatalf("pinned listener socket was lost after path replacement: %v", err)
+	for _, name := range []string{"direct", "shortened"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TMPDIR", "/tmp")
+			root := t.TempDir()
+			if name == "shortened" {
+				root = filepath.Join(root, strings.Repeat("long-state-path-", 8))
+				if err := os.MkdirAll(root, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runDir := filepath.Join(root, "run")
+			if err := os.Mkdir(runDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			endpointDir, shortened, err := controlEndpointDir(runDir)
+			if err != nil || shortened != (name == "shortened") {
+				t.Fatalf("control endpoint mode = %q, %v, %v", endpointDir, shortened, err)
+			}
+			listener, err := listenControl(runDir)
+			if err != nil {
+				t.Fatalf("listen on Run directory: %v", err)
+			}
+			defer listener.Close()
+			moved := filepath.Join(root, "original-run")
+			if err := os.Rename(runDir, moved); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(runDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			if conn, err := dialControl(ctx, runDir); err == nil {
+				_ = conn.Close()
+				t.Fatal("dial connected through a replacement Run directory")
+			}
+			if name == "direct" {
+				endpointDir = moved
+			}
+			if _, err := os.Lstat(filepath.Join(endpointDir, "jinushi.sock")); err != nil {
+				t.Fatalf("pinned listener socket was lost after path replacement: %v", err)
+			}
+		})
 	}
 }
 

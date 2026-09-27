@@ -22,6 +22,8 @@ const guardianSocketName = "jinushi.sock"
 type pinnedControlListener struct {
 	listener  *net.UnixListener
 	directory *os.File
+	endpoint  string
+	shortened bool
 }
 
 func (l *pinnedControlListener) Accept() (net.Conn, error) { return l.listener.Accept() }
@@ -29,6 +31,9 @@ func (l *pinnedControlListener) Addr() net.Addr            { return l.listener.A
 func (l *pinnedControlListener) Close() error {
 	err := l.listener.Close()
 	closeErr := l.directory.Close()
+	if l.shortened {
+		cleanupShortControlDir(l.endpoint)
+	}
 	if err != nil {
 		return err
 	}
@@ -80,7 +85,7 @@ func listenControl(stateDir string) (net.Listener, error) {
 		_ = dir.Close()
 		return nil, fmt.Errorf("guardian: restrict control socket permissions: %w", err)
 	}
-	return &pinnedControlListener{listener: listener, directory: dir}, nil
+	return &pinnedControlListener{listener: listener, directory: dir, endpoint: endpointDir, shortened: shortened}, nil
 }
 
 func dialControl(ctx context.Context, stateDir string) (net.Conn, error) {
@@ -138,6 +143,10 @@ func cleanupControl(stateDir string) {
 	if err != nil || !shortened {
 		return
 	}
+	cleanupShortControlDir(endpointDir)
+}
+
+func cleanupShortControlDir(endpointDir string) {
 	info, err := os.Lstat(endpointDir)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return
@@ -161,7 +170,20 @@ func controlEndpointDir(stateDir string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	hash := sha256.Sum256([]byte(filepath.Clean(abs)))
+	identity := filepath.Clean(abs)
+	dir, openErr := openStateDirectory(identity)
+	if openErr == nil {
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(dir.Fd()), &stat); err != nil {
+			_ = dir.Close()
+			return "", false, fmt.Errorf("guardian: inspect Run directory identity: %w", err)
+		}
+		_ = dir.Close()
+		identity = fmt.Sprintf("%s\x00%d:%d", identity, stat.Dev, stat.Ino)
+	} else if !errors.Is(openErr, os.ErrNotExist) {
+		return "", false, fmt.Errorf("guardian: open Run directory identity: %w", openErr)
+	}
+	hash := sha256.Sum256([]byte(identity))
 	name := fmt.Sprintf("jinushi-%d-%x", os.Getuid(), hash[:])
 	for _, base := range []string{"/tmp", os.TempDir(), "/var/tmp"} {
 		base = filepath.Clean(base)
