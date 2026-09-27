@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"sort"
 	"time"
 
@@ -216,12 +215,10 @@ func (s *Store) CollectTerminal(policy RetentionPolicy, now time.Time) (GCResult
 	if err != nil {
 		return GCResult{}, err
 	}
-	stats := s.db.Stats()
-	pageSize := int64(s.db.Info().PageSize)
-	freeBytes := int64(stats.FreePageN+stats.PendingPageN) * pageSize
-	fileInfo, statErr := os.Stat(s.db.Path())
-	if statErr == nil && policy.CompactMinFreeBytes > 0 && freeBytes >= policy.CompactMinFreeBytes {
-		freeRatio := float64(freeBytes) / float64(max(fileInfo.Size(), int64(1)))
+	snapshot, snapshotErr := s.db.databaseUsageSnapshot()
+	freeBytes := int64(snapshot.stats.FreePageN+snapshot.stats.PendingPageN) * int64(snapshot.pageSize)
+	if snapshotErr == nil && policy.CompactMinFreeBytes > 0 && freeBytes >= policy.CompactMinFreeBytes {
+		freeRatio := float64(freeBytes) / float64(max(snapshot.databaseBytes, int64(1)))
 		result.CompactionRecommended = policy.CompactMinFreeRatio <= 0 || freeRatio >= policy.CompactMinFreeRatio
 	}
 	return result, nil

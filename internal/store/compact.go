@@ -36,23 +36,33 @@ func (s *Store) CompactionNeeded(policy RetentionPolicy) (bool, error) {
 
 // CompactTo writes a compacted snapshot to a new path. The destination must
 // not exist; callers that will atomically replace the source must choose a
-// destination in the same directory. The caller must
-// hold a Store-wide exclusive operation gate for the entire copy and
-// cutover: bbolt Compact reads a consistent snapshot, but writes concurrent
-// with that snapshot are not copied. This method does not replace s.db or the
-// source path; it is the copy primitive for a coordinated online handoff.
+// destination in the same directory. This method takes the Store-wide
+// exclusive operation gate for the entire copy, so concurrent writes cannot
+// be omitted from the snapshot. It does not replace the source path.
 func (s *Store) CompactTo(destination string) error {
-	if destination == "" || filepath.Clean(destination) == filepath.Clean(s.db.Path()) {
+	if s == nil || destination == "" {
 		return errors.New("compaction destination must differ from the source database")
 	}
-	return compactDBToPath(s.db, destination)
+	s.opGate.Lock()
+	defer s.opGate.Unlock()
+	if s.rawDB == nil {
+		return ErrStoreClosed
+	}
+	absDestination, err := filepath.Abs(destination)
+	if err != nil {
+		return fmt.Errorf("resolve compaction destination: %w", err)
+	}
+	if filepath.Clean(absDestination) == s.path {
+		return errors.New("compaction destination must differ from the source database")
+	}
+	return compactDBToPath(s.rawDB, absDestination)
 }
 
 // CompactDatabase compacts a closed store in place. The caller must ensure no
 // Store handle or other supervisor can access path during this operation and
 // must hold the same external supervisor lock used for normal state access.
-// For a resident Store, use CompactTo while holding its Store-wide exclusive
-// operation gate, then atomically hand the completed file to the reopened DB.
+// For a resident Store, use CompactOnline to compact and atomically hand the
+// live Store to the reopened database.
 func CompactDatabase(path string) error {
 	if path == "" {
 		return errors.New("database path is empty")

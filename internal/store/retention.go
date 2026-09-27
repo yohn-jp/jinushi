@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"time"
 
@@ -297,17 +296,15 @@ func (s *Store) Usage() (Usage, error) {
 	if err != nil {
 		return Usage{}, err
 	}
-	stats := s.db.Stats()
-	pageSize := s.db.Info().PageSize
-	usage.PageSize = pageSize
-	usage.FreePages = stats.FreePageN
-	usage.PendingPages = stats.PendingPageN
-	usage.FreeBytes = int64(stats.FreePageN+stats.PendingPageN) * int64(pageSize)
-	info, err := os.Stat(s.db.Path())
+	snapshot, err := s.db.databaseUsageSnapshot()
 	if err != nil {
-		return Usage{}, fmt.Errorf("stat bbolt database: %w", err)
+		return Usage{}, err
 	}
-	usage.DatabaseBytes = info.Size()
+	usage.PageSize = snapshot.pageSize
+	usage.FreePages = snapshot.stats.FreePageN
+	usage.PendingPages = snapshot.stats.PendingPageN
+	usage.FreeBytes = int64(snapshot.stats.FreePageN+snapshot.stats.PendingPageN) * int64(snapshot.pageSize)
+	usage.DatabaseBytes = snapshot.databaseBytes
 	return usage, nil
 }
 

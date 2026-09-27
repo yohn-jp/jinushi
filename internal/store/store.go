@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -28,6 +29,7 @@ var (
 	ErrOutputTooLarge    = errors.New("output byte counter overflow")
 	ErrInvalidOutput     = errors.New("invalid output request")
 	ErrTerminalImmutable = errors.New("terminal run is immutable")
+	ErrStoreClosed       = errors.New("store is closed")
 )
 
 const (
@@ -66,11 +68,14 @@ type Options struct {
 	OutputRetainedBytes int64
 }
 
-// Store is safe for concurrent use. bbolt serializes write transactions and
-// ensures a Run update and its event journal append commit together.
+// Store is safe for concurrent use. The operation gate keeps database calls
+// stable while online compaction atomically replaces and reopens the database.
 type Store struct {
-	db      *bolt.DB
+	opGate  sync.RWMutex
+	db      *operationDB
+	rawDB   *bolt.DB
 	dbGuard *os.File
+	path    string
 	options Options
 }
 
@@ -100,11 +105,15 @@ func Open(path string, options Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create store directory: %w", err)
 	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve store path: %w", err)
+	}
+	path = filepath.Clean(path)
 	db, guard, err := openDatabase(path, 0o600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open store database: %w", err)
 	}
-	s := &Store{db: db, dbGuard: guard, options: options}
 	if err := db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{
 			[]byte(runsBucketName), []byte(eventsBucketName), []byte(outputBucketName),
@@ -121,6 +130,9 @@ func Open(path string, options Options) (*Store, error) {
 		}
 		return nil, fmt.Errorf("initialize store: %w", err)
 	}
+	s := &Store{rawDB: db, dbGuard: guard, path: path, options: options}
+	s.db = &operationDB{store: s}
+	cleanupCompactionArtifacts(path)
 	return s, nil
 }
 
@@ -151,14 +163,21 @@ func withDefaults(options Options) Options {
 
 // Close closes the underlying database.
 func (s *Store) Close() error {
-	if s == nil || s.db == nil {
+	if s == nil {
 		return nil
 	}
-	err := s.db.Close()
+	s.opGate.Lock()
+	defer s.opGate.Unlock()
+	if s.rawDB == nil {
+		return nil
+	}
+	err := s.rawDB.Close()
+	s.rawDB = nil
 	if s.dbGuard != nil {
 		if guardErr := s.dbGuard.Close(); err == nil {
 			err = guardErr
 		}
+		s.dbGuard = nil
 	}
 	return err
 }
