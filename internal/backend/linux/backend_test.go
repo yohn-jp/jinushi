@@ -197,18 +197,48 @@ func TestNativeLimitsAreEnforcedOrRejectedExplicitly(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		linuxProcess := process.(*Process)
+		time.Sleep(300 * time.Millisecond)
+		if linuxProcess.cg.counterFile("cpu.stat")["nr_throttled"] <= linuxProcess.cg.baseline["cpu.nr_throttled"] {
+			_, _ = process.Terminate(100 * time.Millisecond)
+			t.Fatal("CPU quota test workload was not throttled by the kernel")
+		}
+		if outcome := process.(backend.LimitEvidence).LimitOutcome(); outcome != "" {
+			_, _ = process.Terminate(100 * time.Millisecond)
+			t.Fatalf("CPU rate throttling must not be a terminating limit event, got %q", outcome)
+		}
 		result, err := process.Terminate(100 * time.Millisecond)
 		if err != nil {
-			t.Fatalf("terminate CPU-limited workload: %v", err)
+			t.Fatalf("terminate CPU-rate-limited workload: %v", err)
 		}
-		if result.Outcome != "resource-limit:cpu-quota" {
-			t.Fatalf("cpu.stat evidence did not identify throttling: %+v", result)
+		if result.Outcome == "resource-limit:cpu-quota" {
+			t.Fatalf("CPU rate throttling was misclassified as a terminal limit: %+v", result)
 		}
 	} else {
 		_, err := New().Start(limitedSpec(t, model.Limits{CPUQuotaPercent: 10}, "/bin/true"), io.Discard, io.Discard)
 		if !errors.Is(err, ErrUnsupported) {
 			t.Fatalf("CPU quota without delegated cgroup support must be rejected, got %v", err)
 		}
+	}
+}
+
+func TestCPUThrottleCounterIsNotATerminatingLimit(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+		"pids.events":   "max 0\n",
+		"cpu.stat":      "usage_usec 100000\nnr_periods 20\nnr_throttled 15\nthrottled_usec 50000\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cg := &cgroup{
+		location: cgroupLocation{childPath: root},
+		baseline: map[string]uint64{"memory.max": 0, "memory.oom": 0, "memory.oom_kill": 0, "pids.max": 0},
+	}
+	if outcome := cg.nativeLimitOutcome(); outcome != "" {
+		t.Fatalf("cpu.stat throttling was returned as a terminating limit event: %q", outcome)
 	}
 }
 

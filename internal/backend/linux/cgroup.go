@@ -27,11 +27,10 @@ type cgroupLocation struct {
 }
 
 type cgroup struct {
-	location   cgroupLocation
-	name       string
-	file       *os.File
-	baseline   map[string]uint64
-	cpuLimited bool
+	location cgroupLocation
+	name     string
+	file     *os.File
+	baseline map[string]uint64
 }
 
 func discoverCgroup() (cgroupLocation, error) {
@@ -182,7 +181,6 @@ func newCgroup(location cgroupLocation, name string, memoryBytes, cpuPercent, pr
 		if err := writeLimit("cpu", "cpu.max", fmt.Sprintf("%d %d", quota, period)); err != nil {
 			return nil, err
 		}
-		cg.cpuLimited = true
 	}
 	if processCount > 0 {
 		if err := writeLimit("pids", "pids.max", strconv.FormatInt(processCount, 10)); err != nil {
@@ -218,6 +216,8 @@ func (c *cgroup) nativeLimitOutcome() string {
 	if c == nil {
 		return ""
 	}
+	// cpu.max is a rate cap: nr_throttled records normal enforcement and does
+	// not mean the Run exceeded a terminal budget or should be stopped.
 	memory := c.counterFile("memory.events")
 	if memory["oom_kill"] > c.baseline["memory.oom_kill"] || memory["oom"] > c.baseline["memory.oom"] || memory["max"] > c.baseline["memory.max"] {
 		return "resource-limit:memory"
@@ -225,12 +225,6 @@ func (c *cgroup) nativeLimitOutcome() string {
 	pids := c.counterFile("pids.events")
 	if pids["max"] > c.baseline["pids.max"] {
 		return "resource-limit:process-count"
-	}
-	if c.cpuLimited {
-		cpu := c.counterFile("cpu.stat")
-		if cpu["nr_throttled"] > c.baseline["cpu.nr_throttled"] {
-			return "resource-limit:cpu-quota"
-		}
 	}
 	return ""
 }
@@ -242,9 +236,6 @@ func readLimitCounters(c *cgroup) map[string]uint64 {
 	}
 	for key, value := range c.counterFile("pids.events") {
 		out["pids."+key] = value
-	}
-	for key, value := range c.counterFile("cpu.stat") {
-		out["cpu."+key] = value
 	}
 	return out
 }
