@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -152,6 +153,23 @@ type capabilities struct {
 type event struct {
 	Seq  uint64 `json:"seq"`
 	Kind string `json:"kind"`
+}
+
+type followedEvent struct {
+	RunID string `json:"runId"`
+	Seq   uint64 `json:"seq"`
+	Kind  string `json:"kind"`
+}
+
+type followRecord struct {
+	Type  string        `json:"type"`
+	RunID string        `json:"runId"`
+	State string        `json:"state"`
+	Event followedEvent `json:"event"`
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type response struct {
@@ -400,6 +418,144 @@ func TestRunLifecycleStartupFailureAndExitReceipt(t *testing.T) {
 	code, completed = h.await(missing.ID, 15*time.Second)
 	if code == 0 || completed.State != "terminal" || completed.Receipt.Outcome != "startup-failed" || completed.Receipt.Cleanup != "complete" {
 		t.Fatalf("startup failure was not represented as a proven terminal receipt: exit=%d run=%+v", code, completed)
+	}
+}
+
+func TestEventsFollowStreamsLiveRunThroughTerminalMarker(t *testing.T) {
+	h := newHarness(t)
+	releasePath := filepath.Join(t.TempDir(), "release-run")
+	started := h.run("--", "/bin/sh", "-c", `printf 'before-follow'; while [ ! -e "$1" ]; do sleep 0.02; done; printf 'after-follow'`, "jinushi-follow", releasePath)
+	h.waitUntil("held Run first output", 8*time.Second, func() bool {
+		current := h.inspect(started.ID)
+		return current.State == "running" && current.Output.Stdout.ObservedBytes >= int64(len("before-follow"))
+	})
+
+	_, _, prior := h.invoke(5*time.Second, "events", "--state-dir", h.stateDir, "--after", "0", started.ID)
+	if prior.Error != nil || len(prior.Events) == 0 {
+		t.Fatalf("read journal before starting follow: %+v", prior)
+	}
+	var after uint64
+	var sawFirstOutput bool
+	for _, item := range prior.Events {
+		if item.Seq > after {
+			after = item.Seq
+		}
+		if item.Kind == "output.chunk" {
+			sawFirstOutput = true
+		}
+	}
+	if !sawFirstOutput || after == 0 {
+		t.Fatalf("Run journal did not contain the first output before follow: %+v", prior.Events)
+	}
+
+	command := exec.Command(jinushiBinary, "events", "--state-dir", h.stateDir, "--after", strconv.FormatUint(after, 10), "--follow", started.ID)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatalf("open follow stdout: %v", err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatalf("start production events --follow CLI: %v", err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		if !waited {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	})
+	type scannedLine struct {
+		data []byte
+		err  error
+	}
+	lines := make(chan scannedLine, 16)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 4096), 1<<20)
+		for scanner.Scan() {
+			lines <- scannedLine{data: append([]byte(nil), scanner.Bytes()...)}
+		}
+		if err := scanner.Err(); err != nil {
+			lines <- scannedLine{err: err}
+		}
+		close(lines)
+	}()
+	readLine := func(timeout time.Duration) []byte {
+		t.Helper()
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("event follower closed before terminal marker")
+			}
+			if line.err != nil {
+				t.Fatalf("read event follower output: %v", line.err)
+			}
+			return line.data
+		case <-time.After(timeout):
+			t.Fatalf("timed out reading event follower output")
+			return nil
+		}
+	}
+	decodeRecord := func(line []byte) followRecord {
+		t.Helper()
+		var record followRecord
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode follow NDJSON record %q: %v", line, err)
+		}
+		return record
+	}
+	first := decodeRecord(readLine(8 * time.Second))
+	if first.Type != "event" || first.Event.RunID != started.ID || first.Event.Seq <= after ||
+		(first.Event.Kind != "resource.sample" && first.Event.Kind != "resource.unavailable") {
+		t.Fatalf("follow did not stream a new live Run event after sequence %d: %+v", after, first)
+	}
+	if current := h.inspect(started.ID); current.State != "running" {
+		t.Fatalf("follow did not attach while the Run was still active: state=%s", current.State)
+	}
+	if err := os.WriteFile(releasePath, []byte("release"), 0600); err != nil {
+		t.Fatalf("release held Run: %v", err)
+	}
+
+	lastSeq := first.Event.Seq
+	sawTerminalEvent := first.Event.Kind == "run.terminal"
+	sawTerminalMarker := false
+	for !sawTerminalMarker {
+		record := decodeRecord(readLine(8 * time.Second))
+		switch record.Type {
+		case "event":
+			if sawTerminalEvent || record.Event.RunID != started.ID || record.Event.Seq <= lastSeq {
+				t.Fatalf("follow event stream was not strictly ordered for Run %s: last=%d record=%+v", started.ID, lastSeq, record)
+			}
+			lastSeq = record.Event.Seq
+			if record.Event.Kind == "run.terminal" {
+				sawTerminalEvent = true
+			}
+		case "terminal":
+			if !sawTerminalEvent || record.RunID != started.ID || record.State != "terminal" {
+				t.Fatalf("follow terminal marker did not follow run.terminal: %+v (saw event=%v)", record, sawTerminalEvent)
+			}
+			sawTerminalMarker = true
+		default:
+			t.Fatalf("unexpected event follow record %q: %+v", record.Type, record)
+		}
+	}
+	select {
+	case line, ok := <-lines:
+		if ok {
+			t.Fatalf("event follower wrote a record after its final terminal marker: %q", line.data)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("event follower did not close after its final terminal marker")
+	}
+	if err := command.Wait(); err != nil {
+		waited = true
+		t.Fatalf("production events --follow exited unsuccessfully: %v; stderr=%q", err, stderr.String())
+	}
+	waited = true
+	code, completed := h.await(started.ID, 8*time.Second)
+	if code != 0 || completed.Receipt.Outcome != "exited" || completed.Receipt.ExitCode == nil || *completed.Receipt.ExitCode != 0 {
+		t.Fatalf("followed Run did not finish with a clean physical receipt: exit=%d receipt=%+v", code, completed.Receipt)
 	}
 }
 
