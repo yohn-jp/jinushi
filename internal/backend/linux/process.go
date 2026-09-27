@@ -32,6 +32,10 @@ type Process struct {
 	waitDone       chan struct{}
 	outputDone     chan struct{}
 	resultMu       sync.RWMutex
+	evidenceMu     sync.Mutex
+	evidencePrior  map[model.ProcessIdentity]model.ProcessEvidence
+	evidenceReady  bool
+	finalEvidence  *model.TelemetrySample
 	exit           backend.Exit
 	waitErr        error
 	outputErr      error
@@ -453,6 +457,12 @@ func (p *Process) waitForExit() {
 			p.finalResources = &resources
 			p.resultMu.Unlock()
 		}
+	}
+	p.evidenceMu.Lock()
+	finalEvidence, _ := p.collectEvidenceLocked(time.Now().UTC())
+	p.finalEvidence = &finalEvidence
+	p.evidenceMu.Unlock()
+	if p.cg != nil {
 		p.cg.close()
 	}
 

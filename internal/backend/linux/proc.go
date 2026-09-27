@@ -100,8 +100,8 @@ func parseProcStat(data []byte) (procInfo, error) {
 		return procInfo{}, err
 	}
 	rssPages, err := strconv.ParseInt(fields[21], 10, 64)
-	if err != nil {
-		return procInfo{}, err
+	if err != nil || rssPages < 0 || rssPages > int64(^uint64(0)>>1)/int64(os.Getpagesize()) {
+		return procInfo{}, errors.New("invalid Linux resident page count")
 	}
 	threads, err := strconv.ParseInt(fields[17], 10, 64)
 	if err != nil || threads < 0 {
