@@ -108,10 +108,26 @@ type runOutput struct {
 }
 
 type receipt struct {
-	Outcome              string `json:"outcome"`
-	ExitCode             *int   `json:"exitCode"`
-	Cleanup              string `json:"cleanup"`
-	TerminationRequested bool   `json:"terminationRequested"`
+	Outcome              string       `json:"outcome"`
+	ExitCode             *int         `json:"exitCode"`
+	Cleanup              string       `json:"cleanup"`
+	TerminationRequested bool         `json:"terminationRequested"`
+	AcceptedArgvSHA256   string       `json:"acceptedArgvSha256"`
+	Resources            resources    `json:"resources"`
+	Capabilities         capabilities `json:"capabilities"`
+	Output               runOutput    `json:"output"`
+	EventFirstSeq        uint64       `json:"eventFirstSeq"`
+	EventLastSeq         uint64       `json:"eventLastSeq"`
+	EventHistoryComplete bool         `json:"eventHistoryComplete"`
+	EvidenceIncomplete   bool         `json:"evidenceIncomplete"`
+}
+
+type resources struct {
+	MemoryBytes      metric `json:"memoryBytes"`
+	PeakMemoryBytes  metric `json:"peakMemoryBytes"`
+	CPUTimeNs        metric `json:"cpuTimeNs"`
+	ProcessCount     metric `json:"processCount"`
+	PeakProcessCount metric `json:"peakProcessCount"`
 }
 
 type run struct {
@@ -331,6 +347,42 @@ func TestRunLifecycleStartupFailureAndExitReceipt(t *testing.T) {
 	code, completed := h.await(normal.ID, 15*time.Second)
 	if code != 0 || completed.State != "terminal" || completed.Receipt.Outcome != "exited" || completed.Receipt.ExitCode == nil || *completed.Receipt.ExitCode != 0 {
 		t.Fatalf("normal Run did not produce a clean physical receipt: exit=%d run=%+v", code, completed)
+	}
+	if completed.Receipt.EventFirstSeq != 1 || !completed.Receipt.EventHistoryComplete {
+		t.Fatalf("short Run receipt did not preserve complete event history from sequence 1: %+v", completed.Receipt)
+	}
+	if completed.Receipt.AcceptedArgvSHA256 == "" || completed.Receipt.Capabilities.Backend == "" || len(completed.Receipt.Capabilities.Signals) == 0 {
+		t.Fatalf("terminal receipt omitted accepted argv identity or backend capability evidence: %+v", completed.Receipt)
+	}
+	_, _, eventResult := h.invoke(5*time.Second, "events", "--state-dir", h.stateDir, normal.ID)
+	if eventResult.Error != nil {
+		t.Fatalf("read normal Run event journal: %+v", eventResult)
+	}
+	var terminalSeq uint64
+	for _, ev := range eventResult.Events {
+		if ev.Kind == "run.terminal" {
+			terminalSeq = ev.Seq
+			break
+		}
+	}
+	if terminalSeq == 0 || terminalSeq < completed.Receipt.EventFirstSeq || terminalSeq > completed.Receipt.EventLastSeq {
+		t.Fatalf("receipt journal range [%d,%d] does not contain terminal event sequence %d: events=%+v", completed.Receipt.EventFirstSeq, completed.Receipt.EventLastSeq, terminalSeq, eventResult.Events)
+	}
+	unavailableTelemetry := false
+	for _, sampled := range []metric{
+		completed.Receipt.Resources.MemoryBytes,
+		completed.Receipt.Resources.PeakMemoryBytes,
+		completed.Receipt.Resources.CPUTimeNs,
+		completed.Receipt.Resources.ProcessCount,
+		completed.Receipt.Resources.PeakProcessCount,
+	} {
+		if sampled.Status == "unavailable" || sampled.Status == "" {
+			unavailableTelemetry = true
+		}
+	}
+	wantIncomplete := unavailableTelemetry || !completed.Receipt.Output.HistoryComplete || !completed.Receipt.EventHistoryComplete
+	if completed.Receipt.EvidenceIncomplete != wantIncomplete {
+		t.Fatalf("receipt evidenceIncomplete=%v; expected %v from telemetry/output/event evidence: resources=%+v output=%+v eventsComplete=%v", completed.Receipt.EvidenceIncomplete, wantIncomplete, completed.Receipt.Resources, completed.Receipt.Output, completed.Receipt.EventHistoryComplete)
 	}
 	_, _, result := h.invoke(5*time.Second, "output", "--state-dir", h.stateDir, "--stream", "stdout", "--limit", "128", "--json", normal.ID)
 	output, err := base64.StdEncoding.DecodeString(result.Data)
