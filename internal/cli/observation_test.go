@@ -144,7 +144,10 @@ func TestWatchFollowUsesNotifierAndReconnectsPastHistoryGap(t *testing.T) {
 		case 1:
 			return protocol.Response{Version: model.ProtocolVersion, NextCursor: request.Cursor}
 		case 2:
-			return protocol.Response{Version: model.ProtocolVersion, Gap: true, NextCursor: "cursor_watermark"}
+			return protocol.Response{
+				Version: model.ProtocolVersion, Gap: true, NextCursor: "cursor_watermark",
+				WatchWatermark: "cursor_watermark", WatchRetainedFrom: "cursor_retained",
+			}
 		default:
 			return protocol.Response{Version: model.ProtocolVersion, NextCursor: request.Cursor}
 		}
@@ -197,7 +200,7 @@ func TestWatchFollowUsesNotifierAndReconnectsPastHistoryGap(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &page); err != nil {
 		t.Fatalf("watch follow output is not NDJSON/JSON: %v; output=%s", err, line)
 	}
-	if !page.Gap || page.NextCursor != "cursor_watermark" {
+	if !page.Gap || page.NextCursor != "cursor_watermark" || page.WatchWatermark != "cursor_watermark" || page.WatchRetainedFrom != "cursor_retained" {
 		t.Fatalf("watch follow gap page = %#v", page)
 	}
 	if stderr.Len() != 0 {
