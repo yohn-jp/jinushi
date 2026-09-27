@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/yohn-jp/jinushi/internal/model"
 )
@@ -20,6 +21,7 @@ type spool struct {
 	streamLimit int64
 	files       map[string]*os.File
 	stats       map[string]model.OutputStream
+	lastWriteAt map[string]time.Time
 	failed      bool
 	closed      bool
 }
@@ -36,6 +38,7 @@ func openSpool(dir string, maxBytes int64) (*spool, error) {
 		streamLimit: maxBytes / 3,
 		files:       make(map[string]*os.File, 3),
 		stats:       make(map[string]model.OutputStream, 3),
+		lastWriteAt: make(map[string]time.Time, 3),
 	}
 	for _, name := range []string{"stdout", "stderr", "pty"} {
 		path := filepath.Join(dir, name+".out")
@@ -113,6 +116,9 @@ func (w streamWriter) Write(p []byte) (int, error) {
 		}
 	}
 	stat.ObservedBytes = newObserved
+	if len(p) > 0 {
+		s.lastWriteAt[w.name] = time.Now().UTC()
+	}
 	if newFrom > 0 || s.failed {
 		stat.Truncated = true
 	}
@@ -170,11 +176,23 @@ func (s *spool) sync() error {
 }
 
 func (s *spool) output() model.Output {
+	output, _ := s.evidence()
+	return output
+}
+
+func (s *spool) evidence() (model.Output, map[string]time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := model.Output{Stdout: s.stats["stdout"], Stderr: s.stats["stderr"], PTY: s.stats["pty"]}
 	out.HistoryComplete = !s.failed && !out.Stdout.Truncated && !out.Stderr.Truncated && !out.PTY.Truncated
-	return out
+	if len(s.lastWriteAt) == 0 {
+		return out, nil
+	}
+	times := make(map[string]time.Time, len(s.lastWriteAt))
+	for stream, at := range s.lastWriteAt {
+		times[stream] = at
+	}
+	return out, times
 }
 
 func (s *spool) read(stream string, offset, limit int64) (Chunk, error) {
@@ -188,6 +206,9 @@ func (s *spool) read(stream string, offset, limit int64) (Chunk, error) {
 		return Chunk{}, fmt.Errorf("guardian: unknown output stream %q", stream)
 	}
 	chunk := Chunk{Stream: stream, Offset: offset, RetainedFrom: stat.RetainedFrom, ObservedBytes: stat.ObservedBytes, RetainedBytes: stat.RetainedBytes, Truncated: stat.Truncated}
+	if at, exists := s.lastWriteAt[stream]; exists {
+		chunk.LastWriteAt = timePtrOrNil(at)
+	}
 	retainedEnd := stat.RetainedFrom + stat.RetainedBytes
 	if offset < stat.RetainedFrom {
 		chunk.Gap = true

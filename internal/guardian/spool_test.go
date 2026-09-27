@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestSpoolFloodRetainsBoundedTailAndReportsGap(t *testing.T) {
@@ -56,5 +57,35 @@ func TestSpoolFloodRetainsBoundedTailAndReportsGap(t *testing.T) {
 		if b != 'x' {
 			t.Fatalf("ring wrap returned wrong byte %q", b)
 		}
+	}
+}
+
+func TestSpoolTracksPerStreamLastWriteTime(t *testing.T) {
+	spool, err := openSpool(filepath.Join(t.TempDir(), "run"), 3<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.close()
+
+	if _, err := spool.writer("stdout").Write([]byte("out")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.writer("stderr").Write([]byte("err")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, times := spool.evidence()
+	if len(times) != 2 || times["stdout"].IsZero() || times["stderr"].IsZero() {
+		t.Fatalf("per-stream write timestamps = %#v", times)
+	}
+	stdout, err := spool.read("stdout", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.LastWriteAt == nil || !stdout.LastWriteAt.Equal(times["stdout"]) {
+		t.Fatalf("chunk last write time = %v, spool evidence = %v", stdout.LastWriteAt, times["stdout"])
+	}
+	if stdout.LastWriteAt.Before(time.Now().Add(-time.Minute)) {
+		t.Fatalf("chunk write time is stale: %v", stdout.LastWriteAt)
 	}
 }

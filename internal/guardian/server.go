@@ -76,7 +76,7 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 	}
 	state.snapshot = Snapshot{
 		Version: ProtocolVersion, RunID: config.RunID, State: model.Starting,
-		Resources: unavailableResources(), LeaseExpiry: config.InitialLeaseExpiry,
+		Resources: unavailableResourcesFor(config.SampleIntervalMs), LeaseExpiry: config.InitialLeaseExpiry,
 		LeaseGeneration: config.LeaseGeneration,
 	}
 	if err := state.persist(); err != nil {
@@ -136,8 +136,8 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 	state.snapshot.Ownership = &owner
 	state.snapshot.StartedAt = &startedAt
 	state.startedMono = startedMono
-	state.snapshot.Output = spool.output()
-	state.snapshot.Resources = unavailableResources()
+	state.captureOutputEvidenceLocked()
+	state.snapshot.Resources = unavailableResourcesFor(config.SampleIntervalMs)
 	err = state.persistLocked()
 	state.mu.Unlock()
 	state.controlMu.Unlock()
@@ -254,12 +254,16 @@ func (s *runState) observe() (Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.snapshot.State != model.Terminal && s.process != nil {
-		if resources, err := s.process.Observe(); err == nil {
-			s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources)
+		resources, observeErr := s.process.Observe()
+		observedAt := time.Now().UTC()
+		s.snapshot.LastResourceSampleAt = &observedAt
+		if observeErr == nil {
+			s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources, s.descriptor.SampleIntervalMs)
 		} else {
 			s.snapshot.Resources = unavailableCurrent(s.snapshot.Resources)
 		}
-		s.snapshot.Output = s.spool.output()
+		s.snapshot.Resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
+		s.captureOutputEvidenceLocked()
 		if err := s.persistLocked(); err != nil {
 			return Snapshot{}, err
 		}
@@ -300,6 +304,7 @@ func (s *runState) terminate(grace time.Duration, reason string) (backend.Termin
 	s.snapshot.State = model.Terminating
 	s.snapshot.Termination.Requested = true
 	s.snapshot.TerminationReason = boundedReason(reason)
+	s.captureOutputEvidenceLocked()
 	if err := s.persistLocked(); err != nil {
 		s.snapshot.State = model.Uncertain
 		s.snapshot.Reason = "termination-request-persist-failed"
@@ -311,15 +316,30 @@ func (s *runState) terminate(grace time.Duration, reason string) (backend.Termin
 		grace = 0
 	}
 	result, err := process.Terminate(grace)
-	if err != nil {
-		return result, err
-	}
 	s.mu.Lock()
 	s.snapshot.Termination.Requested = result.Requested || s.snapshot.Termination.Requested
-	s.snapshot.Termination.Forced = result.Forced
-	s.snapshot.Termination.TreeEmpty = result.TreeEmpty
-	s.snapshot.Termination.Outcome = result.Outcome
-	_ = s.persistLocked()
+	s.snapshot.Termination.Forced = result.Forced || s.snapshot.Termination.Forced
+	if err == nil {
+		s.snapshot.Termination.TreeEmpty = result.TreeEmpty || s.snapshot.Termination.TreeEmpty
+	}
+	if result.Outcome != "" {
+		s.snapshot.Termination.Outcome = result.Outcome
+	}
+	s.captureOutputEvidenceLocked()
+	if err != nil || !s.snapshot.Termination.TreeEmpty {
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = "termination-outcome-unproven"
+		_ = s.persistLocked()
+		s.mu.Unlock()
+		return result, ErrUncertain
+	}
+	if persistErr := s.persistLocked(); persistErr != nil {
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = "termination-result-persist-failed"
+		_ = s.persistLocked()
+		s.mu.Unlock()
+		return result, ErrUncertain
+	}
 	s.mu.Unlock()
 	return result, nil
 }
@@ -482,17 +502,21 @@ func (s *runState) sample() {
 		return
 	}
 	process := s.process
-	if resources, err := process.Observe(); err == nil {
-		s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources)
+	resources, observeErr := process.Observe()
+	observedAt := time.Now().UTC()
+	s.snapshot.LastResourceSampleAt = &observedAt
+	if observeErr == nil {
+		s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources, s.descriptor.SampleIntervalMs)
 	} else {
 		s.snapshot.Resources = unavailableCurrent(s.snapshot.Resources)
 	}
+	s.snapshot.Resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
 	if limits, ok := process.(backend.LimitEvidence); ok {
 		if outcome := normalizeLimitOutcome(limits.LimitOutcome()); outcome != "" && s.snapshot.LimitOutcome == "" {
 			s.snapshot.LimitOutcome = outcome
 		}
 	}
-	s.snapshot.Output = s.spool.output()
+	s.captureOutputEvidenceLocked()
 	err := s.persistLocked()
 	terminationReason := ""
 	if err == nil && s.snapshot.State == model.Running && !s.snapshot.Termination.Requested {
@@ -520,15 +544,18 @@ func (s *runState) finish(exit backend.Exit) bool {
 	s.mu.Lock()
 	resources := s.snapshot.Resources
 	limitOutcome := s.snapshot.LimitOutcome
-	s.mu.Unlock()
-	if observed, err := s.process.Observe(); err == nil {
-		s.mu.Lock()
-		resources = mergeResources(s.snapshot.Resources, observed)
-		s.mu.Unlock()
+	observed, observeErr := s.process.Observe()
+	observedAt := time.Now().UTC()
+	s.snapshot.LastResourceSampleAt = &observedAt
+	if observeErr == nil {
+		resources = mergeResources(s.snapshot.Resources, observed, s.descriptor.SampleIntervalMs)
 	} else {
 		resources = unavailableCurrent(resources)
 	}
-	output := s.spool.output()
+	resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
+	s.snapshot.Resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
+	output := s.captureOutputEvidenceLocked()
+	s.mu.Unlock()
 	finished := exit.FinishedAt
 	if finished.IsZero() {
 		finished = time.Now().UTC()
@@ -603,8 +630,8 @@ func (s *runState) markStartupFailure(reason string) {
 	s.snapshot.Reason = boundedReason(reason)
 	s.snapshot.FinishedAt = &finished
 	s.snapshot.Termination.TreeEmpty = true
-	s.snapshot.Output = s.spool.output()
-	receipt := model.Receipt{Version: 1, RunID: s.snapshot.RunID, Outcome: "startup-failed", FinishedAt: finished, Resources: unavailableResources(), Output: s.snapshot.Output, Cleanup: "complete"}
+	s.captureOutputEvidenceLocked()
+	receipt := model.Receipt{Version: 1, RunID: s.snapshot.RunID, Outcome: "startup-failed", FinishedAt: finished, Resources: unavailableResourcesFor(s.descriptor.SampleIntervalMs), Output: s.snapshot.Output, Cleanup: "complete"}
 	s.snapshot.Receipt = &receipt
 	_ = s.persistLocked()
 	s.termOnce.Do(func() { close(s.terminal) })
@@ -619,10 +646,10 @@ func (s *runState) markNoStartTerminal(outcome, reason string) {
 	s.snapshot.TerminationReason = boundedReason(reason)
 	s.snapshot.Termination.TreeEmpty = true
 	s.snapshot.FinishedAt = &finished
-	s.snapshot.Output = s.spool.output()
+	s.captureOutputEvidenceLocked()
 	receipt := model.Receipt{
 		Version: 1, RunID: s.snapshot.RunID, Outcome: outcome,
-		FinishedAt: finished, Resources: unavailableResources(),
+		FinishedAt: finished, Resources: unavailableResourcesFor(s.descriptor.SampleIntervalMs),
 		Output: s.snapshot.Output, Cleanup: "complete",
 	}
 	s.snapshot.Receipt = &receipt
@@ -636,7 +663,7 @@ func (s *runState) markUncertain(reason string) {
 	if s.snapshot.State != model.Terminal {
 		s.snapshot.State = model.Uncertain
 		s.snapshot.Reason = boundedReason(reason)
-		s.snapshot.Output = s.spool.output()
+		s.captureOutputEvidenceLocked()
 		_ = s.persistLocked()
 	}
 	s.mu.Unlock()
@@ -647,7 +674,7 @@ func (s *runState) markUncertainWithOwnership(owner model.Ownership, reason stri
 	s.snapshot.State = model.Uncertain
 	s.snapshot.Ownership = &owner
 	s.snapshot.Reason = boundedReason(reason)
-	s.snapshot.Output = s.spool.output()
+	s.captureOutputEvidenceLocked()
 	_ = s.persistLocked()
 	s.mu.Unlock()
 }
@@ -664,6 +691,39 @@ func (s *runState) persist() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.persistLocked()
+}
+
+func (s *runState) captureOutputEvidenceLocked() model.Output {
+	output, latestByStream := s.spool.evidence()
+	s.snapshot.Output = output
+	if len(latestByStream) == 0 {
+		return output
+	}
+
+	merged := make(map[string]time.Time, 3)
+	for _, stream := range []string{"stdout", "stderr", "pty"} {
+		latest, exists := s.snapshot.OutputLastWriteAt[stream]
+		if current, ok := latestByStream[stream]; ok && (!exists || current.After(latest)) {
+			latest, exists = current, true
+		}
+		if exists && !latest.IsZero() {
+			merged[stream] = latest
+		}
+	}
+	if len(merged) == 0 {
+		return output
+	}
+	s.snapshot.OutputLastWriteAt = merged
+	var latest time.Time
+	for _, at := range merged {
+		if at.After(latest) {
+			latest = at
+		}
+	}
+	if s.snapshot.LastOutputAt == nil || latest.After(*s.snapshot.LastOutputAt) {
+		s.snapshot.LastOutputAt = timePtrOrNil(latest)
+	}
+	return output
 }
 
 func (s *runState) persistLocked() error { return writeSnapshot(s.descriptor.Dir, s.snapshot) }
@@ -725,7 +785,7 @@ func timePtrOrNil(value time.Time) *time.Time {
 	return &value
 }
 
-func mergeResources(previous, current model.Resources) model.Resources {
+func mergeResources(previous, current model.Resources, sampleIntervalMs int64) model.Resources {
 	out := current
 	out.PeakMemoryBytes = maxMetric(previous.PeakMemoryBytes, current.PeakMemoryBytes, current.MemoryBytes)
 	out.PeakProcessCount = maxMetric(previous.PeakProcessCount, current.PeakProcessCount, current.ProcessCount)
@@ -734,7 +794,7 @@ func mergeResources(previous, current model.Resources) model.Resources {
 	} else if previous.CPUTimeNs.Status == "measured" {
 		out.CPUTimeNs = previous.CPUTimeNs
 	}
-	out.SampleIntervalMs = 1000
+	out.SampleIntervalMs = sampleIntervalMs
 	return out
 }
 

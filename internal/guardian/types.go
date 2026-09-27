@@ -64,6 +64,9 @@ type Snapshot struct {
 	State                       model.State               `json:"state"`
 	Ownership                   *model.Ownership          `json:"ownership,omitempty"`
 	Resources                   model.Resources           `json:"resources"`
+	LastResourceSampleAt        *time.Time                `json:"lastResourceSampleAt,omitempty"`
+	LastOutputAt                *time.Time                `json:"lastOutputAt,omitempty"`
+	OutputLastWriteAt           map[string]time.Time      `json:"outputLastWriteAt,omitempty"`
 	Output                      model.Output              `json:"output"`
 	StartedAt                   *time.Time                `json:"startedAt,omitempty"`
 	FinishedAt                  *time.Time                `json:"finishedAt,omitempty"`
@@ -90,14 +93,15 @@ type Evidence struct {
 // Chunk is an absolute-offset output range. If Gap is true, some observed
 // bytes in the requested history range were not retained.
 type Chunk struct {
-	Stream        string `json:"stream"`
-	Offset        int64  `json:"offset"`
-	Data          []byte `json:"data,omitempty"`
-	RetainedFrom  int64  `json:"retainedFrom"`
-	RetainedBytes int64  `json:"retainedBytes"`
-	ObservedBytes int64  `json:"observedBytes"`
-	Gap           bool   `json:"gap"`
-	Truncated     bool   `json:"truncated"`
+	Stream        string     `json:"stream"`
+	Offset        int64      `json:"offset"`
+	Data          []byte     `json:"data,omitempty"`
+	LastWriteAt   *time.Time `json:"lastWriteAt,omitempty"`
+	RetainedFrom  int64      `json:"retainedFrom"`
+	RetainedBytes int64      `json:"retainedBytes"`
+	ObservedBytes int64      `json:"observedBytes"`
+	Gap           bool       `json:"gap"`
+	Truncated     bool       `json:"truncated"`
 }
 
 // Handle reconnects to the helper with its private descriptor. Closing a

@@ -128,7 +128,7 @@ func startHelper(ctx context.Context, executable string, config Config) (*Handle
 	}
 	initial := Snapshot{
 		Version: ProtocolVersion, RunID: config.RunID, State: model.Starting,
-		Resources: unavailableResources(), LeaseExpiry: config.InitialLeaseExpiry,
+		Resources: unavailableResourcesFor(config.SampleIntervalMs), LeaseExpiry: config.InitialLeaseExpiry,
 		LeaseGeneration: config.LeaseGeneration,
 	}
 	if err := writeSnapshot(dir, initial); err != nil {
@@ -266,6 +266,12 @@ func unavailableResources() model.Resources {
 	return model.Resources{MemoryBytes: metric, PeakMemoryBytes: metric, CPUTimeNs: metric, ProcessCount: metric, PeakProcessCount: metric}
 }
 
+func unavailableResourcesFor(sampleIntervalMs int64) model.Resources {
+	resources := unavailableResources()
+	resources.SampleIntervalMs = sampleIntervalMs
+	return resources
+}
+
 func safeReason(reason string) string {
 	if reason == "" {
 		return "ownership was not proven"
@@ -393,6 +399,7 @@ func (h *Handle) readOutput(stream string, offset, limit int64) (Chunk, error) {
 	defer cancel()
 	snapshot, _ := h.observe(ctx)
 	stat := outputStream(snapshot.Output, stream)
+	lastWriteAt := outputLastWriteAt(snapshot.OutputLastWriteAt, stream)
 	path := filepath.Join(h.descriptor.Dir, stream+".out")
 	response, callErr := h.call(ctx, rpcRequest{Op: "output", Stream: stream, Offset: offset, Limit: limit})
 	if callErr == nil && response.Chunk != nil {
@@ -406,7 +413,7 @@ func (h *Handle) readOutput(stream string, offset, limit int64) (Chunk, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return Chunk{Stream: stream, Offset: offset, ObservedBytes: stat.ObservedBytes, RetainedBytes: stat.RetainedBytes, RetainedFrom: stat.RetainedFrom, Truncated: stat.Truncated, Gap: offset < stat.ObservedBytes}, nil
+			return Chunk{Stream: stream, Offset: offset, LastWriteAt: lastWriteAt, ObservedBytes: stat.ObservedBytes, RetainedBytes: stat.RetainedBytes, RetainedFrom: stat.RetainedFrom, Truncated: stat.Truncated, Gap: offset < stat.ObservedBytes}, nil
 		}
 		return Chunk{}, err
 	}
@@ -418,7 +425,7 @@ func (h *Handle) readOutput(stream string, offset, limit int64) (Chunk, error) {
 	if !info.Mode().IsRegular() {
 		return Chunk{}, errors.New("guardian: output spool is not a regular file")
 	}
-	chunk := Chunk{Stream: stream, Offset: offset, RetainedFrom: stat.RetainedFrom, RetainedBytes: stat.RetainedBytes, ObservedBytes: stat.ObservedBytes, Truncated: stat.Truncated}
+	chunk := Chunk{Stream: stream, Offset: offset, LastWriteAt: lastWriteAt, RetainedFrom: stat.RetainedFrom, RetainedBytes: stat.RetainedBytes, ObservedBytes: stat.ObservedBytes, Truncated: stat.Truncated}
 	retainedEnd := stat.RetainedFrom + stat.RetainedBytes
 	if offset < stat.RetainedFrom {
 		chunk.Gap = true
@@ -479,6 +486,15 @@ func outputStream(output model.Output, name string) model.OutputStream {
 	default:
 		return output.PTY
 	}
+}
+
+func outputLastWriteAt(times map[string]time.Time, stream string) *time.Time {
+	at, ok := times[stream]
+	if !ok || at.IsZero() {
+		return nil
+	}
+	copy := at
+	return &copy
 }
 
 func (h *Handle) call(ctx context.Context, request rpcRequest) (rpcResponse, error) {
