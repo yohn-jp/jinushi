@@ -46,19 +46,28 @@ type rpcRequest struct {
 	Limit           int64  `json:"limit,omitempty"`
 	LeaseGeneration uint64 `json:"leaseGeneration,omitempty"`
 	LeaseMs         int64  `json:"leaseMs,omitempty"`
+	RequestID       string `json:"requestId,omitempty"`
+	ControlValue    int64  `json:"controlValue,omitempty"`
 }
 
 type rpcResponse struct {
-	Version     int                        `json:"version"`
-	Snapshot    *Snapshot                  `json:"snapshot,omitempty"`
-	Termination *backend.TerminationResult `json:"termination,omitempty"`
-	Chunk       *Chunk                     `json:"chunk,omitempty"`
-	Error       string                     `json:"error,omitempty"`
+	Version       int                        `json:"version"`
+	Snapshot      *Snapshot                  `json:"snapshot,omitempty"`
+	Termination   *backend.TerminationResult `json:"termination,omitempty"`
+	Chunk         *Chunk                     `json:"chunk,omitempty"`
+	Control       *model.ControlEventPayload `json:"control,omitempty"`
+	ControlFound  bool                       `json:"controlFound,omitempty"`
+	ControlGap    *ControlEvidenceGap        `json:"controlGap,omitempty"`
+	ControlRecord *ControlOperation          `json:"controlRecord,omitempty"`
+	Error         string                     `json:"error,omitempty"`
 }
 
 func startHelper(ctx context.Context, executable string, config Config) (*Handle, error) {
 	if !runIDPattern.MatchString(config.RunID) {
 		return nil, ErrInvalidIdentity
+	}
+	if err := validateHostEnvelope(config.HostEnvelope); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(executable) == "" {
 		return nil, errors.New("guardian: executable path is required")
@@ -118,10 +127,11 @@ func startHelper(ctx context.Context, executable string, config Config) (*Handle
 		return nil, fmt.Errorf("guardian: create control credential: %w", err)
 	}
 	descriptor := privateDescriptor{
-		Version: ProtocolVersion,
-		RunID:   config.RunID,
-		Dir:     dir,
-		Token:   token,
+		Version:      ProtocolVersion,
+		RunID:        config.RunID,
+		Dir:          dir,
+		Token:        token,
+		HostEnvelope: config.HostEnvelope,
 	}
 	if err := writeDescriptor(descriptor); err != nil {
 		return nil, err
@@ -140,6 +150,7 @@ func startHelper(ctx context.Context, executable string, config Config) (*Handle
 		MaxOutputBytes: config.MaxOutputBytes, InitialLeaseExpiry: config.InitialLeaseExpiry,
 		LeaseGeneration: config.LeaseGeneration, TerminationGraceMs: config.TerminationGraceMs,
 		SampleIntervalMs: config.SampleIntervalMs, Token: token,
+		HostEnvelope: config.HostEnvelope,
 	}
 	configBytes, err := json.Marshal(lcfg)
 	if err != nil {
@@ -381,6 +392,64 @@ func (h *Handle) writeInput(ctx context.Context, data []byte) error {
 func (h *Handle) closeInput(ctx context.Context) error {
 	_, err := h.call(ctx, rpcRequest{Op: "close-input"})
 	return err
+}
+
+func (h *Handle) control(ctx context.Context, operation, requestID string, value int64) (model.ControlEventPayload, error) {
+	response, err := h.call(ctx, rpcRequest{Op: operation, RequestID: requestID, ControlValue: value})
+	if err != nil {
+		return model.ControlEventPayload{}, err
+	}
+	if response.Control == nil {
+		return model.ControlEventPayload{}, errors.New("guardian: control response lacks physical evidence")
+	}
+	evidence := *response.Control
+	switch evidence.Outcome {
+	case "applied":
+		return evidence, nil
+	case "failed":
+		if evidence.Reason == "request-id-conflict" {
+			return evidence, ErrControlConflict
+		}
+		return evidence, ErrControlFailed
+	case "uncertain":
+		return evidence, ErrUncertain
+	default:
+		return evidence, errors.New("guardian: control response has an unknown outcome")
+	}
+}
+
+func (h *Handle) lookupControl(ctx context.Context, requestID string) (ControlOperation, bool, ControlEvidenceGap, error) {
+	if len(requestID) == 0 || len(requestID) > 128 || strings.ContainsAny(requestID, "\x00\r\n") {
+		return ControlOperation{}, false, ControlEvidenceGap{}, errors.New("guardian: invalid control request identity")
+	}
+	response, err := h.call(ctx, rpcRequest{Op: "control-evidence", RequestID: requestID})
+	if err != nil {
+		snapshot, readErr := readSnapshot(h.descriptor.Dir)
+		if readErr != nil {
+			return ControlOperation{}, false, ControlEvidenceGap{}, errors.Join(err, readErr, ErrUncertain)
+		}
+		if snapshot.Controls == nil {
+			return ControlOperation{}, false, ControlEvidenceGap{}, nil
+		}
+		pruneControlEvidence(snapshot.Controls, time.Now().UTC())
+		for _, operation := range snapshot.Controls.Operations {
+			if operation.RequestID == requestID {
+				return operation, true, snapshot.Controls.EvidenceGap, nil
+			}
+		}
+		return ControlOperation{}, false, snapshot.Controls.EvidenceGap, nil
+	}
+	var gap ControlEvidenceGap
+	if response.ControlGap != nil {
+		gap = *response.ControlGap
+	}
+	if !response.ControlFound {
+		return ControlOperation{}, false, gap, nil
+	}
+	if response.ControlRecord == nil {
+		return ControlOperation{}, false, gap, errors.New("guardian: control evidence response lacks operation metadata")
+	}
+	return *response.ControlRecord, true, gap, nil
 }
 
 func (h *Handle) resize(ctx context.Context, rows, cols uint16) error {

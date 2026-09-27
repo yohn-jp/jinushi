@@ -25,6 +25,8 @@ var (
 	ErrInvalidIdentity = errors.New("guardian: invalid run identity")
 	ErrLeaseExpired    = errors.New("guardian: lease has expired")
 	ErrStaleGeneration = errors.New("guardian: stale lease generation")
+	ErrControlFailed   = errors.New("guardian: physical control failed")
+	ErrControlConflict = errors.New("guardian: control request identity conflict")
 )
 
 // Config is transient launch data. Spec, including its environment values,
@@ -33,11 +35,28 @@ type Config struct {
 	RunID              string
 	Dir                string
 	Spec               model.RunSpec
+	HostEnvelope       HostEnvelopeConfig
 	MaxOutputBytes     int64
 	InitialLeaseExpiry *time.Time
 	LeaseGeneration    uint64
 	TerminationGraceMs int64
 	SampleIntervalMs   int64
+}
+
+// HostEnvelopeConfig is the bounded, Linux-neutral launch projection for
+// supervisor-level physical safety ceilings. The helper persists it with its
+// launch evidence so the selected backend can apply the same envelope.
+type HostEnvelopeConfig struct {
+	MemoryBytes   int64 `json:"memoryBytes,omitempty"`
+	TaskCount     int64 `json:"taskCount,omitempty"`
+	MaxActiveRuns int64 `json:"maxActiveRuns,omitempty"`
+}
+
+func validateHostEnvelope(config HostEnvelopeConfig) error {
+	if config.MemoryBytes < 0 || config.TaskCount < 0 || config.MaxActiveRuns < 0 {
+		return errors.New("guardian: host envelope limits cannot be negative")
+	}
+	return nil
 }
 
 // Descriptor contains only a private state path for reconnect. Authentication
@@ -49,10 +68,44 @@ type Descriptor struct {
 }
 
 type privateDescriptor struct {
-	Version int    `json:"version"`
-	RunID   string `json:"runId"`
-	Dir     string `json:"dir"`
-	Token   string `json:"token"`
+	Version      int                `json:"version"`
+	RunID        string             `json:"runId"`
+	Dir          string             `json:"dir"`
+	Token        string             `json:"token"`
+	HostEnvelope HostEnvelopeConfig `json:"hostEnvelope,omitempty"`
+}
+
+const maxControlEvidenceOperations = 256
+
+// ControlEvidenceGap describes operations evicted after the request identity
+// retention window. The Supervisor event journal remains the complete history
+// authority; this bounded Guardian cache exists to reconcile pending calls.
+type ControlEvidenceGap struct {
+	ExpiredCount   uint64     `json:"expiredCount,omitempty"`
+	ExpiredFrom    *time.Time `json:"expiredFrom,omitempty"`
+	ExpiredThrough *time.Time `json:"expiredThrough,omitempty"`
+	RetainedFrom   *time.Time `json:"retainedFrom,omitempty"`
+}
+
+// ControlOperation is a durable Guardian-side idempotency record. Pending is
+// persisted before a physical effect; Completed records its verified result.
+type ControlOperation struct {
+	RequestID string                    `json:"requestId"`
+	Digest    string                    `json:"digest"`
+	Status    string                    `json:"status"`
+	Evidence  model.ControlEventPayload `json:"evidence"`
+	CreatedAt time.Time                 `json:"createdAt"`
+	UpdatedAt time.Time                 `json:"updatedAt"`
+}
+
+// ControlState retains bounded request evidence and current effective values.
+type ControlState struct {
+	Paused          *bool              `json:"paused,omitempty"`
+	MemoryHighBytes *int64             `json:"memoryHighBytes,omitempty"`
+	CPUQuotaPercent *int64             `json:"cpuQuotaPercent,omitempty"`
+	Operations      []ControlOperation `json:"operations,omitempty"`
+	EvidenceGap     ControlEvidenceGap `json:"evidenceGap,omitempty"`
+	UpdatedAt       time.Time          `json:"updatedAt,omitempty"`
 }
 
 // Snapshot is durable physical evidence available even if the helper is no
@@ -80,6 +133,7 @@ type Snapshot struct {
 	Termination                 backend.TerminationResult `json:"termination"`
 	TerminationReason           string                    `json:"terminationReason,omitempty"`
 	Reason                      string                    `json:"reason,omitempty"`
+	Controls                    *ControlState             `json:"controls,omitempty"`
 	Live                        bool                      `json:"-"`
 }
 
@@ -171,6 +225,33 @@ func (h *Handle) CloseInput(ctx context.Context) error { return h.closeInput(ctx
 
 func (h *Handle) Resize(ctx context.Context, rows, cols uint16) error {
 	return h.resize(ctx, rows, cols)
+}
+
+// Pause requests a capability-gated physical freeze and returns durable
+// evidence keyed by the caller's idempotent request identity.
+func (h *Handle) Pause(ctx context.Context, requestID string) (model.ControlEventPayload, error) {
+	return h.control(ctx, "control-pause", requestID, 0)
+}
+
+// Resume requests a capability-gated physical thaw.
+func (h *Handle) Resume(ctx context.Context, requestID string) (model.ControlEventPayload, error) {
+	return h.control(ctx, "control-resume", requestID, 0)
+}
+
+// SetMemoryHigh applies a positive finite soft memory threshold in bytes.
+func (h *Handle) SetMemoryHigh(ctx context.Context, requestID string, bytes int64) (model.ControlEventPayload, error) {
+	return h.control(ctx, "control-memory-high", requestID, bytes)
+}
+
+// SetCPUQuotaPercent applies a positive finite cgroup CPU rate limit.
+func (h *Handle) SetCPUQuotaPercent(ctx context.Context, requestID string, percent int64) (model.ControlEventPayload, error) {
+	return h.control(ctx, "control-cpu-quota", requestID, percent)
+}
+
+// LookupControl returns retained physical control evidence for a request ID.
+// The gap reports whether older Guardian cache entries have expired.
+func (h *Handle) LookupControl(ctx context.Context, requestID string) (ControlOperation, bool, ControlEvidenceGap, error) {
+	return h.lookupControl(ctx, requestID)
 }
 
 func (h *Handle) ReadOutput(stream string, offset, limit int64) (Chunk, error) {

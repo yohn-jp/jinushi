@@ -1,12 +1,16 @@
 package guardian
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,7 +45,7 @@ func serveFromArgs(args []string, factory BackendFactory) error {
 
 func validateLaunchConfig(config launchConfig) error {
 	d, err := readDescriptor(config.Dir, config.RunID)
-	if err != nil || !equalToken(d.Token, config.Token) {
+	if err != nil || !equalToken(d.Token, config.Token) || d.HostEnvelope != config.HostEnvelope {
 		return errors.New("guardian: launch config does not match private descriptor")
 	}
 	if config.MaxOutputBytes < 0 || config.MaxOutputBytes > 1<<40 {
@@ -52,6 +56,9 @@ func validateLaunchConfig(config launchConfig) error {
 	}
 	if config.SampleIntervalMs < 50 || config.SampleIntervalMs > 60000 {
 		return errors.New("guardian: invalid sample interval")
+	}
+	if err := validateHostEnvelope(config.HostEnvelope); err != nil {
+		return err
 	}
 	if config.Spec.Lifetime.Mode == "lease-bound" {
 		if config.InitialLeaseExpiry == nil || config.InitialLeaseExpiry.IsZero() || config.LeaseGeneration == 0 {
@@ -247,12 +254,492 @@ func (s *runState) dispatch(request rpcRequest) rpcResponse {
 			return rpcResponse{Error: "lease-renewal-failed"}
 		}
 		return rpcResponse{Snapshot: &snapshot}
+	case "control-pause", "control-resume", "control-memory-high", "control-cpu-quota":
+		evidence := s.control(request)
+		return rpcResponse{Control: &evidence}
+	case "control-evidence":
+		if !validControlRequestID(request.RequestID) {
+			return rpcResponse{Error: "invalid-control-request-id"}
+		}
+		record, found, gap := s.lookupControl(request.RequestID)
+		return rpcResponse{ControlRecord: &record, ControlFound: found, ControlGap: &gap}
 	default:
 		return rpcResponse{Error: "unsupported operation"}
 	}
 }
 
+type guardianPhysicalControl interface {
+	Pause() error
+	Resume() error
+	SetMemoryHigh(int64) error
+	SetCPUQuotaPercent(int64) error
+}
+
+type guardianControlCapability interface {
+	SupportsCgroupFreeze() bool
+	SupportsMemoryHighControl() bool
+	SupportsCPUQuotaControl() bool
+}
+
+type guardianPauseObserver interface {
+	CurrentPauseState() (paused bool, known bool, err error)
+}
+
+type guardianMemoryHighObserver interface {
+	CurrentMemoryHigh() (value int64, unlimited bool, err error)
+}
+
+type guardianCPUQuotaObserver interface {
+	CurrentCPUQuotaPercent() (value int64, unlimited bool, err error)
+}
+
+func (s *runState) control(request rpcRequest) model.ControlEventPayload {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+
+	requestID := request.RequestID
+	action, control, target, valid := decodeControlRequest(request)
+	evidence := model.ControlEventPayload{OperationID: requestID, Control: control, Action: action}
+	if valid {
+		evidence.Value = int64Pointer(target)
+		if request.Op == "control-memory-high" || request.Op == "control-cpu-quota" {
+			evidence.Unlimited = boolPointer(false)
+		}
+	}
+	if !validControlRequestID(requestID) {
+		evidence.Outcome = "failed"
+		evidence.Reason = "request-id-invalid"
+		return evidence
+	}
+	digest := controlRequestDigest(request.Op, target)
+
+	s.mu.Lock()
+	controls := s.ensureControlStateLocked()
+	if pruneControlEvidence(controls, time.Now().UTC()) {
+		controls.UpdatedAt = time.Now().UTC()
+		if err := s.persistLocked(); err != nil {
+			s.mu.Unlock()
+			evidence.Outcome = "uncertain"
+			evidence.Reason = "control-evidence-prune-persist-failed"
+			return evidence
+		}
+	}
+	if previous, ok := findControlOperation(controls, requestID); ok {
+		if previous.Digest != digest {
+			s.mu.Unlock()
+			evidence.Outcome = "failed"
+			evidence.Reason = "request-id-conflict"
+			return evidence
+		}
+		evidence = previous.Evidence
+		if previous.Status == "pending" {
+			evidence.Outcome = "uncertain"
+			evidence.Reason = "control-effect-pending"
+			s.snapshot.State = model.Uncertain
+			s.snapshot.Reason = evidence.Reason
+			controls.Operations[controlOperationIndex(controls, requestID)].Evidence = evidence
+			controls.Operations[controlOperationIndex(controls, requestID)].Status = "completed"
+			controls.Operations[controlOperationIndex(controls, requestID)].UpdatedAt = time.Now().UTC()
+			controls.UpdatedAt = time.Now().UTC()
+			_ = s.persistLocked()
+		}
+		s.mu.Unlock()
+		return evidence
+	}
+	if len(controls.Operations) >= maxControlEvidenceOperations {
+		s.mu.Unlock()
+		evidence.Outcome = "failed"
+		evidence.Reason = "control-evidence-capacity"
+		return evidence
+	}
+	process, state := s.process, s.snapshot.State
+	var capabilities model.Capabilities
+	if s.snapshot.EffectiveCapabilities != nil {
+		capabilities = *s.snapshot.EffectiveCapabilities
+	}
+	s.mu.Unlock()
+
+	if !valid {
+		evidence.Outcome = "failed"
+		evidence.Reason = "control-value-invalid"
+		return s.persistControlOperation(requestID, digest, evidence)
+	}
+	if process == nil || state != model.Running {
+		evidence.Outcome = "failed"
+		evidence.Reason = "run-not-live"
+		return s.persistControlOperation(requestID, digest, evidence)
+	}
+	controller, hasController := process.(guardianPhysicalControl)
+	if !hasController || !controlAvailable(capabilities, request.Op) {
+		evidence.Outcome = "failed"
+		evidence.Reason = "unsupported"
+		return s.persistControlOperation(requestID, digest, evidence)
+	}
+	if err := capturePreviousControl(process, request.Op, &evidence); err != nil {
+		evidence.Outcome = "failed"
+		evidence.Reason = "previous-control-observation-unavailable"
+		return s.persistControlOperation(requestID, digest, evidence)
+	}
+	if err := s.persistPendingControlOperation(requestID, digest, evidence); err != nil {
+		evidence.Outcome = "uncertain"
+		evidence.Reason = "control-intent-persist-failed"
+		return evidence
+	}
+
+	var applyErr error
+	switch request.Op {
+	case "control-pause":
+		applyErr = controller.Pause()
+	case "control-resume":
+		applyErr = controller.Resume()
+	case "control-memory-high":
+		applyErr = controller.SetMemoryHigh(target)
+	case "control-cpu-quota":
+		applyErr = controller.SetCPUQuotaPercent(target)
+	}
+	if applyErr != nil {
+		evidence.Outcome = "uncertain"
+		evidence.Reason = "control-effect-unverified"
+		return s.completeControlOperation(requestID, evidence, applyErr)
+	}
+	if err := verifyCurrentControl(process, request.Op, target); err != nil {
+		evidence.Outcome = "uncertain"
+		evidence.Reason = "control-effect-unverified"
+		return s.completeControlOperation(requestID, evidence, err)
+	}
+	evidence.Outcome = "applied"
+	return s.completeControlOperation(requestID, evidence, nil)
+}
+
+func decodeControlRequest(request rpcRequest) (action, control string, target int64, valid bool) {
+	switch request.Op {
+	case "control-pause":
+		return "pause", "cgroup.freeze", 1, request.ControlValue == 0
+	case "control-resume":
+		return "resume", "cgroup.freeze", 0, request.ControlValue == 0
+	case "control-memory-high":
+		return "set", "memory.high", request.ControlValue, request.ControlValue > 0
+	case "control-cpu-quota":
+		return "set", "cpu.max", request.ControlValue, request.ControlValue > 0
+	default:
+		return "", "", 0, false
+	}
+}
+
+func controlRequestDigest(operation string, target int64) string {
+	digest := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", operation, target)))
+	return hex.EncodeToString(digest[:])
+}
+
+func validControlRequestID(requestID string) bool {
+	return len(requestID) > 0 && len(requestID) <= 128 && !strings.ContainsAny(requestID, "\x00\r\n")
+}
+
+func controlAvailable(capabilities model.Capabilities, operation string) bool {
+	switch operation {
+	case "control-pause", "control-resume":
+		return capabilities.CgroupFreeze
+	case "control-memory-high":
+		return capabilities.MemoryHighControl
+	case "control-cpu-quota":
+		return capabilities.CPUQuotaControl
+	default:
+		return false
+	}
+}
+
+func capturePreviousControl(process backend.Process, operation string, evidence *model.ControlEventPayload) error {
+	switch operation {
+	case "control-pause", "control-resume":
+		observer, ok := process.(guardianPauseObserver)
+		if !ok {
+			return errors.New("pause-state observer is unavailable")
+		}
+		paused, known, err := observer.CurrentPauseState()
+		if err != nil || !known {
+			return errors.Join(err, errors.New("pause state is unavailable"))
+		}
+		value := int64(0)
+		if paused {
+			value = 1
+		}
+		evidence.PreviousValue = &value
+	case "control-memory-high":
+		observer, ok := process.(guardianMemoryHighObserver)
+		if !ok {
+			return errors.New("memory.high observer is unavailable")
+		}
+		value, unlimited, err := observer.CurrentMemoryHigh()
+		if err != nil {
+			return err
+		}
+		if unlimited {
+			value = 0
+		}
+		evidence.PreviousValue = &value
+		evidence.PreviousUnlimited = boolPointer(unlimited)
+	case "control-cpu-quota":
+		observer, ok := process.(guardianCPUQuotaObserver)
+		if !ok {
+			return errors.New("cpu quota observer is unavailable")
+		}
+		value, unlimited, err := observer.CurrentCPUQuotaPercent()
+		if err != nil {
+			return err
+		}
+		if unlimited {
+			value = 0
+		}
+		evidence.PreviousValue = &value
+		evidence.PreviousUnlimited = boolPointer(unlimited)
+	default:
+		return errors.New("unknown control operation")
+	}
+	return nil
+}
+
+func verifyCurrentControl(process backend.Process, operation string, target int64) error {
+	switch operation {
+	case "control-pause", "control-resume":
+		observer, ok := process.(guardianPauseObserver)
+		if !ok {
+			return errors.New("pause-state observer is unavailable")
+		}
+		paused, known, err := observer.CurrentPauseState()
+		want := operation == "control-pause"
+		if err != nil || !known || paused != want {
+			return errors.Join(err, errors.New("requested frozen state was not observed"))
+		}
+	case "control-memory-high":
+		observer, ok := process.(guardianMemoryHighObserver)
+		if !ok {
+			return errors.New("memory.high observer is unavailable")
+		}
+		value, unlimited, err := observer.CurrentMemoryHigh()
+		if err != nil || unlimited || value != target {
+			return errors.Join(err, errors.New("requested memory.high value was not observed"))
+		}
+	case "control-cpu-quota":
+		observer, ok := process.(guardianCPUQuotaObserver)
+		if !ok {
+			return errors.New("cpu quota observer is unavailable")
+		}
+		value, unlimited, err := observer.CurrentCPUQuotaPercent()
+		if err != nil || unlimited || value != target {
+			return errors.Join(err, errors.New("requested cpu quota was not observed"))
+		}
+	default:
+		return errors.New("unknown control operation")
+	}
+	return nil
+}
+
+func (s *runState) persistControlOperation(requestID, digest string, evidence model.ControlEventPayload) model.ControlEventPayload {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.ensureControlStateLocked()
+	if len(state.Operations) >= maxControlEvidenceOperations {
+		evidence.Outcome = "failed"
+		evidence.Reason = "control-evidence-capacity"
+		return evidence
+	}
+	now := time.Now().UTC()
+	state.Operations = append(state.Operations, ControlOperation{
+		RequestID: requestID, Digest: digest, Status: "completed", Evidence: evidence,
+		CreatedAt: now, UpdatedAt: now,
+	})
+	refreshControlRetainedFrom(state)
+	state.UpdatedAt = now
+	if err := s.persistLocked(); err != nil {
+		state.Operations = state.Operations[:len(state.Operations)-1]
+		evidence.Outcome = "uncertain"
+		evidence.Reason = "control-evidence-persist-failed"
+		return evidence
+	}
+	return evidence
+}
+
+func (s *runState) persistPendingControlOperation(requestID, digest string, evidence model.ControlEventPayload) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.ensureControlStateLocked()
+	if len(state.Operations) >= maxControlEvidenceOperations {
+		return errors.New("guardian: control evidence capacity is full")
+	}
+	now := time.Now().UTC()
+	pending := evidence
+	pending.Outcome = "uncertain"
+	pending.Reason = "control-effect-pending"
+	state.Operations = append(state.Operations, ControlOperation{
+		RequestID: requestID, Digest: digest, Status: "pending", Evidence: pending,
+		CreatedAt: now, UpdatedAt: now,
+	})
+	refreshControlRetainedFrom(state)
+	state.UpdatedAt = now
+	if err := s.persistLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *runState) completeControlOperation(requestID string, evidence model.ControlEventPayload, effectErr error) model.ControlEventPayload {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.snapshot.Controls
+	index := controlOperationIndex(state, requestID)
+	if index < 0 {
+		evidence.Outcome = "uncertain"
+		evidence.Reason = "control-intent-missing"
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = evidence.Reason
+		_ = s.persistLocked()
+		return evidence
+	}
+	now := time.Now().UTC()
+	state.Operations[index].Status = "completed"
+	state.Operations[index].Evidence = evidence
+	state.Operations[index].UpdatedAt = now
+	state.UpdatedAt = now
+	if evidence.Outcome == "applied" {
+		switch evidence.Control {
+		case "cgroup.freeze":
+			paused := evidence.Action == "pause"
+			state.Paused = &paused
+		case "memory.high":
+			value := dereferenceControlValue(evidence.Value)
+			state.MemoryHighBytes = &value
+		case "cpu.max":
+			value := dereferenceControlValue(evidence.Value)
+			state.CPUQuotaPercent = &value
+		}
+	}
+	if evidence.Outcome == "uncertain" {
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = "physical-control-outcome-unproven"
+	}
+	if err := s.persistLocked(); err != nil {
+		evidence.Outcome = "uncertain"
+		evidence.Reason = "control-evidence-persist-failed"
+		state.Operations[index].Evidence = evidence
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = evidence.Reason
+		_ = s.persistLocked()
+		return evidence
+	}
+	if effectErr != nil && evidence.Outcome == "applied" {
+		// Defensive: a caller must not claim success if it reported an effect
+		// error while assembling the evidence.
+		evidence.Outcome = "uncertain"
+		evidence.Reason = "control-effect-unverified"
+		state.Operations[index].Evidence = evidence
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = evidence.Reason
+		_ = s.persistLocked()
+	}
+	return evidence
+}
+
+func (s *runState) ensureControlStateLocked() *ControlState {
+	if s.snapshot.Controls == nil {
+		s.snapshot.Controls = &ControlState{}
+	}
+	return s.snapshot.Controls
+}
+
+func findControlOperation(state *ControlState, requestID string) (ControlOperation, bool) {
+	index := controlOperationIndex(state, requestID)
+	if index < 0 {
+		return ControlOperation{}, false
+	}
+	return state.Operations[index], true
+}
+
+func controlOperationIndex(state *ControlState, requestID string) int {
+	if state == nil {
+		return -1
+	}
+	for index := len(state.Operations) - 1; index >= 0; index-- {
+		if state.Operations[index].RequestID == requestID {
+			return index
+		}
+	}
+	return -1
+}
+
+func pruneControlEvidence(state *ControlState, now time.Time) bool {
+	cutoff := now.Add(-24 * time.Hour)
+	removed := 0
+	for removed < len(state.Operations) && state.Operations[removed].CreatedAt.Before(cutoff) {
+		operation := state.Operations[removed]
+		if state.EvidenceGap.ExpiredCount == 0 {
+			from := operation.CreatedAt
+			state.EvidenceGap.ExpiredFrom = &from
+		}
+		through := operation.CreatedAt
+		state.EvidenceGap.ExpiredThrough = &through
+		state.EvidenceGap.ExpiredCount++
+		removed++
+	}
+	if removed > 0 {
+		state.Operations = append([]ControlOperation(nil), state.Operations[removed:]...)
+	}
+	return refreshControlRetainedFrom(state) || removed > 0
+}
+
+func refreshControlRetainedFrom(state *ControlState) bool {
+	var next *time.Time
+	if len(state.Operations) > 0 {
+		retainedFrom := state.Operations[0].CreatedAt
+		next = &retainedFrom
+	}
+	if (next == nil && state.EvidenceGap.RetainedFrom == nil) ||
+		(next != nil && state.EvidenceGap.RetainedFrom != nil && next.Equal(*state.EvidenceGap.RetainedFrom)) {
+		return false
+	}
+	state.EvidenceGap.RetainedFrom = next
+	return true
+}
+
+func (s *runState) lookupControl(requestID string) (ControlOperation, bool, ControlEvidenceGap) {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var gap ControlEvidenceGap
+	if state := s.snapshot.Controls; state != nil {
+		priorOperations := state.Operations
+		priorGap := state.EvidenceGap
+		priorUpdatedAt := state.UpdatedAt
+		if pruneControlEvidence(state, time.Now().UTC()) {
+			state.UpdatedAt = time.Now().UTC()
+			if err := s.persistLocked(); err != nil {
+				state.Operations = priorOperations
+				state.EvidenceGap = priorGap
+				state.UpdatedAt = priorUpdatedAt
+			}
+		}
+		gap = state.EvidenceGap
+		if operation, ok := findControlOperation(state, requestID); ok {
+			return operation, true, gap
+		}
+	}
+	return ControlOperation{}, false, gap
+}
+
+func dereferenceControlValue(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func int64Pointer(value int64) *int64 { return &value }
+
+func boolPointer(value bool) *bool { return &value }
+
 func (s *runState) observe() (Snapshot, error) {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.snapshot.State != model.Terminal && s.process != nil {
@@ -264,6 +751,12 @@ func (s *runState) observe() (Snapshot, error) {
 		} else {
 			s.snapshot.Resources = unavailableCurrent(s.snapshot.Resources)
 		}
+		if s.snapshot.State == model.Running && s.snapshot.Controls != nil {
+			if err := verifyPersistedControlState(s.process, s.snapshot.Controls); err != nil {
+				s.snapshot.State = model.Uncertain
+				s.snapshot.Reason = "physical-control-state-unavailable-or-changed"
+			}
+		}
 		s.snapshot.Resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
 		s.captureOutputEvidenceLocked()
 		if err := s.persistLocked(); err != nil {
@@ -271,6 +764,43 @@ func (s *runState) observe() (Snapshot, error) {
 		}
 	}
 	return s.snapshot, nil
+}
+
+func verifyPersistedControlState(process backend.Process, state *ControlState) error {
+	if state == nil {
+		return nil
+	}
+	if state.Paused != nil {
+		observer, ok := process.(guardianPauseObserver)
+		if !ok {
+			return errors.New("pause-state observer is unavailable")
+		}
+		paused, known, err := observer.CurrentPauseState()
+		if err != nil || !known || paused != *state.Paused {
+			return errors.Join(err, errors.New("persisted cgroup freeze state does not match the kernel"))
+		}
+	}
+	if state.MemoryHighBytes != nil {
+		observer, ok := process.(guardianMemoryHighObserver)
+		if !ok {
+			return errors.New("memory.high observer is unavailable")
+		}
+		value, unlimited, err := observer.CurrentMemoryHigh()
+		if err != nil || unlimited || value != *state.MemoryHighBytes {
+			return errors.Join(err, errors.New("persisted memory.high state does not match the kernel"))
+		}
+	}
+	if state.CPUQuotaPercent != nil {
+		observer, ok := process.(guardianCPUQuotaObserver)
+		if !ok {
+			return errors.New("cpu quota observer is unavailable")
+		}
+		value, unlimited, err := observer.CurrentCPUQuotaPercent()
+		if err != nil || unlimited || value != *state.CPUQuotaPercent {
+			return errors.Join(err, errors.New("persisted cpu quota does not match the kernel"))
+		}
+	}
+	return nil
 }
 
 func (s *runState) signal(name string) error {
@@ -748,6 +1278,16 @@ func effectiveCapabilities(selected backend.Backend, process backend.Process, in
 	} else {
 		capabilities.Backend = process.Ownership().Backend
 		capabilities.PTY = interactive && capabilities.PTY
+	}
+	// Physical controls are advertised for a Run only when its concrete
+	// backend handle exposes the corresponding cgroup control surface.
+	capabilities.CgroupFreeze = false
+	capabilities.MemoryHighControl = false
+	capabilities.CPUQuotaControl = false
+	if controls, ok := process.(guardianControlCapability); ok {
+		capabilities.CgroupFreeze = controls.SupportsCgroupFreeze()
+		capabilities.MemoryHighControl = controls.SupportsMemoryHighControl()
+		capabilities.CPUQuotaControl = controls.SupportsCPUQuotaControl()
 	}
 	capabilities.Signals = append([]string(nil), capabilities.Signals...)
 	return capabilities
