@@ -59,6 +59,56 @@ type Metric struct {
 	Value  int64  `json:"value,omitempty"`
 }
 
+// HostEnvelopeConfig contains the aggregate physical workload ceilings
+// configured by the supervisor. Zero disables an individual ceiling.
+type HostEnvelopeConfig struct {
+	MemoryBytes   int64 `json:"memoryBytes,omitempty"`
+	TaskCount     int64 `json:"taskCount,omitempty"`
+	MaxActiveRuns int64 `json:"maxActiveRuns,omitempty"`
+}
+
+// HostEnvelopeCapabilities reports the physical controls and observations
+// available for the aggregate workload boundary.
+type HostEnvelopeCapabilities struct {
+	WorkloadRoot         bool `json:"workloadRoot"`
+	MemoryEnforcement    bool `json:"memoryEnforcement"`
+	TaskCountEnforcement bool `json:"taskCountEnforcement"`
+	ActiveRunEnforcement bool `json:"activeRunEnforcement"`
+	MemoryTelemetry      bool `json:"memoryTelemetry"`
+	TaskTelemetry        bool `json:"taskTelemetry"`
+	PressureTelemetry    bool `json:"pressureTelemetry"`
+}
+
+// HostPressure stores PSI averages as milli-percent and cumulative pressure
+// time in microseconds. Metric status distinguishes unavailable and
+// unsupported observations from a measured zero.
+type HostPressure struct {
+	Status                 string `json:"status"`
+	SomeAvg10MilliPercent  Metric `json:"someAvg10MilliPercent"`
+	SomeAvg60MilliPercent  Metric `json:"someAvg60MilliPercent"`
+	SomeAvg300MilliPercent Metric `json:"someAvg300MilliPercent"`
+	SomeTotalUsec          Metric `json:"someTotalUsec"`
+	FullAvg10MilliPercent  Metric `json:"fullAvg10MilliPercent"`
+	FullAvg60MilliPercent  Metric `json:"fullAvg60MilliPercent"`
+	FullAvg300MilliPercent Metric `json:"fullAvg300MilliPercent"`
+	FullTotalUsec          Metric `json:"fullTotalUsec"`
+}
+
+// HostEnvelopeStatus is a bounded point-in-time observation of aggregate
+// workload usage and pressure. It carries no scheduling recommendations.
+type HostEnvelopeStatus struct {
+	Status         string                   `json:"status"`
+	Config         HostEnvelopeConfig       `json:"config"`
+	Capabilities   HostEnvelopeCapabilities `json:"capabilities"`
+	ActiveRuns     Metric                   `json:"activeRuns"`
+	MemoryBytes    Metric                   `json:"memoryBytes"`
+	TaskCount      Metric                   `json:"taskCount"`
+	MemoryPressure HostPressure             `json:"memoryPressure"`
+	CPUPressure    HostPressure             `json:"cpuPressure"`
+	IOPressure     HostPressure             `json:"ioPressure"`
+	Reason         string                   `json:"reason,omitempty"`
+}
+
 // Resources reports process counts independently from Linux kernel task
 // counts. ProcessCount is distinct owned processes; TaskCount includes
 // threads and matches cgroup v2 pids-controller accounting.

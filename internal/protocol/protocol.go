@@ -1,6 +1,10 @@
 package protocol
 
-import "github.com/yohn-jp/jinushi/internal/model"
+import (
+	"time"
+
+	"github.com/yohn-jp/jinushi/internal/model"
+)
 
 const MaxFrame = 1 << 20
 
@@ -28,6 +32,7 @@ type Request struct {
 	TelemetryQuery     *model.TelemetryQuery `json:"telemetryQuery,omitempty"`
 	MemoryHighBytes    int64                 `json:"memoryHighBytes,omitempty"`
 	CPUQuotaPercent    int64                 `json:"cpuQuotaPercent,omitempty"`
+	WriterToken        string                `json:"writerToken,omitempty"`
 }
 
 type Failure struct {
@@ -36,16 +41,19 @@ type Failure struct {
 }
 
 type Response struct {
-	Version      int                      `json:"version"`
-	Run          *model.Run               `json:"run,omitempty"`
-	Runs         []model.Run              `json:"runs,omitempty"`
-	NextCursor   string                   `json:"nextCursor"`
-	Events       []model.Event            `json:"events,omitempty"`
-	RetainedFrom uint64                   `json:"retainedFrom,omitempty"`
-	Gap          bool                     `json:"gap,omitempty"`
-	Data         string                   `json:"data,omitempty"`
-	Capabilities *model.Capabilities      `json:"capabilities,omitempty"`
-	AttachID     string                   `json:"attachId,omitempty"`
-	Telemetry    *model.TelemetryResponse `json:"telemetry,omitempty"`
-	Error        *Failure                 `json:"error,omitempty"`
+	Version              int                       `json:"version"`
+	Run                  *model.Run                `json:"run,omitempty"`
+	Runs                 []model.Run               `json:"runs,omitempty"`
+	NextCursor           string                    `json:"nextCursor"`
+	Events               []model.Event             `json:"events,omitempty"`
+	RetainedFrom         uint64                    `json:"retainedFrom,omitempty"`
+	Gap                  bool                      `json:"gap,omitempty"`
+	Data                 string                    `json:"data,omitempty"`
+	Capabilities         *model.Capabilities       `json:"capabilities,omitempty"`
+	HostEnvelope         *model.HostEnvelopeStatus `json:"hostEnvelope,omitempty"`
+	AttachID             string                    `json:"attachId,omitempty"`
+	Telemetry            *model.TelemetryResponse  `json:"telemetry,omitempty"`
+	WriterToken          string                    `json:"writerToken,omitempty"`
+	WriterLeaseExpiresAt *time.Time                `json:"writerLeaseExpiresAt,omitempty"`
+	Error                *Failure                  `json:"error,omitempty"`
 }
