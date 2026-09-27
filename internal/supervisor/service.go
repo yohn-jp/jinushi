@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -1361,6 +1362,11 @@ func (s *Service) reconcile() error {
 			run = refreshed
 			a.run = refreshed
 			var resourceEvents []model.Event
+			if e == nil {
+				if run.EffectiveCapabilities != nil && result.effective != nil && !reflect.DeepEqual(run.EffectiveCapabilities, result.effective) {
+					e = errors.New("guardian effective capabilities conflict with durable Run evidence")
+				}
+			}
 			if e == nil {
 				e = importLeaseState(&run, result.lease)
 				if e == nil {
