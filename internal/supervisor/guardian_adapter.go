@@ -29,7 +29,11 @@ func newGuardedExecutor(root string) (*guardedExecutor, error) {
 	return &guardedExecutor{root: root, executable: exe, native: PlatformBackendFactory()()}, nil
 }
 
-func (g *guardedExecutor) Capabilities() model.Capabilities { return g.native.Capabilities() }
+func (g *guardedExecutor) Capabilities() model.Capabilities {
+	c := g.native.Capabilities()
+	c.RestartReconciliation = "guardian+" + c.RestartReconciliation
+	return c
+}
 
 func (g *guardedExecutor) runDir(id string) string { return filepath.Join(g.root, "runs", id) }
 
@@ -232,4 +236,8 @@ func (p *guardianPhysical) Resize(rows, cols uint16) error {
 	return p.h.Resize(ctx, rows, cols)
 }
 
-func (p *guardianPhysical) CloseInput() error { return errors.New("guardian close-input unsupported") }
+func (p *guardianPhysical) CloseInput() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return p.h.CloseInput(ctx)
+}

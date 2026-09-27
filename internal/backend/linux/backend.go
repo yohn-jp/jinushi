@@ -1,3 +1,5 @@
+//go:build linux
+
 // Package linux implements Jinushi's Linux process backend using dedicated
 // sessions, cgroup v2 when delegated, and real PTYs for interactive Runs.
 package linux
