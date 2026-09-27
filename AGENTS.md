@@ -47,8 +47,9 @@ Do not introduce agent names or product-specific orchestration rules into Core.
 ## Implementation constraints
 
 - Go is the implementation language.
-- Linux and Windows are first-class V1 targets.
-- Prefer OS-native ownership primitives: cgroup v2/process groups on Linux, Job Objects on Windows, real PTY/ConPTY for interactive Runs.
+- Linux is the primary supported development and verification target.
+- The existing Windows backend is experimental and frozen during Wave 2. Do not add Windows parity work or expand its public guarantees unless a later architecture decision explicitly reactivates it.
+- Prefer OS-native Linux ownership primitives: cgroup v2 when delegated, with process-session/subreaper fallback and a real PTY for interactive Runs.
 - Never construct a shell command from argv. Shell use must be an explicit executable supplied by the caller.
 - Do not control arbitrary caller-supplied PIDs. Control uses Jinushi Run identity plus revalidated backend ownership.
 - Never log raw environment values or secrets.
@@ -84,4 +85,20 @@ Implement the smallest coherent vertical slice required by the current task.
 
 Do not add distributed control, cloud APIs, containers, repository management, GitHub integration, semantic agent adapters, automatic retries, or workflow scheduling unless a later accepted architecture explicitly introduces them.
 
-Initial development may proceed without CI. Do not weaken or replace required real OS-bound verification with mocks once such verification exists.
+Initial development may proceed without CI. Do not weaken or replace existing OS-bound verification with mocks. Wave 2 may be developed and reviewed from code/tests without a manual real-machine certification pass; environment-dependent proofs must remain explicit rather than being invented.
+
+
+## Wave 2 authority
+
+For the current hardening/evidence programme, `docs/WAVE2.md` is the implementation programme beneath the architecture/contract documents.
+
+Wave 2 may strengthen physical execution evidence and control, but it must not introduce agent semantics or scheduling. In particular:
+
+- caller retries must not create duplicate physical Runs;
+- process/task-count terminology must match Linux kernel semantics;
+- terminal receipts must describe the effective backend/capabilities actually used by that Run;
+- lifecycle/control events must use one typed, versioned vocabulary;
+- high-rate telemetry must not be treated as an unbounded lifecycle journal;
+- host-wide safety envelopes may reject or constrain physical execution, but may not choose semantic work;
+- retention/GC may discard bounded historical evidence only with explicit, machine-readable policy/evidence;
+- Windows implementation work is out of scope unless required to keep the existing code compiling after shared-contract changes.

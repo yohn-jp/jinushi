@@ -7,7 +7,7 @@ Jinushi is implemented in Go.
 Reasons:
 
 - process ownership is the primary domain;
-- Linux and Windows OS primitives are central;
+- Linux OS primitives are central to the supported target; the existing Windows implementation is retained but not a Wave 2 parity target;
 - a single native binary simplifies distribution;
 - Go provides direct access to platform process/resource APIs;
 - the runtime should not depend on Node.js, npm, Python, or an agent runtime;
@@ -178,7 +178,7 @@ If process/cgroup identity cannot be proven current after restart, classify the 
 
 ## 6. Windows implementation direction
 
-Windows is a first-class V1 backend.
+The existing Windows backend is an experimental implementation retained for compatibility and future evaluation. It is frozen during Wave 2: shared contract changes may keep it compiling, but new Windows parity, certification, or capability work is not required.
 
 ### Process ownership
 
@@ -218,11 +218,9 @@ The data model must preserve:
 - terminal receipt;
 - reconciliation status.
 
-An embedded transactional store is preferred over a collection of independently updated JSON files because lifecycle and event metadata must survive crashes coherently.
+The current implementation uses bbolt as the embedded transactional store for Run state, lifecycle/control events, and imported output metadata. A durable per-Run guardian owns the OS backend, maintains a bounded output ring and physical snapshots, and lets the supervisor reconcile after restart.
 
-Initial implementation should evaluate an embedded SQLite store using a pure-Go driver. Output spools can remain separate bounded files referenced by durable metadata.
-
-The architectural requirement is transactional durable state, not SQLite itself.
+The architecture requires crash-consistent transactional state; bbolt is the current implementation authority. Changing the store is not a Wave 2 objective unless a concrete contract defect requires it.
 
 ## 8. State write ordering
 
@@ -307,7 +305,7 @@ termination grace ceiling
 
 This is a safety ceiling, not a workload scheduler.
 
-Linux and Windows map the accepted Run limits to their native primitives. If the backend cannot enforce a required hard limit, Run creation fails with an unsupported-capability error.
+Linux maps accepted Run limits to cgroup v2 when the relevant controller is delegated. A required hard limit that cannot be enforced is rejected explicitly. The experimental Windows backend may preserve its existing behavior but is not a Wave 2 parity target.
 
 ## 13. Termination implementation
 
@@ -533,7 +531,7 @@ Required test layers:
 - output flood/backpressure tests;
 - timeout/termination races;
 - Linux cgroup/PTY capability tests where available;
-- Windows Job Object/ConPTY tests on Windows;
+- existing Windows tests must continue to compile where shared contracts change; Windows real-machine certification is outside Wave 2;
 - supervisor crash/restart reconciliation;
 - process identity/PID reuse defensive cases;
 - limit enforcement;
@@ -561,3 +559,55 @@ Do not add:
 - persistent arbitrary environment snapshots.
 
 These belong to higher layers or require a separate architecture decision.
+
+
+## 24. Current implementation baseline
+
+The initial architecture has been implemented beyond the original package sketch. The current runtime topology is:
+
+```text
+CLI / local client
+      |
+      v
+Supervisor
+  |-- bbolt Run/event/output metadata
+  |-- local IPC
+  |-- reconciliation
+  |
+  +-- per-Run Guardian
+        |-- durable descriptor/status
+        |-- bounded output ring
+        |-- deadline/lease enforcement
+        |
+        +-- Linux backend
+              |-- cgroup v2 when delegated
+              |-- session/subreaper fallback
+              |-- pidfd-validated signalling
+              +-- PTY
+```
+
+Wave 2 must evolve this implementation rather than recreate the original package proposal.
+
+Known contract/implementation items to close include:
+
+- idempotent Run submission across ambiguous client retries;
+- separation of Linux process count from cgroup task/PID count semantics;
+- recording the effective per-Run backend/capability mode rather than only host capability at receipt time;
+- output retention semantics that do not silently reduce an interactive PTY Run to one third of its requested aggregate budget;
+- one authoritative monotonic wall-time/deadline source in the Guardian;
+- one typed/versioned event vocabulary shared by producer, retention policy, and consumers;
+- preserving the full physical receipt when a fast workload reaches terminal state before supervisor ownership import completes;
+- bounded supervisor shutdown/start goroutine coordination and stronger Linux state-path replacement/symlink defenses.
+
+## 25. Wave 2 implementation programme
+
+Wave 2 is defined in [WAVE2.md](WAVE2.md). It is a Linux-first hardening and evidence programme with six tracks:
+
+1. canonical alignment and correctness closure;
+2. durable/idempotent control;
+3. process and resource evidence;
+4. host safety envelope;
+5. event-driven observation and interactive control;
+6. lifecycle operations and bounded retention.
+
+The tracks may be implemented in parallel after shared protocol/model contracts are stabilized. Linux behavior is authoritative. Windows work is limited to keeping shared-code compilation coherent.

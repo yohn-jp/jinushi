@@ -115,12 +115,12 @@ A PID is never the public Run identity.
                  +-------------+-------------+
                  |                           |
                  v                           v
-        +----------------+          +----------------+
-        | Linux backend  |          | Windows backend|
-        | process groups |          | Job Objects    |
-        | cgroup v2      |          | ConPTY         |
-        | PTY            |          | process metrics|
-        +----------------+          +----------------+
+        +----------------+          +----------------------+
+        | Linux backend  |          | Windows backend      |
+        | supported      |          | experimental/frozen  |
+        | cgroup v2      |          | existing Job/ConPTY  |
+        | subreaper/PTY  |          | implementation       |
+        +----------------+          +----------------------+
 ```
 
 The exact internal package structure may evolve, but these responsibility boundaries must remain distinct.
@@ -243,11 +243,7 @@ Preferred mechanisms:
 
 ### Windows
 
-Preferred mechanisms:
-
-- Job Objects for process membership, limits, and termination;
-- ConPTY for interactive terminal workloads;
-- Windows-native process accounting.
+An existing Windows backend uses Job Objects, ConPTY, named pipes, and Windows-native accounting. It is experimental and frozen during Wave 2. Linux is the supported development target; new Windows parity or certification work requires a later architecture decision.
 
 Implementation must not claim equal enforcement on a platform when the underlying OS capability is unavailable.
 
@@ -475,3 +471,144 @@ A separate harness may:
 Those higher-level interpretations remain outside Jinushi.
 
 This seam is intentional: the runtime should make semantic/physical correlation possible without embedding agent semantics into the execution substrate.
+
+
+## 19. Linux-first product posture
+
+Linux is the primary supported Jinushi platform.
+
+Wave 2 may change shared contracts when required by Linux correctness. The existing Windows backend is retained as experimental code, but it does not define the Wave 2 design and does not create a parity obligation. Shared changes should avoid gratuitously breaking it, while no new Windows capability work is required.
+
+## 20. Idempotent physical dispatch
+
+A caller must be able to retry an ambiguous Run submission without creating duplicate physical work.
+
+Run creation therefore gains a caller-supplied, opaque submission identity. For a bounded retention window:
+
+- the first accepted submission identity binds to the immutable accepted Run specification identity;
+- retrying the same submission identity with the same specification returns the existing Run;
+- retrying it with a different specification fails with an explicit conflict;
+- the submission identity is correlation/control metadata, not task semantics or authorization.
+
+This mechanism is below orchestration policy. Mottainai may decide what to dispatch; Jinushi only makes physical dispatch retry-safe.
+
+Control operations that are not naturally idempotent, especially input delivery, must expose enough request identity/currentness to prevent ambiguous retries from duplicating side effects.
+
+## 21. Effective execution capability
+
+Host capability and Run capability are distinct.
+
+A terminal receipt and live Run observation must describe the effective physical backend used by that Run, for example a delegated cgroup-v2 ownership boundary versus the subreaper/session fallback. Receipt evidence must not imply that a Run used a host capability merely because the host advertised it.
+
+Capability evidence includes the enforcement/telemetry surfaces actually active for the Run.
+
+## 22. Linux process and task semantics
+
+Linux cgroup `pids.max` limits tasks, while `cgroup.procs` enumerates processes. Jinushi must not label these as the same metric.
+
+The model therefore distinguishes at least:
+
+- process count: process identities in the owned execution;
+- task/PID count: kernel task count relevant to `pids.max` enforcement where available.
+
+A process-count presentation must not be used as proof of a task-count hard limit.
+
+## 23. Physical process evidence
+
+Run-level resource totals are not sufficient for diagnosis of agent workloads.
+
+Jinushi may expose bounded process-level physical evidence without importing agent semantics. A process identity is stronger than PID alone and includes the OS identity needed to resist PID reuse (for Linux, PID plus start identity).
+
+Process evidence may include:
+
+- parent/lineage identity within the owned execution;
+- executable/comm identity that is safe to expose;
+- start/exit observation;
+- CPU and RSS observations;
+- membership changes.
+
+Raw argv or environment values are not process evidence by default because they may contain secrets.
+
+The purpose is to explain physical resource use, not to infer a tool name, task phase, or semantic success.
+
+## 24. Evidence lanes
+
+Jinushi separates evidence by update rate and durability needs.
+
+```text
+Lifecycle / control
+  low rate, strongly durable, typed ordered events
+
+Telemetry
+  high rate, bounded time-series, aggregation/downsampling
+
+Output
+  high volume, bounded byte retention with explicit gaps
+```
+
+High-rate resource sampling must not consume the lifecycle/control journal as if every sample were a durable control event.
+
+Telemetry retention must preserve explicit sampling resolution, aggregation interval, gaps, and min/max/aggregate facts needed to diagnose spikes.
+
+## 25. Host safety envelope
+
+Per-Run limits alone cannot protect a host when many individually valid Runs execute concurrently.
+
+Jinushi may own a Linux-wide physical workload envelope beneath the supervisor/control plane. The envelope can impose runtime safety ceilings such as:
+
+- total workload memory high/max;
+- total task/PID ceiling;
+- maximum active physical Runs;
+- pressure observations;
+- host reserve.
+
+The supervisor and guardians must remain able to control/terminate workloads when the workload envelope is exhausted.
+
+This is a physical safety boundary, not scheduling. Jinushi may reject or constrain a requested physical execution because the configured safety envelope would be violated; it must not choose which semantic task should run next.
+
+## 26. Event-driven observation
+
+Long-lived clients should not require model-driven or tight polling.
+
+Jinushi exposes wakeup-driven subscriptions for lifecycle/control changes, output availability, telemetry windows, and terminal state. A local all-Run watch surface may multiplex physical Run events for an orchestrator.
+
+Subscription transport remains bounded and reconnectable. Sequence/watermark semantics make missed history explicit.
+
+## 27. Interactive writer ownership
+
+Multiple observers may attach to one interactive Run, but physical stdin mutation requires explicit writer ownership.
+
+An interactive input lease/token prevents two clients from interleaving terminal input unknowingly. Losing the observer connection does not terminate the Run. Writer ownership is physical I/O coordination only.
+
+## 28. Bounded lifetime of retained evidence
+
+Each Run is bounded internally, but a resident runtime must also bound the number and total size of historical Runs.
+
+Jinushi therefore owns retention/GC policy for terminal physical evidence, including:
+
+- terminal retention age/count;
+- global state byte ceilings;
+- output/event/telemetry eviction;
+- preservation of a minimal receipt/tombstone where configured;
+- store compaction when deletion does not reclaim physical storage automatically.
+
+GC never changes a live Run and never turns missing historical evidence into a complete history claim.
+
+## 29. Physical suspension and QoS
+
+Linux cgroup mechanisms may expose pause/resume and mutable resource controls as physical operations:
+
+- freeze/thaw;
+- memory soft/high controls;
+- CPU weight/quota changes;
+- other stable cgroup v2 controls.
+
+Jinushi does not decide when to reprioritize a workload. It only performs explicitly requested physical control and records the resulting evidence.
+
+## 30. Guardian loss
+
+Supervisor restart durability is not sufficient if a per-Run guardian itself disappears while owned descendants remain alive.
+
+Where Linux ownership can still be proven independently (for example by the owned cgroup), Jinushi must have an explicit fail-closed recovery path. It may re-establish sufficient control or terminate the proven owned tree; it must not abandon a potentially live execution merely by converting it to an inert `uncertain` record.
+
+If ownership cannot be proven safely, uncertainty remains explicit and destructive control must not target unrelated processes.
