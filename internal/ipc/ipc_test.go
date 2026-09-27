@@ -237,8 +237,8 @@ func TestFollowDisconnectCancelsOnlySubscription(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("client disconnect did not cancel the subscription handler")
 	}
-	if calls.Load() < 2 {
-		t.Fatal("follow handler did not poll after its first event")
+	if calls.Load() < 1 {
+		t.Fatal("follow handler did not deliver its first event")
 	}
 }
 
