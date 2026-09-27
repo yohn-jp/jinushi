@@ -658,7 +658,13 @@ func (s *Service) events(req protocol.Request) protocol.Response {
 func (s *Service) output(req protocol.Request) protocol.Response {
 	if req.AttachID != "" {
 		if err := s.renewAttachment(req.RunID, req.AttachID); err != nil {
-			return failure("attachment-expired", err.Error())
+			// Once a Run is final, retained output is still readable even though
+			// its live attachment has been removed. The attachment cannot be
+			// renewed, but no live input authority is granted by this read.
+			run, readErr := s.store.Get(req.RunID)
+			if readErr != nil || (run.State != model.Terminal && run.State != model.Uncertain) {
+				return failure("attachment-expired", err.Error())
+			}
 		}
 	}
 	stream := req.Stream
