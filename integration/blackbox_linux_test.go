@@ -129,16 +129,21 @@ type resources struct {
 	CPUTimeNs        metric `json:"cpuTimeNs"`
 	ProcessCount     metric `json:"processCount"`
 	PeakProcessCount metric `json:"peakProcessCount"`
+	SampleIntervalMs int64  `json:"sampleIntervalMs"`
 }
 
 type run struct {
-	ID              string     `json:"runId"`
-	State           string     `json:"state"`
-	Generation      uint64     `json:"generation"`
-	Output          runOutput  `json:"output"`
-	Receipt         *receipt   `json:"receipt"`
-	LeaseGeneration uint64     `json:"leaseGeneration"`
-	LeaseExpiry     *time.Time `json:"leaseExpiry"`
+	ID                   string     `json:"runId"`
+	State                string     `json:"state"`
+	Generation           uint64     `json:"generation"`
+	Output               runOutput  `json:"output"`
+	Resources            resources  `json:"resources"`
+	LastOutputAt         *time.Time `json:"lastOutputAt"`
+	LastResourceSampleAt *time.Time `json:"lastResourceSampleAt"`
+	ResourceGap          bool       `json:"resourceGap"`
+	Receipt              *receipt   `json:"receipt"`
+	LeaseGeneration      uint64     `json:"leaseGeneration"`
+	LeaseExpiry          *time.Time `json:"leaseExpiry"`
 }
 
 type capabilities struct {
@@ -151,9 +156,10 @@ type capabilities struct {
 }
 
 type event struct {
-	Seq  uint64         `json:"seq"`
-	Kind string         `json:"kind"`
-	Body map[string]any `json:"body"`
+	Seq        uint64         `json:"seq"`
+	Kind       string         `json:"kind"`
+	ObservedAt time.Time      `json:"observedAt"`
+	Body       map[string]any `json:"body"`
 }
 
 type followedEvent struct {
@@ -601,6 +607,41 @@ func TestOutputFloodIsBoundedAndReportsOutputGap(t *testing.T) {
 	}
 }
 
+func TestContinuousStdoutFloodDoesNotStarveStderrAndCancelsTree(t *testing.T) {
+	h := newHarness(t)
+	pidFile := filepath.Join(t.TempDir(), "stdout-flood.pid")
+	const marker = "stderr-fairness-marker"
+	const outputRetention = int64(12 << 10)
+	const perStreamRetention = outputRetention / 3
+	script := `dd if=/dev/zero bs=4096 2>/dev/null & flood_pid=$!; printf '%s\n' "$flood_pid" > "$1"; sleep 0.1; printf '%s' "$2" >&2; wait "$flood_pid"`
+	started := h.run("--output-bytes", strconv.FormatInt(outputRetention, 10), "--", "/bin/sh", "-c", script, "jinushi-output-fairness", pidFile, marker)
+	floodPID := waitForPIDFile(t, pidFile, 10*time.Second)
+	h.waitUntil("stderr marker to be observed while stdout floods and Run stays live", 20*time.Second, func() bool {
+		current := h.inspect(started.ID)
+		return current.State == "running" && current.Output.Stdout.ObservedBytes > 2*perStreamRetention && current.Output.Stderr.ObservedBytes >= int64(len(marker))
+	})
+	whileFlooding := h.inspect(started.ID)
+	if !linuxProcessExecuting(floodPID) {
+		t.Fatalf("continuous stdout producer PID %d stopped before cancellation", floodPID)
+	}
+	if whileFlooding.State != "running" || whileFlooding.Output.Stdout.RetainedBytes > perStreamRetention || !whileFlooding.Output.Stdout.Truncated {
+		t.Fatalf("stdout flood was not both live and bounded by its retention limit: state=%s output=%+v", whileFlooding.State, whileFlooding.Output.Stdout)
+	}
+	if whileFlooding.Output.Stderr.ObservedBytes != int64(len(marker)) || whileFlooding.Output.Stderr.RetainedBytes > perStreamRetention {
+		t.Fatalf("stderr marker was not fully observed within the bounded stream: %+v", whileFlooding.Output.Stderr)
+	}
+
+	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, started.ID)
+	if code != 0 || canceled.Error != nil {
+		t.Fatalf("cancel output flood Run: exit=%d response=%+v", code, canceled)
+	}
+	_, completed := h.await(started.ID, 20*time.Second)
+	if completed.Receipt.Outcome != "cancelled" || completed.Receipt.Cleanup != "complete" || !completed.Receipt.TerminationRequested {
+		t.Fatalf("output flood cancellation did not prove physical tree cleanup: %+v", completed.Receipt)
+	}
+	waitProcessGone(t, floodPID, 8*time.Second)
+}
+
 func TestEventJournalReportsCompactionGap(t *testing.T) {
 	h := newHarness(t)
 	caps := h.getCapabilities()
@@ -940,6 +981,169 @@ func TestSupervisorRestartPreservesTruncatedOutputCursor(t *testing.T) {
 	wantTail := expected[len(expected)-int(retention):]
 	if !finalOutput.Gap || finalOutput.RetainedFrom != uint64(len(expected))-uint64(retention) || !bytes.Equal(finalBytes, wantTail) {
 		t.Fatalf("final retained output is not the exact truncated tail: got=%q want=%q response=%+v", finalBytes, wantTail, finalOutput)
+	}
+}
+
+func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) {
+	h := newHarness(t)
+	writeGate := filepath.Join(t.TempDir(), "write-while-supervisor-down")
+	writtenMarker := filepath.Join(t.TempDir(), "prefix-written")
+	finishGate := filepath.Join(t.TempDir(), "finish-run")
+	const prefix = "written-during-supervisor-outage"
+	const suffix = "written-after-restart"
+	script := `while [ ! -e "$1" ]; do sleep 0.02; done; printf '%s' "$2"; : > "$3"; while [ ! -e "$4" ]; do sleep 0.02; done; printf '%s' "$5"`
+	started := h.run("--", "/bin/sh", "-c", script, "jinushi-physical-evidence", writeGate, prefix, writtenMarker, finishGate, suffix)
+	h.waitUntil("held Run to have a persisted resource sample", 10*time.Second, func() bool {
+		current := h.inspect(started.ID)
+		return current.State == "running" && current.LastResourceSampleAt != nil && current.Resources.SampleIntervalMs > 0
+	})
+	baseline := h.inspect(started.ID)
+	if baseline.LastResourceSampleAt == nil || baseline.Resources.SampleIntervalMs <= 0 {
+		t.Fatalf("running Run omitted baseline resource sample evidence: %+v", baseline)
+	}
+	baselineSampleAt := *baseline.LastResourceSampleAt
+	sampleInterval := time.Duration(baseline.Resources.SampleIntervalMs) * time.Millisecond
+
+	supervisorDown := false
+	t.Cleanup(func() {
+		if supervisorDown && h.sup == nil {
+			h.startSupervisor()
+			supervisorDown = false
+		}
+	})
+	h.stopSupervisor(true)
+	supervisorDown = true
+	supervisorDownAt := time.Now().UTC()
+	if err := os.WriteFile(writeGate, []byte("write"), 0600); err != nil {
+		t.Fatalf("release prefix while Supervisor is down: %v", err)
+	}
+	h.waitUntil("workload to write its prefix while Supervisor is down", 10*time.Second, func() bool {
+		_, err := os.Stat(writtenMarker)
+		return err == nil
+	})
+	// Keep the Supervisor unavailable across several backend sampling intervals.
+	time.Sleep(5*sampleInterval + 100*time.Millisecond)
+	restartStartedAt := time.Now().UTC()
+	h.startSupervisor()
+	supervisorDown = false
+
+	reconciled := h.inspect(started.ID)
+	if reconciled.State != "running" || !reconciled.ResourceGap {
+		t.Fatalf("restart did not retain the live Run and record a resource gap: state=%s resourceGap=%v", reconciled.State, reconciled.ResourceGap)
+	}
+	if reconciled.LastResourceSampleAt == nil || reconciled.LastOutputAt == nil {
+		t.Fatalf("restart omitted physical observation timestamps: sample=%v output=%v", reconciled.LastResourceSampleAt, reconciled.LastOutputAt)
+	}
+	if reconciled.LastOutputAt.Before(supervisorDownAt) || !reconciled.LastOutputAt.Before(restartStartedAt) {
+		t.Fatalf("LastOutputAt does not identify the physical write during Supervisor downtime: down=%s restart=%s LastOutputAt=%s", supervisorDownAt, restartStartedAt, *reconciled.LastOutputAt)
+	}
+
+	_, _, journal := h.invoke(5*time.Second, "events", "--state-dir", h.stateDir, started.ID)
+	if journal.Error != nil {
+		t.Fatalf("read reconciled lifecycle journal: %+v", journal.Error)
+	}
+	var gapEvent *event
+	var resourceSamples []*event
+	var lastPhysicalOutput *event
+	for i := range journal.Events {
+		current := &journal.Events[i]
+		switch current.Kind {
+		case "resource.gap":
+			gapEvent = current
+		case "resource.sample":
+			resourceSamples = append(resourceSamples, current)
+		case "output.chunk":
+			if current.Body["stream"] == "stdout" {
+				var body struct {
+					TimestampBasis string `json:"timestampBasis"`
+				}
+				encoded, err := json.Marshal(current.Body)
+				if err != nil || json.Unmarshal(encoded, &body) != nil {
+					t.Fatalf("decode output.chunk evidence: body=%v err=%v", current.Body, err)
+				}
+				if body.TimestampBasis != "stream-last-write" {
+					t.Fatalf("output.chunk used %q instead of physical stream write time: %+v", body.TimestampBasis, current)
+				}
+				if lastPhysicalOutput == nil || current.ObservedAt.After(lastPhysicalOutput.ObservedAt) {
+					lastPhysicalOutput = current
+				}
+			}
+		}
+	}
+	if gapEvent == nil {
+		t.Fatalf("reconciliation journal omitted resource.gap evidence: %+v", journal.Events)
+	}
+	var gapBody struct {
+		From            time.Time `json:"from"`
+		To              time.Time `json:"to"`
+		Status          string    `json:"status"`
+		Reason          string    `json:"reason"`
+		LatestResources resources `json:"latestResources"`
+	}
+	encodedGap, err := json.Marshal(gapEvent.Body)
+	if err != nil || json.Unmarshal(encodedGap, &gapBody) != nil {
+		t.Fatalf("decode resource.gap body: body=%v err=%v", gapEvent.Body, err)
+	}
+	gapDuration := gapBody.To.Sub(gapBody.From)
+	if gapBody.From.Before(baselineSampleAt) || gapBody.From.After(baselineSampleAt.Add(2*sampleInterval)) || reconciled.LastResourceSampleAt.Before(gapBody.To) || gapDuration <= 2*sampleInterval || gapDuration > 30*sampleInterval {
+		t.Fatalf("resource.gap interval is not bounded by physical samples: body=%+v baseline=%s interval=%s", gapBody, baselineSampleAt, sampleInterval)
+	}
+	if gapBody.Status != "unavailable" || gapBody.Reason != "supervisor-unavailable" {
+		t.Fatalf("resource.gap did not explain unavailable Supervisor sampling: %+v", gapBody)
+	}
+	if gapBody.LatestResources.SampleIntervalMs != baseline.Resources.SampleIntervalMs {
+		t.Fatalf("resource.gap latest metrics lost the sample interval: %+v", gapBody.LatestResources)
+	}
+	for name, sampled := range map[string]metric{
+		"memoryBytes":      gapBody.LatestResources.MemoryBytes,
+		"peakMemoryBytes":  gapBody.LatestResources.PeakMemoryBytes,
+		"cpuTimeNs":        gapBody.LatestResources.CPUTimeNs,
+		"processCount":     gapBody.LatestResources.ProcessCount,
+		"peakProcessCount": gapBody.LatestResources.PeakProcessCount,
+	} {
+		if sampled.Status != "measured" && sampled.Status != "unavailable" && sampled.Status != "unsupported" {
+			t.Fatalf("resource.gap latest metric %s has no explicit evidence status: %+v", name, sampled)
+		}
+	}
+	var sampleBody struct {
+		Resources resources `json:"resources"`
+	}
+	var sampleEvent *event
+	for _, current := range resourceSamples {
+		if current.ObservedAt.Equal(gapBody.To) {
+			sampleEvent = current
+			break
+		}
+	}
+	if sampleEvent == nil || gapEvent.Seq >= sampleEvent.Seq {
+		t.Fatalf("resource.gap was not followed by its matching resource.sample event: gap=%+v samples=%+v", gapEvent, resourceSamples)
+	}
+	encodedSample, err := json.Marshal(sampleEvent.Body)
+	if err != nil || json.Unmarshal(encodedSample, &sampleBody) != nil {
+		t.Fatalf("decode resource.sample body: body=%v err=%v", sampleEvent.Body, err)
+	}
+	encodedLatest, _ := json.Marshal(gapBody.LatestResources)
+	encodedSampled, _ := json.Marshal(sampleBody.Resources)
+	if !sampleEvent.ObservedAt.Equal(gapBody.To) || !bytes.Equal(encodedLatest, encodedSampled) {
+		t.Fatalf("resource.sample did not carry the latest gap snapshot at its physical timestamp: sample=%+v gap=%+v", sampleEvent, gapBody)
+	}
+	if lastPhysicalOutput == nil || !lastPhysicalOutput.ObservedAt.Equal(*reconciled.LastOutputAt) || lastPhysicalOutput.ObservedAt.Before(supervisorDownAt) || !lastPhysicalOutput.ObservedAt.Before(restartStartedAt) {
+		t.Fatalf("output.chunk timestamp does not match the physical pre-restart write: event=%+v LastOutputAt=%v downtime=[%s,%s)", lastPhysicalOutput, reconciled.LastOutputAt, supervisorDownAt, restartStartedAt)
+	}
+	storedPrefix, storedOutput := readRunStdout(t, h, started.ID, 1024)
+	if storedOutput.Error != nil || storedOutput.Gap || !bytes.Equal(storedPrefix, []byte(prefix)) || reconciled.Output.Stdout.ObservedBytes != int64(len(prefix)) {
+		t.Fatalf("reconciliation did not import the exact pre-restart prefix once: bytes=%q response=%+v", storedPrefix, storedOutput)
+	}
+
+	if err := os.WriteFile(finishGate, []byte("finish"), 0600); err != nil {
+		t.Fatalf("release post-restart suffix: %v", err)
+	}
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code != 0 || completed.Receipt.Outcome != "exited" || completed.Receipt.ExitCode == nil || *completed.Receipt.ExitCode != 0 {
+		t.Fatalf("physical evidence Run did not exit normally: code=%d receipt=%+v", code, completed.Receipt)
+	}
+	if !completed.ResourceGap || !completed.Receipt.EvidenceIncomplete {
+		t.Fatalf("terminal receipt failed to report incomplete evidence after a Supervisor resource gap: %+v", completed.Receipt)
 	}
 }
 
