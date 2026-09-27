@@ -151,8 +151,9 @@ type capabilities struct {
 }
 
 type event struct {
-	Seq  uint64 `json:"seq"`
-	Kind string `json:"kind"`
+	Seq  uint64         `json:"seq"`
+	Kind string         `json:"kind"`
+	Body map[string]any `json:"body"`
 }
 
 type followedEvent struct {
@@ -933,6 +934,10 @@ func TestWallTimeLimitExpiresWhileSupervisorIsStopped(t *testing.T) {
 	if code == 0 || completed.Receipt.Outcome != "timed-out" || !completed.Receipt.TerminationRequested || completed.Receipt.Cleanup != "complete" {
 		t.Fatalf("guardian wall deadline did not survive Supervisor downtime with a terminal receipt: exit=%d receipt=%+v", code, completed.Receipt)
 	}
+	_, _, events := h.invoke(5*time.Second, "events", "--state-dir", h.stateDir, started.ID)
+	if events.Error != nil || !containsLimitReachedEvent(events.Events, "wall-time") {
+		t.Fatalf("wall-time timeout did not record a typed limit.reached event: %+v", events)
+	}
 	waitProcessGone(t, pid, 2*time.Second)
 }
 
@@ -1013,6 +1018,18 @@ func TestLeaseRenewalAfterRestartSurvivesOriginalExpiry(t *testing.T) {
 	if renewed.LeaseGeneration != originalGeneration+1 || renewed.LeaseExpiry == nil || !renewed.LeaseExpiry.After(originalExpiry) {
 		t.Fatalf("lease renewal did not advance durable generation/expiry: old generation=%d expiry=%s, renewed=%+v", originalGeneration, originalExpiry, renewed)
 	}
+	code, _, duplicateRenewal := h.invoke(8*time.Second, "lease", "renew", "--state-dir", h.stateDir, "--generation", strconv.FormatUint(reconciled.LeaseGeneration, 10), "--lease-ms", strconv.FormatInt(renewedLeaseMs, 10), started.ID)
+	if code != 0 || duplicateRenewal.Error != nil || duplicateRenewal.Run == nil || duplicateRenewal.Run.LeaseGeneration != renewed.LeaseGeneration || duplicateRenewal.Run.LeaseExpiry == nil || !duplicateRenewal.Run.LeaseExpiry.Equal(*renewed.LeaseExpiry) {
+		t.Fatalf("identical renewal retry was not idempotent: exit=%d response=%+v original=%+v", code, duplicateRenewal, renewed)
+	}
+	code, _, changedRenewal := h.invoke(8*time.Second, "lease", "renew", "--state-dir", h.stateDir, "--generation", strconv.FormatUint(reconciled.LeaseGeneration, 10), "--lease-ms", strconv.FormatInt(renewedLeaseMs+1000, 10), started.ID)
+	if code == 0 || changedRenewal.Error == nil || changedRenewal.Error.Code != "stale-generation" {
+		t.Fatalf("stale generation with a different duration was not rejected: exit=%d response=%+v", code, changedRenewal)
+	}
+	afterRejectedRenewal := h.inspect(started.ID)
+	if afterRejectedRenewal.LeaseGeneration != renewed.LeaseGeneration || afterRejectedRenewal.LeaseExpiry == nil || !afterRejectedRenewal.LeaseExpiry.Equal(*renewed.LeaseExpiry) {
+		t.Fatalf("rejected renewal changed durable lease state: got %+v, want generation=%d expiry=%s", afterRejectedRenewal, renewed.LeaseGeneration, renewed.LeaseExpiry)
+	}
 
 	// Stop the Supervisor again and cross the original deadline. If renewal was
 	// not persisted into Guardian ownership, the actual descendant will die at
@@ -1050,6 +1067,15 @@ func TestLeaseRenewalAfterRestartSurvivesOriginalExpiry(t *testing.T) {
 func containsEvent(events []event, kind string) bool {
 	for _, item := range events {
 		if item.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func containsLimitReachedEvent(events []event, limit string) bool {
+	for _, item := range events {
+		if item.Kind == "limit.reached" && item.Body["limit"] == limit {
 			return true
 		}
 	}
