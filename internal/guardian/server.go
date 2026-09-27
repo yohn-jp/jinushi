@@ -611,6 +611,9 @@ func (s *runState) finish(exit backend.Exit) bool {
 		Cleanup:              "complete",
 	}
 	if s.snapshot.EffectiveCapabilities != nil {
+		effective := *s.snapshot.EffectiveCapabilities
+		effective.Signals = append([]string(nil), effective.Signals...)
+		receipt.EffectiveCapabilities = &effective
 		receipt.Capabilities = *s.snapshot.EffectiveCapabilities
 	}
 	s.snapshot.Receipt = &receipt
