@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 
 const memoryLimitChildEnv = "JINUSHI_MEMORY_LIMIT_CHILD"
 const escapedDescendantMarkerEnv = "JINUSHI_ESCAPED_DESCENDANT_MARKER"
+const taskCountChildEnv = "JINUSHI_TASK_COUNT_CHILD"
 
 func TestMain(m *testing.M) {
 	wasSubreaper, err := childSubreaperEnabled()
@@ -91,6 +93,215 @@ func TestStartOwnsAndTerminatesRealDescendants(t *testing.T) {
 	if processIsActive(childPID) {
 		t.Fatalf("descendant %d is still active after termination", childPID)
 	}
+}
+
+func TestRunWorkingDirectoryIsPinnedToOpenedDirectory(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "first")
+	second := filepath.Join(root, "second")
+	link := filepath.Join(root, "run")
+	for _, path := range []string{first, second} {
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(first, link); err != nil {
+		t.Fatal(err)
+	}
+	dir, pinnedPath, err := openRunDirectory(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, link); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/sh", "-c", "pwd -P")
+	command.Dir = pinnedPath
+	output, err := command.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(output)); got != first {
+		t.Fatalf("Run cwd followed a replaced path: got %q, want pinned directory %q", got, first)
+	}
+}
+
+func TestLinuxCgroupPathOpensRejectSymlinkComponents(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	link := filepath.Join(root, "link")
+	if err := os.Mkdir(target, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if dir, err := openDirectoryNoSymlinks(target); err != nil {
+		t.Fatalf("open ordinary directory: %v", err)
+	} else {
+		_ = dir.Close()
+	}
+	if dir, err := openDirectoryNoSymlinks(link); err == nil {
+		_ = dir.Close()
+		t.Fatal("opened cgroup path through a symlink")
+	}
+}
+
+func TestCurrentCgroupDirectoryIsPinnedWithoutSymlinkTraversal(t *testing.T) {
+	location, err := discoverCgroup()
+	if err != nil {
+		t.Skipf("cgroup v2 mount is unavailable: %v", err)
+	}
+	dir, err := openDirectoryNoSymlinks(location.basePath)
+	if err != nil {
+		t.Fatalf("open current cgroup without following path substitutions: %v", err)
+	}
+	defer dir.Close()
+	if err := verifyCgroupDirectory(dir); err != nil {
+		t.Fatalf("opened path is not on cgroup v2: %v", err)
+	}
+}
+
+func TestCgroupControlFileOpensRejectSymlink(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(root, "outside")
+	if err := os.WriteFile(outside, []byte("1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "pids.current")); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	if _, err := readFileAt(dir, "pids.current"); err == nil {
+		t.Fatal("read a cgroup control through a symlink")
+	}
+	if err := writeFileAt(dir, "pids.current", "2"); err == nil {
+		t.Fatal("wrote a cgroup control through a symlink")
+	}
+	data, err := os.ReadFile(outside)
+	if err != nil || string(data) != "1\n" {
+		t.Fatalf("symlink target was changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestCgroupRemovalRejectsReplacementDirectory(t *testing.T) {
+	root := t.TempDir()
+	parent, err := os.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	name := "run"
+	original := filepath.Join(root, name)
+	if err := os.Mkdir(original, 0700); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := openDirectoryNoSymlinks(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var originalIdentity unix.Stat_t
+	if err := unix.Fstat(int(opened.Fd()), &originalIdentity); err != nil {
+		_ = opened.Close()
+		t.Fatal(err)
+	}
+	_ = opened.Close()
+	if err := os.Rename(original, filepath.Join(root, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(original, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeCgroupAt(parent, name, originalIdentity.Ino); err == nil {
+		t.Fatal("removed a replacement directory using stale cgroup identity")
+	}
+	if info, err := os.Stat(original); err != nil || !info.IsDir() {
+		t.Fatalf("replacement directory was removed: info=%v err=%v", info, err)
+	}
+}
+
+func TestLinuxOwnershipTokenRecordsCgroupIdentityAndReadsLegacyTokens(t *testing.T) {
+	current, err := parseLinuxOwnershipToken(ownershipToken("boot-id", 41, "jinushi-run", 90210))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Version != 3 || current.SessionID != 41 || current.CgroupName != "jinushi-run" || current.CgroupID != 90210 {
+		t.Fatalf("cgroup ownership token lost its identity: %+v", current)
+	}
+	legacy, err := parseLinuxOwnershipToken("linux-v1;boot-id;41;jinushi-legacy")
+	if err != nil {
+		t.Fatalf("parse pre-Wave 2 cgroup token: %v", err)
+	}
+	if legacy.Version != 1 || legacy.SessionID != 41 || legacy.CgroupName != "jinushi-legacy" {
+		t.Fatalf("legacy cgroup ownership evidence changed: %+v", legacy)
+	}
+}
+
+func TestLinuxTaskCountSeparatesProcessesFromThreads(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := testSpec(t, executable, "-test.run=^TestLinuxTaskCountChildHelper$")
+	spec.Environment.Set = map[string]string{taskCountChildEnv: "1"}
+	process, err := New().Start(spec, io.Discard, io.Discard)
+	if errors.Is(err, ErrUnsupported) {
+		t.Skipf("Linux process ownership is unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		result, err := process.Terminate(100 * time.Millisecond)
+		if err != nil {
+			t.Errorf("terminate task-count helper: %v", err)
+		}
+		if !result.TreeEmpty {
+			t.Errorf("task-count helper tree did not become empty: %+v", result)
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resources, observeErr := process.Observe()
+		if observeErr == nil && resources.ProcessCount.Status == "measured" && resources.TaskCount.Status == "measured" && resources.TaskCount.Value > resources.ProcessCount.Value {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	resources, observeErr := process.Observe()
+	t.Fatalf("Linux task count did not distinguish threads from processes: resources=%+v err=%v", resources, observeErr)
+}
+
+func TestLinuxTaskCountChildHelper(t *testing.T) {
+	if os.Getenv(taskCountChildEnv) != "1" {
+		return
+	}
+	ready := make(chan struct{}, 12)
+	var block chan struct{}
+	for range 12 {
+		go func() {
+			runtime.LockOSThread()
+			ready <- struct{}{}
+			<-block
+		}()
+	}
+	for range 12 {
+		<-ready
+	}
+	go func() {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}()
+	select {}
 }
 
 func TestFastCommandKeepsPhysicalExitReceipt(t *testing.T) {
@@ -400,18 +611,24 @@ func TestNativeLimitsAreEnforcedOrRejectedExplicitly(t *testing.T) {
 	}
 
 	if caps.ProcessCountEnforcement {
-		process, err := New().Start(limitedSpec(t, model.Limits{ProcessCount: 1}, "/bin/sh", "-c", "sleep 30 & wait"), io.Discard, io.Discard)
+		t.Fatal("Linux cgroup pids controller must not be advertised as process-count enforcement")
+	}
+	if _, err := New().Start(limitedSpec(t, model.Limits{ProcessCount: 2}, "/bin/true"), io.Discard, io.Discard); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("process-count limit without a process-leader controller must be rejected, got %v", err)
+	}
+	if caps.TaskCountEnforcement {
+		process, err := New().Start(limitedSpec(t, model.Limits{TaskCount: 1}, "/bin/sh", "-c", "sleep 30 & wait"), io.Discard, io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}
 		exit := waitWithTimeout(t, process)
-		if exit.Outcome != "resource-limit:process-count" {
-			t.Fatalf("pids controller evidence did not identify enforcement: %+v", exit)
+		if exit.Outcome != "resource-limit:task-count" {
+			t.Fatalf("pids controller evidence did not identify task enforcement: %+v", exit)
 		}
 	} else {
-		_, err := New().Start(limitedSpec(t, model.Limits{ProcessCount: 2}, "/bin/true"), io.Discard, io.Discard)
+		_, err := New().Start(limitedSpec(t, model.Limits{TaskCount: 2}, "/bin/true"), io.Discard, io.Discard)
 		if !errors.Is(err, ErrUnsupported) {
-			t.Fatalf("process-count limit without delegated cgroup support must be rejected, got %v", err)
+			t.Fatalf("task-count limit without delegated cgroup support must be rejected, got %v", err)
 		}
 	}
 

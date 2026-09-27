@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,7 +31,106 @@ type cgroup struct {
 	location cgroupLocation
 	name     string
 	file     *os.File
+	parent   *os.File
+	identity uint64
 	baseline map[string]uint64
+}
+
+const cgroup2SuperMagic = 0x63677270
+
+// openDirectoryNoSymlinks opens an absolute directory one component at a time.
+// A path-based open can silently traverse a replaced symlink in a writable
+// delegated hierarchy, so every component is opened relative to its already
+// validated parent directory.
+func openDirectoryNoSymlinks(path string) (*os.File, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, '\x00') {
+		return nil, errors.New("directory path must be a clean absolute path")
+	}
+	fd, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if part == "." || part == ".." {
+			_ = unix.Close(fd)
+			return nil, errors.New("directory path contains an ambiguous component")
+		}
+		next, openErr := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		_ = unix.Close(fd)
+		if openErr != nil {
+			return nil, openErr
+		}
+		fd = next
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
+
+func verifyCgroupDirectory(file *os.File) error {
+	if file == nil {
+		return errors.New("cgroup directory handle is unavailable")
+	}
+	var fs unix.Statfs_t
+	if err := unix.Fstatfs(int(file.Fd()), &fs); err != nil {
+		return err
+	}
+	if uint64(fs.Type) != cgroup2SuperMagic {
+		return errors.New("directory is not on a cgroup v2 filesystem")
+	}
+	return nil
+}
+
+func readFileAt(dir *os.File, name string) ([]byte, error) {
+	if dir == nil || !isControlName(name) {
+		return nil, errors.New("invalid cgroup control file")
+	}
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	return io.ReadAll(file)
+}
+
+func writeFileAt(dir *os.File, name, value string) error {
+	if dir == nil || !isControlName(name) {
+		return errors.New("invalid cgroup control file")
+	}
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	_, writeErr := io.WriteString(file, value)
+	return errors.Join(writeErr, file.Close())
+}
+
+func isControlName(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, "/\\\x00")
+}
+
+func removeCgroupAt(parent *os.File, name string, identity uint64) error {
+	if parent == nil || !isControlName(name) || identity == 0 {
+		return errors.New("cgroup removal identity is incomplete")
+	}
+	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	var current unix.Stat_t
+	statErr := unix.Fstat(fd, &current)
+	_ = unix.Close(fd)
+	if statErr != nil {
+		return statErr
+	}
+	if current.Ino != identity {
+		return errors.New("cgroup path was replaced before removal")
+	}
+	return unix.Unlinkat(int(parent.Fd()), name, unix.AT_REMOVEDIR)
 }
 
 func discoverCgroup() (cgroupLocation, error) {
@@ -119,7 +219,15 @@ func childRelativePath(location cgroupLocation, name string) string {
 }
 
 func cgroupControllerEnabled(basePath, name string) bool {
-	data, err := os.ReadFile(filepath.Join(basePath, "cgroup.subtree_control"))
+	base, err := openDirectoryNoSymlinks(basePath)
+	if err != nil {
+		return false
+	}
+	defer base.Close()
+	if verifyCgroupDirectory(base) != nil {
+		return false
+	}
+	data, err := readFileAt(base, "cgroup.subtree_control")
 	if err != nil {
 		return false
 	}
@@ -132,31 +240,72 @@ func cgroupControllerEnabled(basePath, name string) bool {
 }
 
 func cgroupWritable(basePath string) bool {
-	err := unix.Access(basePath, unix.W_OK|unix.X_OK)
-	return err == nil
+	base, err := openDirectoryNoSymlinks(basePath)
+	if err != nil {
+		return false
+	}
+	defer base.Close()
+	return verifyCgroupDirectory(base) == nil && unix.Faccessat(int(base.Fd()), ".", unix.W_OK|unix.X_OK, 0) == nil
 }
 
-func newCgroup(location cgroupLocation, name string, memoryBytes, cpuPercent, processCount int64) (*cgroup, error) {
+func newCgroup(location cgroupLocation, name string, memoryBytes, cpuPercent, taskCount int64) (*cgroup, error) {
+	parent, err := openDirectoryNoSymlinks(location.basePath)
+	if err != nil {
+		return nil, fmt.Errorf("open delegated cgroup parent safely: %w", err)
+	}
+	if err := verifyCgroupDirectory(parent); err != nil {
+		_ = parent.Close()
+		return nil, err
+	}
 	childPath := filepath.Join(location.basePath, name)
 	childRel := childRelativePath(location, name)
-	if err := os.Mkdir(childPath, 0700); err != nil {
+	if !isControlName(name) || strings.Contains(name, string(filepath.Separator)) {
+		_ = parent.Close()
+		return nil, errors.New("invalid cgroup name")
+	}
+	if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
+		_ = parent.Close()
 		return nil, err
 	}
 	removeOnError := true
+	var child *os.File
+	var childIdentity uint64
 	defer func() {
 		if removeOnError {
-			_ = os.Remove(childPath)
+			if child != nil {
+				_ = child.Close()
+			}
+			if childIdentity != 0 {
+				_ = removeCgroupAt(parent, name, childIdentity)
+			}
+			_ = parent.Close()
 		}
 	}()
+	childFD, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	child = os.NewFile(uintptr(childFD), childPath)
+	if err := verifyCgroupDirectory(child); err != nil {
+		_ = child.Close()
+		return nil, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(childFD, &stat); err != nil {
+		_ = child.Close()
+		return nil, err
+	}
+	childIdentity = stat.Ino
 
 	location.childPath = childPath
 	location.childRel = filepath.Clean(childRel)
-	cg := &cgroup{location: location, name: name, baseline: make(map[string]uint64)}
+	cg := &cgroup{location: location, name: name, file: child, parent: parent, identity: stat.Ino, baseline: make(map[string]uint64)}
 	writeLimit := func(controller, file, value string) error {
-		if !cgroupControllerEnabled(location.basePath, controller) {
+		data, readErr := readFileAt(parent, "cgroup.subtree_control")
+		if readErr != nil || !strings.Contains(" "+strings.TrimSpace(string(data))+" ", " "+controller+" ") {
 			return fmt.Errorf("cgroup v2 %s controller is not enabled for this delegated scope", controller)
 		}
-		if err := writeControl(filepath.Join(childPath, file), value); err != nil {
+		if err := writeFileAt(cg.file, file, value); err != nil {
 			return fmt.Errorf("set cgroup %s: %w", file, err)
 		}
 		return nil
@@ -182,16 +331,11 @@ func newCgroup(location cgroupLocation, name string, memoryBytes, cpuPercent, pr
 			return nil, err
 		}
 	}
-	if processCount > 0 {
-		if err := writeLimit("pids", "pids.max", strconv.FormatInt(processCount, 10)); err != nil {
+	if taskCount > 0 {
+		if err := writeLimit("pids", "pids.max", strconv.FormatInt(taskCount, 10)); err != nil {
 			return nil, err
 		}
 	}
-	dir, err := os.Open(childPath)
-	if err != nil {
-		return nil, err
-	}
-	cg.file = dir
 	cg.baseline = readLimitCounters(cg)
 	removeOnError = false
 	return cg, nil
@@ -205,10 +349,21 @@ func (c *cgroup) close() {
 		_ = c.file.Close()
 		c.file = nil
 	}
-	_ = os.Remove(c.location.childPath)
+	if c.parent != nil {
+		_ = removeCgroupAt(c.parent, c.name, c.identity)
+		_ = c.parent.Close()
+		c.parent = nil
+	}
 }
 
 func (c *cgroup) counterFile(file string) map[string]uint64 {
+	if c.file != nil {
+		data, err := readFileAt(c.file, file)
+		if err != nil {
+			return map[string]uint64{}
+		}
+		return parseCounterData(data)
+	}
 	return parseCounters(filepath.Join(c.location.childPath, file))
 }
 
@@ -224,7 +379,7 @@ func (c *cgroup) nativeLimitOutcome() string {
 	}
 	pids := c.counterFile("pids.events")
 	if pids["max"] > c.baseline["pids.max"] {
-		return "resource-limit:process-count"
+		return "resource-limit:task-count"
 	}
 	return ""
 }
@@ -241,11 +396,15 @@ func readLimitCounters(c *cgroup) map[string]uint64 {
 }
 
 func parseCounters(path string) map[string]uint64 {
-	out := make(map[string]uint64)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return out
+		return map[string]uint64{}
 	}
+	return parseCounterData(data)
+}
+
+func parseCounterData(data []byte) map[string]uint64 {
+	out := make(map[string]uint64)
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 2 {

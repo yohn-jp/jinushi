@@ -36,7 +36,9 @@ type Process struct {
 	waitErr        error
 	outputErr      error
 	peakMemory     int64
-	peakPIDs       int64
+	peakProcesses  int64
+	peakTasks      int64
+	interactive    bool
 	treeEmpty      bool
 	limitOutcome   string
 	finalResources *model.Resources
@@ -46,6 +48,28 @@ type Process struct {
 }
 
 func (p *Process) Ownership() model.Ownership { return p.ownership }
+
+// EffectiveCapabilities reports the backend and enforcement surfaces selected
+// for this Run, rather than rediscovering capabilities after execution.
+func (p *Process) EffectiveCapabilities() model.Capabilities {
+	caps := model.Capabilities{
+		Backend:                 "linux",
+		PTY:                     p.interactive,
+		MemoryTelemetry:         true,
+		CPUTelemetry:            true,
+		ProcessTelemetry:        true,
+		ProcessCountEnforcement: false,
+		RestartReconciliation:   "process-subreaper-tree",
+		Signals:                 []string{"SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"},
+	}
+	if p.cg != nil {
+		caps.RestartReconciliation = "cgroup-v2"
+		caps.MemoryEnforcement = p.cg.location.memoryLimit
+		caps.CPUQuotaEnforcement = p.cg.location.cpuLimit
+		caps.TaskCountEnforcement = p.cg.location.pidsLimit
+	}
+	return caps
+}
 
 func (p *Process) Wait() (backend.Exit, error) {
 	<-p.waitDone
@@ -253,14 +277,13 @@ func (p *Process) Observe() (model.Resources, error) {
 
 func (p *Process) observeCgroup() model.Resources {
 	resources := unavailableResources()
-	base := p.cg.location.childPath
 	processes, processErr := scanCgroup(p.cg)
 	if processErr != nil {
 		return resources
 	}
 	total := totals(processes)
-	resources.MemoryBytes = readMetric(filepath.Join(base, "memory.current"))
-	resources.PeakMemoryBytes = readMetric(filepath.Join(base, "memory.peak"))
+	resources.MemoryBytes = readMetricAt(p.cg.file, "memory.current")
+	resources.PeakMemoryBytes = readMetricAt(p.cg.file, "memory.peak")
 	if resources.MemoryBytes.Status == "unsupported" {
 		resources.MemoryBytes = measuredMetric(total.Memory)
 	}
@@ -269,19 +292,26 @@ func (p *Process) observeCgroup() model.Resources {
 	} else if resources.MemoryBytes.Status == "measured" {
 		p.updatePeaks(resources.MemoryBytes.Value, 0)
 	}
-	resources.CPUTimeNs = readCPUTime(filepath.Join(base, "cpu.stat"))
+	resources.CPUTimeNs = readCPUTimeAt(p.cg.file, "cpu.stat")
 	if resources.CPUTimeNs.Status == "unsupported" {
 		resources.CPUTimeNs = measuredMetric(total.CPUTimeNS)
 	}
-	resources.ProcessCount = readProcessCount(filepath.Join(base, "cgroup.procs"))
+	resources.ProcessCount = readProcessCountAt(p.cg.file, "cgroup.procs")
 	if resources.ProcessCount.Status == "measured" {
 		resources.PeakProcessCount = p.sampledProcessPeak(resources.ProcessCount.Value)
+	}
+	resources.TaskCount = readMetricAt(p.cg.file, "pids.current")
+	if resources.TaskCount.Status == "unsupported" {
+		resources.TaskCount = measuredMetric(total.Tasks)
+	}
+	if resources.TaskCount.Status == "measured" {
+		resources.PeakTaskCount = p.sampledTaskPeak(resources.TaskCount.Value)
 	}
 	return resources
 }
 
 func scanCgroup(cg *cgroup) ([]procInfo, error) {
-	data, err := os.ReadFile(filepath.Join(cg.location.childPath, "cgroup.procs"))
+	data, err := readFileAt(cg.file, "cgroup.procs")
 	if err != nil {
 		return nil, err
 	}
@@ -311,6 +341,8 @@ func (p *Process) observeProcesses(processes []procInfo) model.Resources {
 	resource.CPUTimeNs = measuredMetric(current.CPUTimeNS)
 	resource.ProcessCount = measuredMetric(current.Processes)
 	resource.PeakProcessCount = p.sampledProcessPeak(current.Processes)
+	resource.TaskCount = measuredMetric(current.Tasks)
+	resource.PeakTaskCount = p.sampledTaskPeak(current.Tasks)
 	return resource
 }
 
@@ -319,8 +351,8 @@ func (p *Process) updatePeaks(memory, processes int64) {
 	if memory > p.peakMemory {
 		p.peakMemory = memory
 	}
-	if processes > p.peakPIDs {
-		p.peakPIDs = processes
+	if processes > p.peakProcesses {
+		p.peakProcesses = processes
 	}
 	p.resultMu.Unlock()
 }
@@ -337,10 +369,20 @@ func (p *Process) sampledMemoryPeak(current int64) model.Metric {
 
 func (p *Process) sampledProcessPeak(current int64) model.Metric {
 	p.resultMu.Lock()
-	if current > p.peakPIDs {
-		p.peakPIDs = current
+	if current > p.peakProcesses {
+		p.peakProcesses = current
 	}
-	peak := p.peakPIDs
+	peak := p.peakProcesses
+	p.resultMu.Unlock()
+	return measuredMetric(peak)
+}
+
+func (p *Process) sampledTaskPeak(current int64) model.Metric {
+	p.resultMu.Lock()
+	if current > p.peakTasks {
+		p.peakTasks = current
+	}
+	peak := p.peakTasks
 	p.resultMu.Unlock()
 	return measuredMetric(peak)
 }
@@ -465,25 +507,25 @@ func validateCgroupOwnership(owner model.Ownership, cg *cgroup) error {
 	if owner.Backend != "linux" || owner.PID <= 0 || owner.StartTime == 0 || owner.CgroupPath == "" {
 		return errors.New("incomplete Linux cgroup ownership evidence")
 	}
-	bootID, sessionID, name, err := parseFullOwnershipToken(owner.Token)
+	token, err := parseLinuxOwnershipToken(owner.Token)
 	if err != nil {
 		return err
 	}
 	currentBoot, err := readBootID()
-	if err != nil || currentBoot != bootID {
+	if err != nil || currentBoot != token.BootID {
 		if err == nil {
 			err = errors.New("Linux boot identity changed")
 		}
 		return err
 	}
-	if name != cg.name || filepath.Clean(owner.CgroupPath) != filepath.Clean(cg.location.childPath) || sessionID != owner.ProcessGroup {
+	if token.Version != 3 || token.CgroupID != cg.identity || token.CgroupName != cg.name || filepath.Clean(owner.CgroupPath) != filepath.Clean(cg.location.childPath) || token.SessionID != owner.ProcessGroup {
 		return errors.New("Linux cgroup ownership token does not match the execution")
 	}
 	return nil
 }
 
 func cgroupEmpty(cg *cgroup) (bool, error) {
-	data, err := os.ReadFile(filepath.Join(cg.location.childPath, "cgroup.events"))
+	data, err := readFileAt(cg.file, "cgroup.events")
 	if err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			fields := strings.Fields(line)
@@ -493,7 +535,7 @@ func cgroupEmpty(cg *cgroup) (bool, error) {
 			}
 		}
 	}
-	pids, readErr := os.ReadFile(filepath.Join(cg.location.childPath, "cgroup.procs"))
+	pids, readErr := readFileAt(cg.file, "cgroup.procs")
 	if readErr != nil {
 		return false, errors.Join(err, readErr)
 	}
@@ -502,6 +544,15 @@ func cgroupEmpty(cg *cgroup) (bool, error) {
 
 func readMetric(path string) model.Metric {
 	data, err := os.ReadFile(path)
+	return parseIntegerMetric(data, err)
+}
+
+func readMetricAt(dir *os.File, name string) model.Metric {
+	data, err := readFileAt(dir, name)
+	return parseIntegerMetric(data, err)
+}
+
+func parseIntegerMetric(data []byte, err error) model.Metric {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return model.Metric{Status: "unsupported"}
@@ -515,8 +566,28 @@ func readMetric(path string) model.Metric {
 	return measuredMetric(value)
 }
 
+func readProcessCountAt(dir *os.File, name string) model.Metric {
+	data, err := readFileAt(dir, name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return model.Metric{Status: "unsupported"}
+		}
+		return model.Metric{Status: "unavailable"}
+	}
+	return measuredMetric(int64(len(strings.Fields(string(data)))))
+}
+
 func readCPUTime(path string) model.Metric {
 	data, err := os.ReadFile(path)
+	return parseCPUTime(data, err)
+}
+
+func readCPUTimeAt(dir *os.File, name string) model.Metric {
+	data, err := readFileAt(dir, name)
+	return parseCPUTime(data, err)
+}
+
+func parseCPUTime(data []byte, err error) model.Metric {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return model.Metric{Status: "unsupported"}
@@ -556,6 +627,8 @@ func unavailableResources() model.Resources {
 		CPUTimeNs:        model.Metric{Status: "unavailable"},
 		ProcessCount:     model.Metric{Status: "unavailable"},
 		PeakProcessCount: model.Metric{Status: "unavailable"},
+		TaskCount:        model.Metric{Status: "unavailable"},
+		PeakTaskCount:    model.Metric{Status: "unavailable"},
 	}
 }
 

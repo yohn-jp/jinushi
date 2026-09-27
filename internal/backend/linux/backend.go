@@ -40,25 +40,35 @@ func (*Backend) ValidateLimits(limits model.Limits) error {
 	if limits.CPUQuotaPercent > (int64(^uint64(0)>>1) / 1000) {
 		return errors.New("CPU quota exceeds Linux cgroup v2 range")
 	}
+	if limits.ProcessCount > 0 {
+		return fmt.Errorf("%w: Linux cgroup v2 cannot enforce a process-leader limit; use a task-count limit", ErrUnsupported)
+	}
+	if limits.TaskCount > 0 {
+		location, ok := probeCgroup()
+		if !ok || !location.pidsLimit {
+			return fmt.Errorf("%w: Linux task-count enforcement requires a delegated cgroup v2 pids controller", ErrUnsupported)
+		}
+	}
 	return nil
 }
 
 func (*Backend) Capabilities() model.Capabilities {
 	location, ok := probeCgroup()
 	capabilities := model.Capabilities{
-		Backend:               "linux",
-		PTY:                   true,
-		MemoryTelemetry:       true,
-		CPUTelemetry:          true,
-		ProcessTelemetry:      true,
-		RestartReconciliation: "process-subreaper-tree",
-		Signals:               []string{"SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"},
+		Backend:                 "linux",
+		PTY:                     true,
+		MemoryTelemetry:         true,
+		CPUTelemetry:            true,
+		ProcessTelemetry:        true,
+		ProcessCountEnforcement: false,
+		RestartReconciliation:   "process-subreaper-tree",
+		Signals:                 []string{"SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"},
 	}
 	if ok {
 		capabilities.RestartReconciliation = "cgroup-v2"
 		capabilities.MemoryEnforcement = location.memoryLimit
 		capabilities.CPUQuotaEnforcement = location.cpuLimit
-		capabilities.ProcessCountEnforcement = location.pidsLimit
+		capabilities.TaskCountEnforcement = location.pidsLimit
 	}
 	return capabilities
 }
@@ -70,8 +80,11 @@ func (*Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Pro
 	if !filepath.IsAbs(spec.Cwd) {
 		return nil, errors.New("cwd must be absolute")
 	}
-	if spec.Limits.MemoryBytes < 0 || spec.Limits.CPUQuotaPercent < 0 || spec.Limits.ProcessCount < 0 || spec.Limits.WallTimeMs < 0 || spec.Limits.OutputBytes < 0 {
+	if spec.Limits.MemoryBytes < 0 || spec.Limits.CPUQuotaPercent < 0 || spec.Limits.ProcessCount < 0 || spec.Limits.TaskCount < 0 || spec.Limits.WallTimeMs < 0 || spec.Limits.OutputBytes < 0 {
 		return nil, errors.New("resource limits cannot be negative")
+	}
+	if spec.Limits.ProcessCount > 0 {
+		return nil, fmt.Errorf("%w: Linux cgroup v2 cannot enforce a process-leader limit; use a task-count limit", ErrUnsupported)
 	}
 	env, err := runEnvironment(spec.Environment)
 	if err != nil {
@@ -84,7 +97,7 @@ func (*Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Pro
 		stderr = io.Discard
 	}
 
-	limitRequested := spec.Limits.MemoryBytes > 0 || spec.Limits.CPUQuotaPercent > 0 || spec.Limits.ProcessCount > 0
+	limitRequested := spec.Limits.MemoryBytes > 0 || spec.Limits.CPUQuotaPercent > 0 || spec.Limits.TaskCount > 0
 	var cg *cgroup
 	var cgroupSetupErr error
 	location, locationErr := discoverCgroup()
@@ -93,7 +106,7 @@ func (*Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Pro
 		if nameErr != nil {
 			return nil, nameErr
 		}
-		cg, cgroupSetupErr = newCgroup(location, name, spec.Limits.MemoryBytes, spec.Limits.CPUQuotaPercent, spec.Limits.ProcessCount)
+		cg, cgroupSetupErr = newCgroup(location, name, spec.Limits.MemoryBytes, spec.Limits.CPUQuotaPercent, spec.Limits.TaskCount)
 	}
 	if limitRequested && cg == nil {
 		if cgroupSetupErr == nil {
@@ -128,7 +141,12 @@ func (*Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Pro
 }
 
 func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg *cgroup) (*Process, error) {
-	path, err := resolveExecutable(spec.Argv[0], spec.Cwd, env)
+	cwd, runCwd, err := openRunDirectory(spec.Cwd)
+	if err != nil {
+		return nil, err
+	}
+	defer cwd.Close()
+	path, err := resolveExecutable(spec.Argv[0], runCwd, env)
 	if err != nil {
 		return nil, err
 	}
@@ -145,14 +163,15 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 	}
 	cmd := exec.Command(path, spec.Argv[1:]...)
 	cmd.Args = append([]string(nil), spec.Argv...)
-	cmd.Dir = spec.Cwd
+	cmd.Dir = runCwd
 	cmd.Env = env
 	p := &Process{
-		cmd:        cmd,
-		startedAt:  time.Now().UTC(),
-		waitDone:   make(chan struct{}),
-		outputDone: make(chan struct{}),
-		cg:         cg,
+		cmd:         cmd,
+		startedAt:   time.Now().UTC(),
+		interactive: spec.Interactive,
+		waitDone:    make(chan struct{}),
+		outputDone:  make(chan struct{}),
+		cg:          cg,
 	}
 
 	var master, slave *os.File
@@ -212,7 +231,7 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 	owner := model.Ownership{Backend: "linux", PID: cmd.Process.Pid, ProcessGroup: cmd.Process.Pid}
 	if cg != nil {
 		owner.CgroupPath = cg.location.childPath
-		owner.Token = ownershipToken(bootID, cmd.Process.Pid, cg.name)
+		owner.Token = ownershipToken(bootID, cmd.Process.Pid, cg.name, cg.identity)
 	} else {
 		owner.Token = ownershipTokenWithSubreaper(bootID, cmd.Process.Pid, reaper)
 	}
@@ -242,7 +261,7 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 	}
 	if cg != nil {
 		p.ownership.CgroupPath = cg.location.childPath
-		p.ownership.Token = ownershipToken(bootID, info.Session, cg.name)
+		p.ownership.Token = ownershipToken(bootID, info.Session, cg.name, cg.identity)
 	}
 	if spec.Interactive {
 		go p.copyPTYOutput(stdout)
@@ -251,6 +270,26 @@ func startCommand(spec model.RunSpec, env []string, stdout, stderr io.Writer, cg
 	}
 	go p.waitForExit()
 	return p, nil
+}
+
+func openRunDirectory(path string) (*os.File, string, error) {
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("open Run working directory: %w", err)
+	}
+	info, err := dir.Stat()
+	if err != nil {
+		_ = dir.Close()
+		return nil, "", fmt.Errorf("inspect Run working directory: %w", err)
+	}
+	if !info.IsDir() {
+		_ = dir.Close()
+		return nil, "", errors.New("Run working directory is not a directory")
+	}
+	// Go's fork/exec child changes directory before exec. Resolving this procfs
+	// magic link in that step pins the child to the directory opened above,
+	// even if the caller's original path is renamed or replaced meanwhile.
+	return dir, fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), dir.Fd()), nil
 }
 
 func cleanupUnidentifiedStart(cmd *exec.Cmd, cg *cgroup, owner model.Ownership) error {
@@ -375,13 +414,17 @@ func randomCgroupName() (string, error) {
 	return "jinushi-" + hex.EncodeToString(id[:]), nil
 }
 
-func fileWritable(path string) bool {
-	return unix.Access(path, unix.W_OK) == nil
-}
-
 func probeCgroup() (cgroupLocation, bool) {
 	location, err := discoverCgroup()
 	if err != nil {
+		return cgroupLocation{}, false
+	}
+	parent, err := openDirectoryNoSymlinks(location.basePath)
+	if err != nil {
+		return cgroupLocation{}, false
+	}
+	defer parent.Close()
+	if verifyCgroupDirectory(parent) != nil {
 		return cgroupLocation{}, false
 	}
 	name, err := randomCgroupName()
@@ -389,47 +432,60 @@ func probeCgroup() (cgroupLocation, bool) {
 		return cgroupLocation{}, false
 	}
 	probePath := filepath.Join(location.basePath, name)
-	if err := os.Mkdir(probePath, 0700); err != nil {
+	if err := unix.Mkdirat(int(parent.Fd()), name, 0700); err != nil {
 		return cgroupLocation{}, false
 	}
-	defer os.Remove(probePath)
+	probeFD, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return cgroupLocation{}, false
+	}
+	probe := os.NewFile(uintptr(probeFD), probePath)
+	var probeIdentity unix.Stat_t
+	if err := unix.Fstat(probeFD, &probeIdentity); err != nil {
+		_ = probe.Close()
+		return cgroupLocation{}, false
+	}
+	defer func() {
+		_ = probe.Close()
+		_ = removeCgroupAt(parent, name, probeIdentity.Ino)
+	}()
+	if verifyCgroupDirectory(probe) != nil {
+		return cgroupLocation{}, false
+	}
 	location.childPath = probePath
 	location.childRel = childRelativePath(location, name)
-	if _, err := os.Stat(filepath.Join(probePath, "cgroup.procs")); err != nil {
+	if _, err := readFileAt(probe, "cgroup.procs"); err != nil {
 		return cgroupLocation{}, false
 	}
-	location.memoryLimit = fileWritable(filepath.Join(probePath, "memory.max")) && fileWritable(filepath.Join(probePath, "memory.oom.group"))
-	location.cpuLimit = fileWritable(filepath.Join(probePath, "cpu.max"))
-	location.pidsLimit = fileWritable(filepath.Join(probePath, "pids.max"))
+	location.memoryLimit = fileWritableAt(probe, "memory.max") && fileWritableAt(probe, "memory.oom.group")
+	location.cpuLimit = fileWritableAt(probe, "cpu.max")
+	location.pidsLimit = fileWritableAt(probe, "pids.max")
 	return location, true
 }
 
-func writeControl(path, value string) error {
-	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+func fileWritableAt(dir *os.File, name string) bool {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_WRONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
-		return err
+		return false
 	}
-	_, writeErr := io.WriteString(file, value)
-	closeErr := file.Close()
-	return errors.Join(writeErr, closeErr)
+	return unix.Close(fd) == nil
 }
 
 func killCgroup(cg *cgroup) error {
 	if cg == nil {
 		return nil
 	}
-	if err := writeControl(filepath.Join(cg.location.childPath, "cgroup.kill"), "1"); err == nil {
+	if err := writeFileAt(cg.file, "cgroup.kill", "1"); err == nil {
 		return nil
 	}
 	return signalCgroup(cg, syscall.SIGKILL)
 }
 
 func signalCgroup(cg *cgroup, signal syscall.Signal) error {
-	data, err := os.ReadFile(filepath.Join(cg.location.childPath, "cgroup.procs"))
+	data, err := readFileAt(cg.file, "cgroup.procs")
 	if err != nil {
 		return err
 	}
-	expected := filepath.Clean(cg.location.childRel)
 	var failures []error
 	for _, line := range strings.Fields(string(data)) {
 		pid := atoiOrZero(line)
@@ -444,8 +500,8 @@ func signalCgroup(cg *cgroup, signal syscall.Signal) error {
 			failures = append(failures, err)
 			continue
 		}
-		beforeGroup, err := procCgroupPath(pid)
-		if err != nil || filepath.Clean(beforeGroup) != expected {
+		inCgroup, err := processInCgroup(pid, cg)
+		if err != nil || !inCgroup {
 			if err == nil {
 				err = errors.New("process is outside the owned cgroup")
 			}
@@ -453,8 +509,8 @@ func signalCgroup(cg *cgroup, signal syscall.Signal) error {
 			continue
 		}
 		err = pidfdSignal(pid, signal, before, func() bool {
-			currentPath, pathErr := procCgroupPath(pid)
-			return pathErr == nil && filepath.Clean(currentPath) == expected
+			current, pathErr := processInCgroup(pid, cg)
+			return pathErr == nil && current
 		})
 		if err != nil && !errors.Is(err, syscall.ESRCH) {
 			failures = append(failures, fmt.Errorf("signal cgroup process %d: %w", pid, err))

@@ -3,11 +3,14 @@
 package linux
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/yohn-jp/jinushi/internal/backend"
 	"github.com/yohn-jp/jinushi/internal/model"
+	"golang.org/x/sys/unix"
 )
 
 func (*Backend) Reconcile(owner model.Ownership) (backend.ReconcileResult, error) {
@@ -34,24 +37,62 @@ func (*Backend) Reconcile(owner model.Ownership) (backend.ReconcileResult, error
 	}
 
 	if owner.CgroupPath != "" {
-		if cgroupName == "-" || filepath.Base(filepath.Clean(owner.CgroupPath)) != cgroupName {
+		legacy := token.Version == 1 && token.CgroupName != "-"
+		if (!legacy && (token.Version != 3 || token.CgroupID == 0)) || token.CgroupName == "-" || filepath.Base(filepath.Clean(owner.CgroupPath)) != token.CgroupName {
 			return uncertain("persisted cgroup identity does not match the ownership token"), nil
 		}
 		expectedPath, err := expectedCgroupPath(owner.CgroupPath)
 		if err != nil {
 			return uncertain("persisted cgroup path cannot be mapped to the active cgroup v2 mount"), nil
 		}
-		if _, err := os.Stat(owner.CgroupPath); err != nil {
+		cgroupDir, err := openDirectoryNoSymlinks(owner.CgroupPath)
+		if err != nil {
 			return uncertain("owned cgroup is missing; physical execution cannot be proven"), nil
 		}
+		if err := verifyCgroupDirectory(cgroupDir); err != nil {
+			_ = cgroupDir.Close()
+			return uncertain("owned cgroup path is not a cgroup v2 directory"), nil
+		}
+		var identity unix.Stat_t
+		if err := unix.Fstat(int(cgroupDir.Fd()), &identity); err != nil || !legacy && identity.Ino != token.CgroupID {
+			_ = cgroupDir.Close()
+			return uncertain("owned cgroup path was replaced after ownership was recorded"), nil
+		}
+		defer cgroupDir.Close()
 		location, err := discoverCgroup()
 		if err != nil {
 			return uncertain("cgroup v2 mount is unavailable during reconciliation"), nil
 		}
-		location.childPath = filepath.Clean(owner.CgroupPath)
+		location.childPath = owner.CgroupPath
 		location.childRel = expectedPath
-		cg := &cgroup{location: location, name: cgroupName}
-		resources := (&Process{ownership: owner, cg: cg}).observeCgroup()
+		cg := &cgroup{location: location, name: token.CgroupName, identity: identity.Ino, file: cgroupDir}
+		process := &Process{ownership: owner, cg: cg}
+		members, err := scanCgroup(cg)
+		if err != nil {
+			return uncertain("owned cgroup membership cannot be observed"), nil
+		}
+		active := activeProcesses(members)
+		for _, member := range active {
+			inCgroup, memberErr := processInCgroup(member.PID, cg)
+			if errors.Is(memberErr, os.ErrNotExist) || errors.Is(memberErr, syscall.ESRCH) {
+				continue
+			}
+			if memberErr != nil || !inCgroup {
+				return uncertain("owned cgroup process membership cannot be revalidated"), nil
+			}
+		}
+		root, rootErr := readProcInfo(owner.PID)
+		rootProven := rootErr == nil && root.StartTime == owner.StartTime && root.Session == owner.ProcessGroup
+		if rootProven {
+			rootProven, err = processInCgroup(owner.PID, cg)
+			if err != nil {
+				rootProven = false
+			}
+		}
+		if legacy && len(active) == 0 && !rootProven {
+			return uncertain("legacy cgroup ownership has no live PID or membership evidence to distinguish a replaced empty path"), nil
+		}
+		resources := process.observeCgroup()
 		empty, err := cgroupEmpty(cg)
 		if err != nil {
 			return uncertain("owned cgroup membership cannot be observed"), nil
@@ -84,6 +125,8 @@ func (*Backend) Reconcile(owner model.Ownership) (backend.ReconcileResult, error
 		CPUTimeNs:        measuredMetric(resourceTotals.CPUTimeNS),
 		ProcessCount:     measuredMetric(resourceTotals.Processes),
 		PeakProcessCount: model.Metric{Status: "unavailable"},
+		TaskCount:        measuredMetric(resourceTotals.Tasks),
+		PeakTaskCount:    model.Metric{Status: "unavailable"},
 	}
 	if len(activeProcesses(processes)) == 0 {
 		resources.CPUTimeNs = model.Metric{Status: "unavailable"}

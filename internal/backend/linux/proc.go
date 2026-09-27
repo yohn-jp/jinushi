@@ -22,6 +22,7 @@ type procInfo struct {
 	ProcessGroup int
 	Session      int
 	State        byte
+	Threads      int64
 	UserTicks    uint64
 	SysTicks     uint64
 	StartTime    uint64
@@ -30,6 +31,7 @@ type procInfo struct {
 
 type procTotals struct {
 	Processes int64
+	Tasks     int64
 	Memory    int64
 	CPUTimeNS int64
 }
@@ -44,6 +46,7 @@ type linuxOwnershipToken struct {
 	BootID     string
 	SessionID  int
 	CgroupName string
+	CgroupID   uint64
 	Subreaper  subreaperIdentity
 }
 
@@ -100,12 +103,17 @@ func parseProcStat(data []byte) (procInfo, error) {
 	if err != nil {
 		return procInfo{}, err
 	}
+	threads, err := strconv.ParseInt(fields[17], 10, 64)
+	if err != nil || threads < 0 {
+		return procInfo{}, errors.New("invalid Linux process task count")
+	}
 	return procInfo{
 		PID:          pid,
 		PPID:         ppid,
 		ProcessGroup: processGroup,
 		Session:      session,
 		State:        fields[0][0],
+		Threads:      threads,
 		UserTicks:    userTicks,
 		SysTicks:     sysTicks,
 		StartTime:    startTime,
@@ -282,6 +290,7 @@ func totals(processes []procInfo) procTotals {
 	var out procTotals
 	for _, process := range activeProcesses(processes) {
 		out.Processes++
+		out.Tasks += process.Threads
 		out.Memory += process.RSSBytes
 		// Linux exports process CPU time in USER_HZ ticks. USER_HZ is 100 on
 		// supported Linux ABIs, independent of the kernel's scheduling HZ.
@@ -298,28 +307,20 @@ func readBootID() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-func ownershipToken(bootID string, sessionID int, cgroupName string) string {
+func ownershipToken(bootID string, sessionID int, cgroupName string, cgroupID uint64) string {
 	if cgroupName == "" {
 		cgroupName = "-"
 	}
-	return fmt.Sprintf("linux-v1;%s;%d;%s", bootID, sessionID, cgroupName)
+	return fmt.Sprintf("linux-v3;%s;%d;%s;%d", bootID, sessionID, cgroupName, cgroupID)
 }
 
 func ownershipTokenWithSubreaper(bootID string, sessionID int, reaper subreaperIdentity) string {
 	return fmt.Sprintf("linux-v2;%s;%d;-;%d;%d", bootID, sessionID, reaper.PID, reaper.StartTime)
 }
 
-func parseFullOwnershipToken(token string) (bootID string, sessionID int, cgroupName string, err error) {
-	parsed, err := parseLinuxOwnershipToken(token)
-	if err != nil {
-		return "", 0, "", err
-	}
-	return parsed.BootID, parsed.SessionID, parsed.CgroupName, nil
-}
-
 func parseLinuxOwnershipToken(token string) (linuxOwnershipToken, error) {
 	parts := strings.Split(token, ";")
-	if (len(parts) != 4 && len(parts) != 6) || (parts[0] != "linux-v1" && parts[0] != "linux-v2") || parts[1] == "" {
+	if len(parts) < 4 || parts[1] == "" {
 		return linuxOwnershipToken{}, errors.New("invalid Linux ownership token")
 	}
 	sessionID, err := strconv.Atoi(parts[2])
@@ -333,7 +334,19 @@ func parseLinuxOwnershipToken(token string) (linuxOwnershipToken, error) {
 		}
 		return parsed, nil
 	}
-	if len(parts) != 6 || parts[3] != "-" {
+	if parts[0] == "linux-v3" {
+		if len(parts) != 5 || parts[3] == "-" {
+			return linuxOwnershipToken{}, errors.New("invalid Linux cgroup ownership token")
+		}
+		cgroupID, parseErr := strconv.ParseUint(parts[4], 10, 64)
+		if parseErr != nil || cgroupID == 0 {
+			return linuxOwnershipToken{}, errors.New("invalid Linux cgroup identity")
+		}
+		parsed.Version = 3
+		parsed.CgroupID = cgroupID
+		return parsed, nil
+	}
+	if parts[0] != "linux-v2" || len(parts) != 6 || parts[3] != "-" {
 		return linuxOwnershipToken{}, errors.New("invalid Linux subreaper ownership token")
 	}
 	reaperPID, pidErr := strconv.Atoi(parts[4])
@@ -364,13 +377,47 @@ func expectedCgroupPath(ownerPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ownerPath = filepath.Clean(ownerPath)
+	if !filepath.IsAbs(ownerPath) || filepath.Clean(ownerPath) != ownerPath {
+		return "", errors.New("owned cgroup path is not a clean absolute path")
+	}
 	if !pathWithin(location.mountPoint, ownerPath) || ownerPath == location.mountPoint {
 		return "", errors.New("owned cgroup path is outside the active cgroup mount")
 	}
 	rel := strings.TrimPrefix(ownerPath, location.mountPoint)
 	rel = strings.TrimPrefix(rel, string(filepath.Separator))
 	return filepath.Clean(filepath.Join(location.mountRoot, rel)), nil
+}
+
+func processInCgroup(pid int, cg *cgroup) (bool, error) {
+	if pid <= 0 || cg == nil || cg.file == nil {
+		return false, errors.New("Linux cgroup membership evidence is incomplete")
+	}
+	procPath, err := procCgroupPath(pid)
+	if err != nil {
+		return false, err
+	}
+	root := filepath.Clean(cg.location.mountRoot)
+	if !pathWithin(root, procPath) {
+		return false, nil
+	}
+	rel, err := filepath.Rel(root, procPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, nil
+	}
+	visiblePath := filepath.Join(cg.location.mountPoint, rel)
+	member, err := openDirectoryNoSymlinks(visiblePath)
+	if err != nil {
+		return false, err
+	}
+	defer member.Close()
+	if err := verifyCgroupDirectory(member); err != nil {
+		return false, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(member.Fd()), &stat); err != nil {
+		return false, err
+	}
+	return stat.Ino == cg.identity, nil
 }
 
 func pidfdSignal(pid int, signal syscall.Signal, expected procInfo, validate func() bool) error {
