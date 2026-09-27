@@ -113,6 +113,92 @@ func TestLifecycleUpdateAndEventCommitTogether(t *testing.T) {
 	}
 }
 
+func TestTypedEventPayloadUsesCanonicalVersionedSchema(t *testing.T) {
+	s, err := Open(t.TempDir()+"/state.db", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if _, _, err := s.Create(testRun("run-typed-events"), nil); err != nil {
+		t.Fatal(err)
+	}
+	appended, err := s.AppendEvent("run-typed-events", model.Event{
+		Kind: model.EventRunAccepted,
+		Payload: &model.EventPayload{Run: &model.RunEventPayload{
+			State: model.Accepted, Generation: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if appended.Version != model.EventSchemaVersion || appended.Kind != model.EventRunAccepted {
+		t.Fatalf("appended event header = %#v", appended)
+	}
+	if _, err := s.AppendEvent("run-typed-events", model.Event{
+		Kind:    model.EventResourceSample,
+		Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Running}},
+	}); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("mismatched typed payload error = %v, want ErrInvalidEvent", err)
+	}
+	events, _, _, err := s.Events("run-typed-events", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Payload == nil || events[0].Payload.Run == nil || events[0].Payload.Run.State != model.Accepted {
+		t.Fatalf("stored typed event = %#v", events)
+	}
+}
+
+func TestEffectiveCapabilitiesAreFrozenIntoReceipt(t *testing.T) {
+	s, err := Open(t.TempDir()+"/state.db", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	run, _, err := s.Create(testRun("run-effective-backend"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective := model.Capabilities{Backend: "linux-session"}
+	run.State = model.Running
+	run.Generation++
+	run.EffectiveCapabilities = &effective
+	if _, err := s.Update(run, nil); err != nil {
+		t.Fatal(err)
+	}
+	changed := run
+	changedCaps := effective
+	changedCaps.Backend = "linux-cgroup-v2"
+	changed.EffectiveCapabilities = &changedCaps
+	if _, err := s.Update(changed, nil); !errors.Is(err, ErrInvalidRun) {
+		t.Fatalf("effective capability mutation error = %v, want ErrInvalidRun", err)
+	}
+
+	finishedAt := time.Now().UTC()
+	run.State = model.Terminal
+	run.Generation++
+	run.FinishedAt = &finishedAt
+	run.Receipt = &model.Receipt{
+		Version:               model.ProtocolVersion,
+		RunID:                 run.ID,
+		Outcome:               "exited",
+		FinishedAt:            finishedAt,
+		EffectiveCapabilities: &effective,
+		Capabilities:          effective,
+	}
+	if _, err := s.Update(run, nil); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.EffectiveCapabilities == nil || current.Receipt == nil || current.Receipt.EffectiveCapabilities == nil ||
+		current.EffectiveCapabilities.Backend != "linux-session" || current.Receipt.Capabilities.Backend != "linux-session" {
+		t.Fatalf("effective backend was not frozen into the receipt: %#v", current)
+	}
+}
+
 func TestFailedMultiEventLifecycleUpdateRollsBackEntireTransaction(t *testing.T) {
 	s, err := Open(t.TempDir()+"/state.db", Options{
 		EventRetentionCount: 8,
@@ -221,7 +307,7 @@ func TestEventCompactionReportsWatermarkAndBoundsPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 6; i++ {
-		if _, err := s.AppendEvent("run-events", model.Event{Kind: fmt.Sprintf("sample.%d", i)}); err != nil {
+		if _, err := s.AppendEvent("run-events", model.Event{Kind: model.EventResourceSample}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -261,7 +347,7 @@ func TestLifecycleEventsSurviveTelemetryCompactionUntilTerminal(t *testing.T) {
 	}
 	run.State = model.Running
 	run.Generation++
-	if _, err := s.Update(run, &model.Event{Kind: "run.started"}); err != nil {
+	if _, err := s.Update(run, &model.Event{Kind: model.EventRunRunning}); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 20; i++ {
@@ -273,7 +359,7 @@ func TestLifecycleEventsSurviveTelemetryCompactionUntilTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !gap || retainedFrom != 1 || len(events) != 3 || events[0].Kind != "run.accepted" || events[1].Kind != "run.started" {
+	if !gap || retainedFrom != 1 || len(events) != 3 || events[0].Kind != model.EventRunAccepted || events[1].Kind != model.EventRunRunning {
 		t.Fatalf("events after telemetry compaction = %#v retainedFrom=%d gap=%v", events, retainedFrom, gap)
 	}
 
@@ -324,7 +410,7 @@ func TestProtectedLifecycleEventsCanRejectAnUnboundedJournal(t *testing.T) {
 	}
 	run.State = model.Running
 	run.Generation++
-	if _, err := s.Update(run, &model.Event{Kind: "run.started"}); !errors.Is(err, ErrJournalFull) {
+	if _, err := s.Update(run, &model.Event{Kind: model.EventRunRunning}); !errors.Is(err, ErrJournalFull) {
 		t.Fatalf("second protected event error = %v, want ErrJournalFull", err)
 	}
 	current, err := s.Get(run.ID)
@@ -357,28 +443,37 @@ func TestOutputFloodKeepsBoundedTailAndReportsGap(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	wantTail := all.Bytes()[all.Len()-32:]
+	wantTail := all.Bytes()[all.Len()-96:]
 	got, err := s.Get("run-output")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Output.Stdout.ObservedBytes != int64(all.Len()) || got.Output.Stdout.RetainedBytes != 32 ||
-		got.Output.Stdout.RetainedFrom != int64(all.Len()-32) || !got.Output.Stdout.Truncated || got.Output.HistoryComplete {
+	if got.Output.Stdout.ObservedBytes != int64(all.Len()) || got.Output.Stdout.RetainedBytes != 96 ||
+		got.Output.Stdout.RetainedFrom != int64(all.Len()-96) || !got.Output.Stdout.Truncated || got.Output.HistoryComplete {
 		t.Fatalf("Run output metadata = %#v", got.Output)
 	}
 	data, retainedFrom, observed, gap, err := s.ReadOutput("run-output", "stdout", 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if retainedFrom != int64(all.Len()-32) || observed != int64(all.Len()) || !gap || !bytes.Equal(data, wantTail[:16]) {
+	if retainedFrom != int64(all.Len()-96) || observed != int64(all.Len()) || !gap || !bytes.Equal(data, wantTail[:16]) {
 		t.Fatalf("first output read = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
 	}
-	data, retainedFrom, observed, gap, err = s.ReadOutput("run-output", "stdout", retainedFrom+16, 100)
-	if err != nil {
-		t.Fatal(err)
+	collected := append([]byte(nil), data...)
+	cursor := retainedFrom + int64(len(data))
+	for cursor < observed {
+		data, retainedFrom, observed, gap, err = s.ReadOutput("run-output", "stdout", cursor, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if retainedFrom != int64(all.Len()-96) || observed != int64(all.Len()) || gap || len(data) == 0 {
+			t.Fatalf("continued output read = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
+		}
+		collected = append(collected, data...)
+		cursor += int64(len(data))
 	}
-	if retainedFrom != int64(all.Len()-32) || observed != int64(all.Len()) || gap || !bytes.Equal(data, wantTail[16:]) {
-		t.Fatalf("second output read = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
+	if !bytes.Equal(collected, wantTail) {
+		t.Fatalf("retained output = %q, want %q", collected, wantTail)
 	}
 }
 
@@ -406,7 +501,7 @@ func TestOutputAppendAndStreamMetadataSurviveReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "23456789" || retainedFrom != 2 || observed != 10 || !gap {
+	if string(data) != "0123456789" || retainedFrom != 0 || observed != 10 || gap {
 		t.Fatalf("reopened output = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
 	}
 }
@@ -444,9 +539,48 @@ func TestOutputAggregateCeilingAndPartialChunkTrim(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(data) != "56789" || retainedFrom != 5 || observed != 10 || !gap {
+		want := map[string]struct {
+			data         string
+			retainedFrom int64
+			gap          bool
+		}{
+			"stdout": {data: "", retainedFrom: 10, gap: true},
+			"stderr": {data: "56789", retainedFrom: 5, gap: true},
+			"pty":    {data: "0123456789", retainedFrom: 0, gap: false},
+		}[stream]
+		if string(data) != want.data || retainedFrom != want.retainedFrom || observed != 10 || gap != want.gap {
 			t.Fatalf("partial output trim for %s = %q retainedFrom=%d observed=%d gap=%v", stream, data, retainedFrom, observed, gap)
 		}
+	}
+}
+
+func TestPTYOutputUsesSharedAggregateRetention(t *testing.T) {
+	s, err := Open(t.TempDir()+"/state.db", Options{OutputRetainedBytes: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	run := testRun("run-pty-output-quota")
+	run.Spec.Interactive = true
+	if _, _, err := s.Create(run, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendOutput(run.ID, "pty", []byte("012345678901234567890123456789"), 0); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Output.PTY.ObservedBytes != 30 || current.Output.PTY.RetainedBytes != 24 || current.Output.PTY.RetainedFrom != 6 {
+		t.Fatalf("PTY output metadata = %#v", current.Output.PTY)
+	}
+	data, retainedFrom, observed, gap, err := s.ReadOutput(run.ID, "pty", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "678901234567890123456789" || retainedFrom != 6 || observed != 30 || !gap {
+		t.Fatalf("PTY output = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
 	}
 }
 
@@ -479,8 +613,8 @@ func TestOutputFloodKeepsDatabaseBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data) != 32 || !bytes.Equal(data, bytes.Repeat([]byte{last}, 32)) ||
-		retainedFrom != (32<<20)-32 || observed != 32<<20 || !gap {
+	if len(data) != 64 || !bytes.Equal(data, bytes.Repeat([]byte{last}, 64)) ||
+		retainedFrom != (32<<20)-96 || observed != 32<<20 || !gap {
 		t.Fatalf("flood output len=%d retainedFrom=%d observed=%d gap=%v", len(data), retainedFrom, observed, gap)
 	}
 	if err := s.Close(); err != nil {
@@ -517,7 +651,7 @@ func TestRecordOutputGapPreservesAbsoluteOffsets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "ure-output" || retainedFrom != 103 || observed != 113 || !gap {
+	if string(data) != "future-output" || retainedFrom != 100 || observed != 113 || !gap {
 		t.Fatalf("output after gap = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
 	}
 }
@@ -549,7 +683,7 @@ func TestAtomicOutputWritesPersistMetadataAndJournalEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if chunkMeta.ObservedBytes != 10 || chunkMeta.RetainedBytes != 8 || chunkMeta.RetainedFrom != 2 || !chunkMeta.Truncated {
+	if chunkMeta.ObservedBytes != 10 || chunkMeta.RetainedBytes != 10 || chunkMeta.RetainedFrom != 0 || chunkMeta.Truncated {
 		t.Fatalf("appended output metadata = %#v", chunkMeta)
 	}
 	current, err := s.Get(run.ID)
@@ -563,7 +697,7 @@ func TestAtomicOutputWritesPersistMetadataAndJournalEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "23456789" || retainedFrom != 2 || observed != 10 || !gap {
+	if string(data) != "0123456789" || retainedFrom != 0 || observed != 10 || gap {
 		t.Fatalf("read output chunk = %q retainedFrom=%d observed=%d gap=%v", data, retainedFrom, observed, gap)
 	}
 
@@ -635,7 +769,7 @@ func TestAtomicOutputWriteRollsBackWhenEventCannotBePersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	largeEvent := func(kind string) model.Event {
+	largeEvent := func(kind model.EventKind) model.Event {
 		return model.Event{Kind: kind, Body: map[string]any{"payload": bytes.Repeat([]byte("x"), 1024)}}
 	}
 	if _, err := s.AppendOutputWithEvent(run.ID, "stdout", []byte("lost"), 24, largeEvent("output.chunk")); !errors.Is(err, ErrEventTooLarge) {

@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -36,10 +35,11 @@ const (
 	eventsBucketName = "events"
 	outputBucketName = "outputs"
 
-	eventMetaKey  = "\x00meta"
-	eventEntryKey = byte(1)
-	outputMetaKey = "meta"
-	outputDataKey = byte(1)
+	eventMetaKey      = "\x00meta"
+	eventEntryKey     = byte(1)
+	outputMetaKey     = "meta"
+	outputDataKey     = byte(1)
+	outputSequenceKey = "\x00sequence"
 
 	defaultEventRetentionCount = 4096
 	defaultEventRetentionBytes = 16 << 20
@@ -52,8 +52,9 @@ const (
 
 // Options controls the per-Run history bounds. Zero-valued fields use the
 // documented package defaults. OutputRetainedBytes is an aggregate ceiling
-// across stdout, stderr, and PTY output; each stream receives one third of the
-// configured ceiling so the combined retained bytes remain bounded.
+// across stdout, stderr, and PTY output. Retention is shared by streams that
+// actually produce bytes; when the aggregate is exceeded, the least recently
+// written stream is compacted first.
 type Options struct {
 	EventRetentionCount int
 	EventRetentionBytes int64
@@ -69,6 +70,7 @@ type Options struct {
 // ensures a Run update and its event journal append commit together.
 type Store struct {
 	db      *bolt.DB
+	dbGuard *os.File
 	options Options
 }
 
@@ -80,8 +82,9 @@ type eventMeta struct {
 }
 
 type outputMeta struct {
-	Observed     int64 `json:"observed"`
-	RetainedFrom int64 `json:"retainedFrom"`
+	Observed      int64  `json:"observed"`
+	RetainedFrom  int64  `json:"retainedFrom"`
+	LastAppendSeq uint64 `json:"lastAppendSeq,omitempty"`
 }
 
 // Open opens or creates a durable store at path. The containing directory is
@@ -97,11 +100,11 @@ func Open(path string, options Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create store directory: %w", err)
 	}
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	db, guard, err := openDatabase(path, 0o600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open store database: %w", err)
 	}
-	s := &Store{db: db, options: options}
+	s := &Store{db: db, dbGuard: guard, options: options}
 	if err := db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{
 			[]byte(runsBucketName), []byte(eventsBucketName), []byte(outputBucketName),
@@ -113,6 +116,9 @@ func Open(path string, options Options) (*Store, error) {
 		return nil
 	}); err != nil {
 		_ = db.Close()
+		if guard != nil {
+			_ = guard.Close()
+		}
 		return nil, fmt.Errorf("initialize store: %w", err)
 	}
 	return s, nil
@@ -148,7 +154,13 @@ func (s *Store) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	err := s.db.Close()
+	if s.dbGuard != nil {
+		if guardErr := s.dbGuard.Close(); err == nil {
+			err = guardErr
+		}
+	}
+	return err
 }
 
 // Create persists an accepted Run and, when event is non-nil, its initial
@@ -272,8 +284,14 @@ func (s *Store) UpdateWithEvents(run model.Run, events []model.Event) ([]model.E
 		if run.State != previous.State && run.Generation == previous.Generation {
 			return fmt.Errorf("%w: lifecycle state change requires a new generation", ErrInvalidRun)
 		}
+		if previous.EffectiveCapabilities == nil && run.EffectiveCapabilities != nil && run.Generation == previous.Generation {
+			return fmt.Errorf("%w: establishing effective backend capabilities requires a new generation", ErrInvalidRun)
+		}
 		if !reflect.DeepEqual(previous.Spec, run.Spec) || !previous.CreatedAt.Equal(run.CreatedAt) {
 			return fmt.Errorf("%w: Run specification and creation time are immutable", ErrInvalidRun)
+		}
+		if previous.EffectiveCapabilities != nil && !reflect.DeepEqual(previous.EffectiveCapabilities, run.EffectiveCapabilities) {
+			return fmt.Errorf("%w: effective backend capabilities are immutable once established", ErrInvalidRun)
 		}
 		if !reflect.DeepEqual(previous.Output, run.Output) {
 			return fmt.Errorf("%w: output metadata is managed by the output spool", ErrInvalidRun)
@@ -462,11 +480,19 @@ func (s *Store) appendEventTx(tx *bolt.Tx, runID string, event model.Event, pres
 	if meta.LastSeq >= math.MaxUint64-1 {
 		return model.Event{}, fmt.Errorf("%w: sequence exhausted", ErrInvalidEvent)
 	}
-	event.Version = model.ProtocolVersion
+	event.Version = model.EventSchemaVersion
 	event.RunID = runID
 	event.Seq = meta.LastSeq + 1
 	if event.ObservedAt.IsZero() {
 		event.ObservedAt = time.Now().UTC()
+	}
+	if event.Payload != nil {
+		if err := event.Payload.Validate(event.Kind); err != nil {
+			return model.Event{}, fmt.Errorf("%w: %v", ErrInvalidEvent, err)
+		}
+		if event.Body != nil {
+			return model.Event{}, fmt.Errorf("%w: typed payload cannot be combined with legacy body", ErrInvalidEvent)
+		}
 	}
 	encoded, err := json.Marshal(event)
 	if err != nil {
@@ -508,7 +534,7 @@ func compactEvents(journal *bolt.Bucket, meta *eventMeta, options Options, prese
 		for candidate, value := cursor.Seek([]byte{eventEntryKey}); candidate != nil && candidate[0] == eventEntryKey; candidate, value = cursor.Next() {
 			if preserveCritical {
 				var event struct {
-					Kind string `json:"kind"`
+					Kind model.EventKind `json:"kind"`
 				}
 				if err := json.Unmarshal(value, &event); err != nil {
 					return fmt.Errorf("decode event during compaction: %w", err)
@@ -543,16 +569,8 @@ func compactEvents(journal *bolt.Bucket, meta *eventMeta, options Options, prese
 	return nil
 }
 
-func isCriticalEvent(kind string) bool {
-	if strings.HasPrefix(kind, "run.") || strings.HasPrefix(kind, "lease.") {
-		return true
-	}
-	switch kind {
-	case "termination.requested", "signal.sent", "limit.reached", "process.exited", "cancel.requested":
-		return true
-	default:
-		return false
-	}
+func isCriticalEvent(kind model.EventKind) bool {
+	return model.IsCriticalEventKind(kind)
 }
 
 func validateRun(run model.Run) error {
@@ -572,6 +590,18 @@ func validateRun(run model.Run) error {
 	}
 	if run.Receipt != nil && run.Receipt.RunID != run.ID {
 		return fmt.Errorf("%w: receipt Run ID does not match", ErrInvalidRun)
+	}
+	if run.EffectiveCapabilities != nil {
+		if run.EffectiveCapabilities.Backend == "" {
+			return fmt.Errorf("%w: effective backend identity is empty", ErrInvalidRun)
+		}
+	}
+	if run.Receipt != nil && (run.EffectiveCapabilities != nil || run.Receipt.EffectiveCapabilities != nil) {
+		if run.EffectiveCapabilities == nil || run.Receipt.EffectiveCapabilities == nil ||
+			!reflect.DeepEqual(run.EffectiveCapabilities, run.Receipt.EffectiveCapabilities) ||
+			!reflect.DeepEqual(*run.EffectiveCapabilities, run.Receipt.Capabilities) {
+			return fmt.Errorf("%w: terminal receipt does not preserve effective backend capabilities", ErrInvalidRun)
+		}
 	}
 	return nil
 }

@@ -12,11 +12,11 @@ import (
 	"github.com/yohn-jp/jinushi/internal/model"
 )
 
-// AppendOutput records observed output and retains only the newest bytes for
-// the selected stream. maxRetained is an aggregate Run ceiling across stdout,
-// stderr, and PTY; the store assigns each stream one third of that ceiling. A
-// zero maxRetained uses the store-wide aggregate default. Run output counters
-// and spool chunks commit atomically.
+// AppendOutput records observed output under one aggregate Run retention
+// ceiling across stdout, stderr, and PTY. Streams share the available bytes;
+// on overflow, bytes from the least recently written stream are compacted
+// first. A zero maxRetained uses the store-wide aggregate default. Run output
+// counters and spool chunks commit atomically.
 func (s *Store) AppendOutput(runID, stream string, data []byte, maxRetained int64) (model.OutputStream, error) {
 	return s.appendOutput(runID, stream, data, maxRetained, nil)
 }
@@ -25,7 +25,7 @@ func (s *Store) AppendOutput(runID, stream string, data []byte, maxRetained int6
 // LastOutputAt is advanced to the event's observation time in the same
 // transaction. The event must have kind output.chunk.
 func (s *Store) AppendOutputWithEvent(runID, stream string, data []byte, maxRetained int64, event model.Event) (model.OutputStream, error) {
-	if err := prepareOutputEvent(&event, "output.chunk"); err != nil {
+	if err := prepareOutputEvent(&event, model.EventOutputChunk); err != nil {
 		return model.OutputStream{}, err
 	}
 	return s.appendOutput(runID, stream, data, maxRetained, &event)
@@ -59,7 +59,6 @@ func (s *Store) appendOutput(runID, stream string, data []byte, maxRetained int6
 		if run.Spec.Limits.OutputBytes > 0 && run.Spec.Limits.OutputBytes < runLimit {
 			runLimit = run.Spec.Limits.OutputBytes
 		}
-		streamLimit := runLimit / 3
 		root := tx.Bucket([]byte(outputBucketName))
 		runBucket, err := root.CreateBucketIfNotExists([]byte(runID))
 		if err != nil {
@@ -83,10 +82,14 @@ func (s *Store) appendOutput(runID, stream string, data []byte, maxRetained int6
 		}
 		newObserved := meta.Observed + int64(len(data))
 		newRetainedFrom := meta.RetainedFrom
-		if newObserved-streamLimit > newRetainedFrom {
-			newRetainedFrom = newObserved - streamLimit
+		if newObserved-newRetainedFrom > runLimit {
+			newRetainedFrom = newObserved - runLimit
 		}
 		if len(data) > 0 {
+			meta.LastAppendSeq, err = nextOutputSequence(runBucket)
+			if err != nil {
+				return err
+			}
 			writeOffset := meta.Observed
 			writeData := data
 			if newRetainedFrom > writeOffset {
@@ -109,20 +112,18 @@ func (s *Store) appendOutput(runID, stream string, data []byte, maxRetained int6
 		}
 		meta.Observed = newObserved
 		meta.RetainedFrom = newRetainedFrom
-		metaData, err := json.Marshal(meta)
+		if err := persistOutputMeta(streamBucket, meta); err != nil {
+			return err
+		}
+		setRunOutput(&run, stream, outputStream(meta))
+		if err := enforceAggregateOutput(runBucket, &run, runLimit); err != nil {
+			return err
+		}
+		meta, err = readOutputMeta(streamBucket)
 		if err != nil {
-			return fmt.Errorf("encode output metadata: %w", err)
+			return err
 		}
-		if err := streamBucket.Put([]byte(outputMetaKey), metaData); err != nil {
-			return fmt.Errorf("persist output metadata: %w", err)
-		}
-		result = model.OutputStream{
-			ObservedBytes: newObserved,
-			RetainedBytes: newObserved - newRetainedFrom,
-			RetainedFrom:  newRetainedFrom,
-			Truncated:     newRetainedFrom > 0,
-		}
-		setRunOutput(&run, stream, result)
+		result = outputStream(meta)
 		if event != nil {
 			appended, err := s.appendEventTx(tx, runID, *event, true)
 			if err != nil {
@@ -142,6 +143,115 @@ func (s *Store) appendOutput(runID, stream string, data []byte, maxRetained int6
 	return result, err
 }
 
+func nextOutputSequence(runBucket *bolt.Bucket) (uint64, error) {
+	var sequence uint64
+	if raw := runBucket.Get([]byte(outputSequenceKey)); raw != nil {
+		if len(raw) != 8 {
+			return 0, fmt.Errorf("%w: corrupt output sequence", ErrInvalidOutput)
+		}
+		sequence = binary.BigEndian.Uint64(raw)
+	}
+	if sequence == math.MaxUint64 {
+		return 0, fmt.Errorf("%w: output sequence exhausted", ErrInvalidOutput)
+	}
+	sequence++
+	encoded := make([]byte, 8)
+	binary.BigEndian.PutUint64(encoded, sequence)
+	if err := runBucket.Put([]byte(outputSequenceKey), encoded); err != nil {
+		return 0, fmt.Errorf("persist output sequence: %w", err)
+	}
+	return sequence, nil
+}
+
+func readOutputMeta(bucket *bolt.Bucket) (outputMeta, error) {
+	meta := outputMeta{}
+	if bucket == nil {
+		return meta, nil
+	}
+	if raw := bucket.Get([]byte(outputMetaKey)); raw != nil {
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return outputMeta{}, fmt.Errorf("decode output metadata: %w", err)
+		}
+	}
+	if meta.Observed < 0 || meta.RetainedFrom < 0 || meta.RetainedFrom > meta.Observed {
+		return outputMeta{}, fmt.Errorf("%w: corrupt output metadata", ErrInvalidOutput)
+	}
+	return meta, nil
+}
+
+func persistOutputMeta(bucket *bolt.Bucket, meta outputMeta) error {
+	encoded, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("encode output metadata: %w", err)
+	}
+	if err := bucket.Put([]byte(outputMetaKey), encoded); err != nil {
+		return fmt.Errorf("persist output metadata: %w", err)
+	}
+	return nil
+}
+
+func outputStream(meta outputMeta) model.OutputStream {
+	return model.OutputStream{
+		ObservedBytes: meta.Observed,
+		RetainedBytes: meta.Observed - meta.RetainedFrom,
+		RetainedFrom:  meta.RetainedFrom,
+		Truncated:     meta.RetainedFrom > 0,
+	}
+}
+
+func enforceAggregateOutput(runBucket *bolt.Bucket, run *model.Run, limit int64) error {
+	streams := []string{"stdout", "stderr", "pty"}
+	metas := make(map[string]outputMeta, len(streams))
+	var retained int64
+	for _, stream := range streams {
+		bucket := runBucket.Bucket([]byte(stream))
+		if bucket == nil {
+			continue
+		}
+		meta, err := readOutputMeta(bucket)
+		if err != nil {
+			return err
+		}
+		metas[stream] = meta
+		streamRetained := meta.Observed - meta.RetainedFrom
+		if retained > math.MaxInt64-streamRetained {
+			return fmt.Errorf("%w: aggregate output counter overflow", ErrInvalidOutput)
+		}
+		retained += streamRetained
+	}
+	for retained > limit {
+		oldest := ""
+		var oldestSequence uint64
+		for _, stream := range streams {
+			meta, ok := metas[stream]
+			if !ok || meta.Observed == meta.RetainedFrom {
+				continue
+			}
+			if oldest == "" || meta.LastAppendSeq < oldestSequence {
+				oldest = stream
+				oldestSequence = meta.LastAppendSeq
+			}
+		}
+		if oldest == "" {
+			return fmt.Errorf("%w: aggregate output metadata is inconsistent", ErrInvalidOutput)
+		}
+		meta := metas[oldest]
+		drop := min(retained-limit, meta.Observed-meta.RetainedFrom)
+		meta.RetainedFrom += drop
+		bucket := runBucket.Bucket([]byte(oldest))
+		if err := trimOutput(bucket, meta.RetainedFrom); err != nil {
+			return err
+		}
+		if err := persistOutputMeta(bucket, meta); err != nil {
+			return err
+		}
+		metas[oldest] = meta
+		setRunOutput(run, oldest, outputStream(meta))
+		retained -= drop
+	}
+	return nil
+}
+
 // RecordOutputGap advances the absolute observed byte count while discarding
 // currently retained bytes for a stream. It is used when an external spool
 // reports that output was compacted or lost before it could be imported.
@@ -155,7 +265,7 @@ func (s *Store) RecordOutputGap(runID, stream string, observedBytes int64) error
 // typed journal event. LastOutputAt is advanced to the event's observation
 // time in the same transaction. The event must have kind output.gap.
 func (s *Store) RecordOutputGapWithEvent(runID, stream string, observedBytes int64, event model.Event) (model.OutputStream, error) {
-	if err := prepareOutputEvent(&event, "output.gap"); err != nil {
+	if err := prepareOutputEvent(&event, model.EventOutputGap); err != nil {
 		return model.OutputStream{}, err
 	}
 	return s.recordOutputGap(runID, stream, observedBytes, &event)
@@ -241,7 +351,7 @@ func (s *Store) recordOutputGap(runID, stream string, observedBytes int64, event
 	return result, err
 }
 
-func prepareOutputEvent(event *model.Event, kind string) error {
+func prepareOutputEvent(event *model.Event, kind model.EventKind) error {
 	if event.Kind != kind {
 		return fmt.Errorf("%w: expected kind %q", ErrInvalidEvent, kind)
 	}
