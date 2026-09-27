@@ -4,7 +4,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +15,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yohn-jp/jinushi/internal/ipc"
@@ -74,7 +78,7 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, runSuper
 	case "signal":
 		return signalCommand(ctx, args[1:], stdout, stderr)
 	case "cancel":
-		return idCommand(ctx, "cancel", args[1:], stdout, stderr)
+		return controlIDCommand(ctx, "cancel", args[1:], stdout, stderr)
 	case "capabilities":
 		return simpleCommand(ctx, "capabilities", args[1:], stdout, stderr)
 	case "status":
@@ -97,6 +101,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	fs.SetOutput(stderr)
 	stateDir := fs.String("state-dir", defaultStateDir(), "supervisor state directory")
 	human := fs.Bool("human", false, "render a concise human-readable response")
+	submissionID := fs.String("submission-id", "", "stable caller-generated identity for safe Run retries")
 	cwd := fs.String("cwd", "", "working directory (defaults to the current directory)")
 	environmentMode := fs.String("environment-mode", "inherit-supervisor", "inherit-supervisor or replace")
 	interactive := fs.Bool("interactive", false, "request a PTY/ConPTY")
@@ -120,6 +125,10 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	argv := fs.Args()
 	if len(argv) == 0 {
 		fmt.Fprintln(stderr, "run requires an executable; use: jinushi run [options] -- executable [args...]")
+		return 2
+	}
+	if *submissionID == "" || len(*submissionID) > 128 {
+		fmt.Fprintln(stderr, "run requires --submission-id between 1 and 128 bytes")
 		return 2
 	}
 	if *lifetime != "detached" && *lifetime != "lease-bound" {
@@ -179,7 +188,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		ParentRunID: *parent,
 		Correlation: labels,
 	}
-	response, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "run", Spec: &spec}, *human, stdout, stderr, false)
+	response, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "run", SubmissionID: *submissionID, Spec: &spec}, *human, stdout, stderr, false)
 	if code != 0 || !*wait {
 		return code
 	}
@@ -219,6 +228,21 @@ func idCommand(ctx context.Context, op string, args []string, stdout, stderr io.
 	if op == "await" {
 		return awaitAccepted(ctx, *stateDir, request.RunID, *human, stdout, stderr)
 	}
+	_, code := requestAndRender(ctx, *stateDir, request, *human, stdout, stderr, false)
+	return code
+}
+
+func controlIDCommand(ctx context.Context, op string, args []string, stdout, stderr io.Writer) int {
+	fs, stateDir, human := commonFlags(op, args, stderr)
+	requestID := fs.String("request-id", "", "stable identity for retrying this physical mutation")
+	expectedGeneration := fs.Uint64("expected-generation", 0, "current Run generation from inspect")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if len(fs.Args()) != 1 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
+		return usageError(stderr, fmt.Sprintf("%s requires a Run ID, --request-id, and positive --expected-generation", op))
+	}
+	request := protocol.Request{Op: op, RunID: fs.Arg(0), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}
 	_, code := requestAndRender(ctx, *stateDir, request, *human, stdout, stderr, false)
 	return code
 }
@@ -410,13 +434,15 @@ func writeNDJSON(w io.Writer, value any) error {
 
 func closeInputCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs, stateDir, human := commonFlags("close-input", args, stderr)
+	requestID := fs.String("request-id", "", "stable identity for retrying this physical mutation")
+	expectedGeneration := fs.Uint64("expected-generation", 0, "current Run generation from inspect")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if len(fs.Args()) != 1 {
-		return usageError(stderr, "close-input requires one Run ID")
+	if len(fs.Args()) != 1 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
+		return usageError(stderr, "close-input requires a Run ID, --request-id, and positive --expected-generation")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "close-input", RunID: fs.Arg(0)}, *human, stdout, stderr, false)
+	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "close-input", RunID: fs.Arg(0), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr, false)
 	return code
 }
 
@@ -508,9 +534,22 @@ func attachCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintln(stderr, "attach response did not include an attachment ID")
 		return 1
 	}
+	if response.Run == nil || response.Run.Generation == 0 {
+		fmt.Fprintln(stderr, "attach response did not include the current Run generation")
+		return 1
+	}
 	defer detachAttachment(ctx, *stateDir, runID, response.AttachID, stderr)
 	if termRows > 0 && termCols > 0 {
-		resize, err := ipc.Call(ctx, *stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: response.AttachID, Rows: termRows, Cols: termCols})
+		if response.Run == nil || response.Run.Generation == 0 {
+			fmt.Fprintln(stderr, "attach response did not include the current Run generation")
+			return 1
+		}
+		requestID, err := newControlRequestID()
+		if err != nil {
+			fmt.Fprintf(stderr, "resize identity: %v\n", err)
+			return 1
+		}
+		resize, err := ipc.Call(ctx, *stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: response.AttachID, Rows: termRows, Cols: termCols, RequestID: requestID, ExpectedGeneration: response.Run.Generation})
 		if err != nil {
 			fmt.Fprintf(stderr, "resize: %v\n", err)
 			return 1
@@ -518,6 +557,9 @@ func attachCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		if resize.Error != nil {
 			fmt.Fprintf(stderr, "resize: %s: %s\n", resize.Error.Code, resize.Error.Message)
 			return 1
+		}
+		if resize.Run != nil {
+			response.Run = resize.Run
 		}
 	}
 	return attachLoop(ctx, *stateDir, runID, response.AttachID, *human, stdinReader{}, stdout, stderr, response.Run, terminal && termRows > 0 && termCols > 0)
@@ -531,8 +573,13 @@ func (stdinReader) Read(p []byte) (int, error) { return os.Stdin.Read(p) }
 func attachLoop(ctx context.Context, stateDir, runID, attachID string, human bool, stdin io.Reader, stdout, stderr io.Writer, initial *model.Run, terminal bool) int {
 	attachCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var controlGeneration atomic.Uint64
+	var controlSendMu sync.Mutex
+	if initial != nil {
+		controlGeneration.Store(initial.Generation)
+	}
 	if terminal {
-		go watchTerminalResize(attachCtx, stateDir, runID, attachID, stderr)
+		go watchTerminalResize(attachCtx, stateDir, runID, attachID, &controlGeneration, &controlSendMu, stderr)
 	}
 	inputDone := make(chan struct{})
 	detachRequested := make(chan struct{})
@@ -549,8 +596,18 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 					close(detachRequested)
 				}
 				if len(input) > 0 {
-					request := protocol.Request{Op: "input", RunID: runID, AttachID: attachID, Stream: "pty", Data: base64.StdEncoding.EncodeToString(input)}
+					requestID, err := newControlRequestID()
+					if err != nil {
+						fmt.Fprintf(stderr, "attach input identity: %v\n", err)
+						return
+					}
+					controlSendMu.Lock()
+					request := protocol.Request{Op: "input", RunID: runID, AttachID: attachID, Stream: "pty", Data: base64.StdEncoding.EncodeToString(input), RequestID: requestID, ExpectedGeneration: controlGeneration.Load()}
 					response, callErr := ipc.Call(attachCtx, stateDir, request)
+					if response.Run != nil {
+						updateControlGeneration(&controlGeneration, response.Run.Generation)
+					}
+					controlSendMu.Unlock()
 					if callErr != nil {
 						if attachCtx.Err() == nil {
 							fmt.Fprintf(stderr, "attach input: %v\n", callErr)
@@ -601,6 +658,9 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 			fmt.Fprintf(stderr, "output history gap; retained output starts at byte %d\n", response.RetainedFrom)
 			offset = int64(response.RetainedFrom)
 		}
+		if response.Run != nil {
+			updateControlGeneration(&controlGeneration, response.Run.Generation)
+		}
 		data, err := base64.StdEncoding.DecodeString(response.Data)
 		if err != nil {
 			fmt.Fprintf(stderr, "decode PTY output: %v\n", err)
@@ -636,6 +696,9 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 			}
 			return 0
 		}
+		if inspection.Run != nil {
+			updateControlGeneration(&controlGeneration, inspection.Run.Generation)
+		}
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-attachCtx.Done():
@@ -650,6 +713,14 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 		case <-timer.C:
 		}
 	}
+}
+
+func newControlRequestID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
 }
 
 func detachAttachment(ctx context.Context, stateDir, runID, attachID string, stderr io.Writer) {
@@ -667,7 +738,15 @@ func detachAttachment(ctx context.Context, stateDir, runID, attachID string, std
 	}
 }
 
-func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, stderr io.Writer) {
+func updateControlGeneration(generation *atomic.Uint64, value uint64) {
+	for current := generation.Load(); value > current; current = generation.Load() {
+		if generation.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
+func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, generation *atomic.Uint64, sendMu *sync.Mutex, stderr io.Writer) {
 	rows, cols, ok := terminalDimensions(os.Stdin)
 	if !ok {
 		return
@@ -684,7 +763,17 @@ func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, 
 		if !valid || (newRows == rows && newCols == cols) {
 			continue
 		}
-		response, err := ipc.Call(ctx, stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: attachID, Rows: newRows, Cols: newCols})
+		requestID, err := newControlRequestID()
+		if err != nil {
+			fmt.Fprintf(stderr, "resize identity: %v\n", err)
+			return
+		}
+		sendMu.Lock()
+		response, err := ipc.Call(ctx, stateDir, protocol.Request{Op: "resize", RunID: runID, AttachID: attachID, Rows: newRows, Cols: newCols, RequestID: requestID, ExpectedGeneration: generation.Load()})
+		if response.Run != nil {
+			updateControlGeneration(generation, response.Run.Generation)
+		}
+		sendMu.Unlock()
 		if err != nil {
 			if ctx.Err() == nil {
 				fmt.Fprintf(stderr, "resize: %v\n", err)
@@ -701,13 +790,15 @@ func watchTerminalResize(ctx context.Context, stateDir, runID, attachID string, 
 
 func signalCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs, stateDir, human := commonFlags("signal", args, stderr)
+	requestID := fs.String("request-id", "", "stable identity for retrying this physical mutation")
+	expectedGeneration := fs.Uint64("expected-generation", 0, "current Run generation from inspect")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if len(fs.Args()) != 2 {
-		return usageError(stderr, "signal requires a Run ID and signal name")
+	if len(fs.Args()) != 2 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
+		return usageError(stderr, "signal requires a Run ID, signal name, --request-id, and positive --expected-generation")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "signal", RunID: fs.Arg(0), Signal: fs.Arg(1)}, *human, stdout, stderr, false)
+	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "signal", RunID: fs.Arg(0), Signal: fs.Arg(1), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr, false)
 	return code
 }
 
@@ -743,13 +834,15 @@ func leaseCommand(ctx context.Context, args []string, stdout, stderr io.Writer) 
 func inputCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs, stateDir, human := commonFlags("input", args, stderr)
 	stream := fs.String("stream", "stdin", "stdin or pty")
+	requestID := fs.String("request-id", "", "stable identity for retrying this physical mutation")
+	expectedGeneration := fs.Uint64("expected-generation", 0, "current Run generation from inspect")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if len(fs.Args()) != 2 {
-		return usageError(stderr, "input requires a Run ID and text")
+	if len(fs.Args()) != 2 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
+		return usageError(stderr, "input requires a Run ID, text, --request-id, and positive --expected-generation")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "input", RunID: fs.Arg(0), Stream: *stream, Data: base64.StdEncoding.EncodeToString([]byte(fs.Arg(1)))}, *human, stdout, stderr, false)
+	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "input", RunID: fs.Arg(0), Stream: *stream, Data: base64.StdEncoding.EncodeToString([]byte(fs.Arg(1))), RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr, false)
 	return code
 }
 
@@ -757,13 +850,15 @@ func resizeCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	fs, stateDir, human := commonFlags("resize", args, stderr)
 	rows := fs.Int("rows", 0, "terminal rows")
 	cols := fs.Int("cols", 0, "terminal columns")
+	requestID := fs.String("request-id", "", "stable identity for retrying this physical mutation")
+	expectedGeneration := fs.Uint64("expected-generation", 0, "current Run generation from inspect")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if len(fs.Args()) != 1 || *rows <= 0 || *cols <= 0 {
-		return usageError(stderr, "resize requires a Run ID plus positive --rows and --cols")
+	if len(fs.Args()) != 1 || *rows <= 0 || *cols <= 0 || *requestID == "" || len(*requestID) > 128 || *expectedGeneration == 0 {
+		return usageError(stderr, "resize requires a Run ID, positive --rows and --cols, --request-id, and positive --expected-generation")
 	}
-	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "resize", RunID: fs.Arg(0), Rows: *rows, Cols: *cols}, *human, stdout, stderr, false)
+	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "resize", RunID: fs.Arg(0), Rows: *rows, Cols: *cols, RequestID: *requestID, ExpectedGeneration: *expectedGeneration}, *human, stdout, stderr, false)
 	return code
 }
 

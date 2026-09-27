@@ -49,14 +49,14 @@ func TestRunForwardsArgumentBoundaries(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Main(context.Background(), []string{
-		"run", "--state-dir", stateDir, "--cwd", workDir, "--",
+		"run", "--state-dir", stateDir, "--submission-id", "caller-run-1", "--cwd", workDir, "--",
 		"program name", "two words", "$(do-not-run)", "",
 	}, &stdout, &stderr, nil)
 	if code != 0 {
 		t.Fatalf("Main exit = %d; stderr=%s", code, stderr.String())
 	}
 	request := <-requestReceived
-	if request.Op != "run" || request.Spec == nil {
+	if request.Op != "run" || request.Spec == nil || request.SubmissionID != "caller-run-1" {
 		t.Fatalf("unexpected request: %#v", request)
 	}
 	want := []string{"program name", "two words", "$(do-not-run)", ""}
@@ -207,7 +207,7 @@ func TestAttachLoopStreamsPTYBytesWithoutControlJSON(t *testing.T) {
 		}
 	})
 	var stdout, stderr bytes.Buffer
-	initial := &model.Run{ID: "run_test", Spec: model.RunSpec{Interactive: true}}
+	initial := &model.Run{ID: "run_test", Generation: 1, Spec: model.RunSpec{Interactive: true}}
 	code := attachLoop(context.Background(), stateDir, "run_test", "attach_test", false, strings.NewReader(""), &stdout, &stderr, initial, false)
 	if code != 0 {
 		t.Fatalf("attachLoop exit = %d; stderr=%s", code, stderr.String())
@@ -230,7 +230,7 @@ func TestAttachLoopReturnsFailureForUncertainRun(t *testing.T) {
 		}
 	})
 	var stdout, stderr bytes.Buffer
-	initial := &model.Run{ID: "run_uncertain", Spec: model.RunSpec{Interactive: true}}
+	initial := &model.Run{ID: "run_uncertain", Generation: 1, Spec: model.RunSpec{Interactive: true}}
 	code := attachLoop(context.Background(), stateDir, initial.ID, "attach_test", false, strings.NewReader(""), &stdout, &stderr, initial, false)
 	if code != 1 || !strings.Contains(stderr.String(), "uncertain") {
 		t.Fatalf("attachLoop exit=%d stderr=%q", code, stderr.String())
@@ -343,13 +343,47 @@ func TestCloseInputUsesRunIdentity(t *testing.T) {
 		return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running}}
 	})
 	var stdout, stderr bytes.Buffer
-	code := Main(context.Background(), []string{"close-input", "--state-dir", stateDir, "run_test"}, &stdout, &stderr, nil)
+	code := Main(context.Background(), []string{"close-input", "--state-dir", stateDir, "--request-id", "close-1", "--expected-generation", "3", "run_test"}, &stdout, &stderr, nil)
 	if code != 0 {
 		t.Fatalf("close-input exit = %d; stderr=%s", code, stderr.String())
 	}
 	request := <-requestReceived
-	if request.Op != "close-input" || request.RunID != "run_test" {
+	if request.Op != "close-input" || request.RunID != "run_test" || request.RequestID != "close-1" || request.ExpectedGeneration != 3 {
 		t.Fatalf("unexpected close-input request: %#v", request)
+	}
+}
+
+func TestPhysicalControlCommandsForwardRetryIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		op   string
+	}{
+		{name: "input", args: []string{"input", "--request-id", "retry-1", "--expected-generation", "5", "run_test", "bytes"}, op: "input"},
+		{name: "signal", args: []string{"signal", "--request-id", "retry-1", "--expected-generation", "5", "run_test", "USR1"}, op: "signal"},
+		{name: "cancel", args: []string{"cancel", "--request-id", "retry-1", "--expected-generation", "5", "run_test"}, op: "cancel"},
+		{name: "resize", args: []string{"resize", "--request-id", "retry-1", "--expected-generation", "5", "--rows", "24", "--cols", "80", "run_test"}, op: "resize"},
+		{name: "close-input", args: []string{"close-input", "--request-id", "retry-1", "--expected-generation", "5", "run_test"}, op: "close-input"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			requestReceived := make(chan protocol.Request, 1)
+			serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+				requestReceived <- request
+				return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running, Generation: 6}}
+			})
+			args := append([]string{tc.args[0], "--state-dir", stateDir}, tc.args[1:]...)
+			var stdout, stderr bytes.Buffer
+			code := Main(context.Background(), args, &stdout, &stderr, nil)
+			if code != 0 {
+				t.Fatalf("%s exit=%d stderr=%s", tc.name, code, stderr.String())
+			}
+			request := <-requestReceived
+			if request.Op != tc.op || request.RunID != "run_test" || request.RequestID != "retry-1" || request.ExpectedGeneration != 5 {
+				t.Fatalf("request = %+v", request)
+			}
+		})
 	}
 }
 

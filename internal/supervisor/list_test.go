@@ -81,12 +81,12 @@ func TestOversizedAcceptedResponseDoesNotCreateRun(t *testing.T) {
 	}
 	argv = append(argv, strings.Repeat("b", 32000))
 	spec := model.RunSpec{Argv: argv, Cwd: t.TempDir()}
-	request, err := json.Marshal(protocol.Request{Version: model.ProtocolVersion, Op: "run", Spec: &spec})
+	request, err := json.Marshal(protocol.Request{Version: model.ProtocolVersion, Op: "run", SubmissionID: "oversized-run", Spec: &spec})
 	if err != nil || len(request) >= protocol.MaxFrame {
 		t.Fatalf("test request size=%d err=%v", len(request), err)
 	}
 	svc := newService(t.TempDir(), db, frameTestExecutor{}, defaultConfig())
-	resp := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "run", Spec: &spec})
+	resp := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "run", SubmissionID: "oversized-run", Spec: &spec})
 	if resp.Error == nil || resp.Error.Code != "response-too-large" {
 		t.Fatalf("oversized acceptance response=%+v", resp.Error)
 	}
@@ -108,12 +108,12 @@ func TestOversizedGuardianLaunchInputDoesNotCreateRun(t *testing.T) {
 	}
 	set["JINUSHI_TEST_LAST"] = strings.Repeat("y", 31800)
 	spec := model.RunSpec{Argv: []string{"/bin/sh"}, Cwd: t.TempDir(), Environment: model.Environment{Set: set}}
-	request, err := json.Marshal(protocol.Request{Version: model.ProtocolVersion, Op: "run", Spec: &spec})
+	request, err := json.Marshal(protocol.Request{Version: model.ProtocolVersion, Op: "run", SubmissionID: "oversized-launch", Spec: &spec})
 	if err != nil || len(request) >= protocol.MaxFrame {
 		t.Fatalf("test request size=%d err=%v", len(request), err)
 	}
 	svc := newService(t.TempDir(), db, frameTestExecutor{}, defaultConfig())
-	resp := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "run", Spec: &spec})
+	resp := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "run", SubmissionID: "oversized-launch", Spec: &spec})
 	if resp.Error == nil || resp.Error.Code != "response-too-large" {
 		t.Fatalf("oversized launch response=%+v", resp.Error)
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/yohn-jp/jinushi/internal/model"
+	"github.com/yohn-jp/jinushi/internal/protocol"
 	"github.com/yohn-jp/jinushi/internal/store"
 )
 
@@ -60,7 +61,7 @@ func TestFastTerminalImportPreservesPhysicalReceipt(t *testing.T) {
 	s := newFastTerminalService(t, executor)
 	defer s.Close()
 	spec := &model.RunSpec{Argv: []string{"/bin/true"}, Cwd: t.TempDir()}
-	accepted := s.create(spec)
+	accepted := s.create(protocol.Request{SubmissionID: "fast-terminal", Spec: spec})
 	if accepted.Error != nil {
 		t.Fatal(accepted.Error)
 	}
@@ -83,7 +84,7 @@ func TestCloseWaitsForAcceptedStartBeforeClosingStore(t *testing.T) {
 	executor := &fastTerminalExecutor{receipt: model.Receipt{Version: model.ProtocolVersion, Outcome: "exited", FinishedAt: time.Now().UTC(), Cleanup: "complete"}, start: make(chan struct{}), release: make(chan struct{})}
 	s := newFastTerminalService(t, executor)
 	spec := &model.RunSpec{Argv: []string{"/bin/true"}, Cwd: t.TempDir()}
-	accepted := s.create(spec)
+	accepted := s.create(protocol.Request{SubmissionID: "close-race", Spec: spec})
 	if accepted.Error != nil {
 		t.Fatal(accepted.Error)
 	}

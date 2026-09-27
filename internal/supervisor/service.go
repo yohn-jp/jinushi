@@ -82,6 +82,7 @@ type executor interface {
 
 type active struct {
 	mu          sync.Mutex
+	controlMu   sync.Mutex
 	leaseMu     sync.Mutex
 	run         model.Run
 	spec        model.RunSpec
@@ -93,16 +94,17 @@ type active struct {
 }
 
 type Service struct {
-	store     *store.Store
-	backend   executor
-	root      string
-	config    Config
-	mu        sync.RWMutex
-	active    map[string]*active
-	stop      chan struct{}
-	closeOnce sync.Once
-	workers   sync.WaitGroup
-	closing   bool // guarded by mu; also gates workers.Add against Close.Wait
+	store        *store.Store
+	backend      executor
+	root         string
+	config       Config
+	mu           sync.RWMutex
+	submissionMu sync.Mutex
+	active       map[string]*active
+	stop         chan struct{}
+	closeOnce    sync.Once
+	workers      sync.WaitGroup
+	closing      bool // guarded by mu; also gates workers.Add against Close.Wait
 }
 
 func newService(root string, db *store.Store, backend executor, config Config) *Service {
@@ -299,7 +301,7 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 		out.Capabilities = &caps
 		return out
 	case "run":
-		return s.create(req.Spec)
+		return s.create(req)
 	case "list":
 		limit := req.Limit
 		if limit == 0 {
@@ -346,13 +348,13 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 	case "input":
 		return s.input(req)
 	case "close-input":
-		return s.closeInput(req.RunID)
+		return s.closeInput(req)
 	case "resize":
 		return s.resize(req)
 	case "signal":
 		return s.signal(req)
 	case "cancel":
-		return s.cancel(req.RunID, "cancelled")
+		return s.cancel(req)
 	case "lease-renew":
 		return s.renew(req)
 	default:
@@ -360,7 +362,30 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 	}
 }
 
-func (s *Service) create(spec *model.RunSpec) protocol.Response {
+func (s *Service) create(req protocol.Request) protocol.Response {
+	if len(req.SubmissionID) == 0 || len(req.SubmissionID) > store.SubmissionIDMaxBytes {
+		return failure("invalid-request", "submissionId must be between 1 and 128 bytes")
+	}
+	digest, err := acceptedSpecDigest(req.Spec)
+	if err != nil {
+		return failure("invalid-request", "Run specification could not be identified")
+	}
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
+	if existing, found, err := s.store.ResolveSubmission(req.SubmissionID, digest, time.Now().UTC()); err != nil {
+		return submissionStoreFailure(err)
+	} else if found {
+		return acceptedRunResponse(existing)
+	}
+	// Validation applies defaults, so keep them on a per-request copy. A
+	// caller retry can arrive concurrently with the same decoded specification
+	// and must not race while either copy is normalized.
+	var specCopy *model.RunSpec
+	if req.Spec != nil {
+		copy := *req.Spec
+		specCopy = &copy
+	}
+	spec := specCopy
 	if f := validSpec(spec, s.backend.Capabilities(), s.config); f != nil {
 		return protocol.Response{Version: model.ProtocolVersion, Error: f}
 	}
@@ -416,15 +441,32 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 		s.mu.Unlock()
 		return failure("supervisor-closed", "supervisor is closing")
 	}
-	if _, _, err = s.store.Create(run, &model.Event{Kind: model.EventRunAccepted, ObservedAt: now, Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Accepted, Generation: run.Generation}}}); err != nil {
+	created, err := s.store.AcceptSubmission(run, &model.Event{Kind: model.EventRunAccepted, ObservedAt: now, Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Accepted, Generation: run.Generation}}}, req.SubmissionID, digest, now)
+	if err != nil {
 		s.mu.Unlock()
-		return failure("storage-failure", err.Error())
+		return submissionStoreFailure(err)
 	}
+	if !created.Created {
+		s.mu.Unlock()
+		return acceptedRunResponse(created.Run)
+	}
+	run = created.Run
 	a := &active{run: run, spec: *spec, done: make(chan struct{})}
 	s.active[id] = a
 	s.launchLocked(func() { s.start(a) })
 	s.mu.Unlock()
-	return accepted
+	return acceptedRunResponse(run)
+}
+
+func acceptedRunResponse(run model.Run) protocol.Response {
+	out := response()
+	clean := publicRun(run)
+	out.Run = &clean
+	encoded, err := json.Marshal(out)
+	if err != nil || len(encoded) >= protocol.MaxFrame-(300<<10) {
+		return failure("response-too-large", "Run metadata exceeds the IPC response limit")
+	}
+	return out
 }
 
 func (s *Service) transition(a *active, state model.State, kind model.EventKind, details model.RunEventPayload) error {
@@ -1034,126 +1076,93 @@ func (s *Service) lookupActive(id string) (*active, protocol.Response) {
 }
 
 func (s *Service) input(req protocol.Request) protocol.Response {
-	if req.AttachID != "" {
-		if err := s.renewAttachment(req.RunID, req.AttachID); err != nil {
-			return failure("attachment-expired", err.Error())
+	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
+		if invalid := checkAttachmentLocked(a, req.AttachID); invalid != nil {
+			return nil, invalid
 		}
-	}
-	a, out := s.lookupActive(req.RunID)
-	if a == nil {
-		return out
-	}
-	if len(req.Data) > 90000 {
-		return failure("invalid-request", "input too large")
-	}
-	data, err := base64.StdEncoding.DecodeString(req.Data)
-	if err != nil || len(data) > 65536 {
-		return failure("invalid-request", "invalid base64 input")
-	}
-	a.mu.Lock()
-	p := a.process
-	a.mu.Unlock()
-	if p == nil {
-		return failure("backend-failure", "Run not started")
-	}
-	if err := p.WriteInput(data); err != nil {
-		return failure("backend-failure", err.Error())
-	}
-	return response()
+		data, invalid := decodeInput(req)
+		if invalid != nil {
+			return nil, invalid
+		}
+		p := a.process
+		if p == nil {
+			return nil, &protocol.Failure{Code: "backend-failure", Message: "Run not started"}
+		}
+		return func() error { return p.WriteInput(data) }, nil
+	})
 }
 
-func (s *Service) closeInput(id string) protocol.Response {
-	a, out := s.lookupActive(id)
-	if a == nil {
-		return out
-	}
-	a.mu.Lock()
-	interactive := a.run.Spec.Interactive
-	p := a.process
-	a.mu.Unlock()
-	if interactive {
-		return failure("unsupported-capability", "PTY input cannot be half-closed")
-	}
-	if p == nil {
-		return failure("backend-failure", "Run not started")
-	}
-	if err := p.CloseInput(); err != nil {
-		return failure("backend-failure", err.Error())
-	}
-	return response()
+func (s *Service) closeInput(req protocol.Request) protocol.Response {
+	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
+		if a.run.Spec.Interactive {
+			return nil, &protocol.Failure{Code: "unsupported-capability", Message: "PTY input cannot be half-closed"}
+		}
+		p := a.process
+		if p == nil {
+			return nil, &protocol.Failure{Code: "backend-failure", Message: "Run not started"}
+		}
+		return p.CloseInput, nil
+	})
 }
 
 func (s *Service) resize(req protocol.Request) protocol.Response {
-	if req.AttachID != "" {
-		if err := s.renewAttachment(req.RunID, req.AttachID); err != nil {
-			return failure("attachment-expired", err.Error())
+	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
+		if invalid := checkAttachmentLocked(a, req.AttachID); invalid != nil {
+			return nil, invalid
 		}
-	}
-	a, out := s.lookupActive(req.RunID)
-	if a == nil {
-		return out
-	}
-	if req.Rows < 1 || req.Cols < 1 || req.Rows > 65535 || req.Cols > 65535 {
-		return failure("invalid-request", "invalid terminal size")
-	}
-	a.mu.Lock()
-	p := a.process
-	a.mu.Unlock()
-	if p == nil {
-		return failure("backend-failure", "Run not started")
-	}
-	if err := p.Resize(uint16(req.Rows), uint16(req.Cols)); err != nil {
-		return failure("unsupported-capability", err.Error())
-	}
-	return response()
+		if req.Rows < 1 || req.Cols < 1 || req.Rows > 65535 || req.Cols > 65535 {
+			return nil, &protocol.Failure{Code: "invalid-request", Message: "invalid terminal size"}
+		}
+		p := a.process
+		if p == nil {
+			return nil, &protocol.Failure{Code: "backend-failure", Message: "Run not started"}
+		}
+		return func() error { return p.Resize(uint16(req.Rows), uint16(req.Cols)) }, nil
+	})
 }
 
 func (s *Service) signal(req protocol.Request) protocol.Response {
-	allowed := false
-	for _, name := range s.backend.Capabilities().Signals {
-		if req.Signal == name {
-			allowed = true
-			break
+	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
+		allowed := false
+		for _, name := range s.backend.Capabilities().Signals {
+			if req.Signal == name {
+				allowed = true
+				break
+			}
 		}
-	}
-	if !allowed {
-		return failure("invalid-request", "signal is not supported by this backend")
-	}
-	a, out := s.lookupActive(req.RunID)
-	if a == nil {
-		return out
-	}
-	a.mu.Lock()
-	p := a.process
-	a.mu.Unlock()
-	if p == nil {
-		return failure("backend-failure", "Run not started")
-	}
-	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: model.EventSignalRequested, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Signal: &model.SignalEventPayload{Signal: req.Signal}}}); err != nil {
-		return failure("storage-failure", err.Error())
-	}
-	if err := p.Signal(req.Signal); err != nil {
-		return failure("backend-failure", err.Error())
-	}
-	if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: model.EventSignalDelivered, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Signal: &model.SignalEventPayload{Signal: req.Signal}}}); err != nil {
-		return failure("storage-failure", err.Error())
-	}
-	return response()
+		if !allowed {
+			return nil, &protocol.Failure{Code: "invalid-request", Message: "signal is not supported by this backend"}
+		}
+		p := a.process
+		if p == nil {
+			return nil, &protocol.Failure{Code: "backend-failure", Message: "Run not started"}
+		}
+		return func() error {
+			if _, err := s.store.AppendEvent(req.RunID, model.Event{Kind: model.EventSignalRequested, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Signal: &model.SignalEventPayload{Signal: req.Signal}}}); err != nil {
+				return err
+			}
+			if err := p.Signal(req.Signal); err != nil {
+				return err
+			}
+			_, err := s.store.AppendEvent(req.RunID, model.Event{Kind: model.EventSignalDelivered, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Signal: &model.SignalEventPayload{Signal: req.Signal}}})
+			return err
+		}, nil
+	})
 }
 
-func (s *Service) cancel(id, reason string) protocol.Response {
-	a, out := s.lookupActive(id)
-	if a == nil {
-		return out
-	}
-	p, err := s.requestTermination(a, reason)
-	if err != nil {
-		return failure("storage-failure", err.Error())
-	}
-	if p != nil {
-		s.launch(func() { s.driveTermination(a, p) })
-	}
-	return response()
+func (s *Service) cancel(req protocol.Request) protocol.Response {
+	return s.mutateControl(req, func(a *active) (func() error, *protocol.Failure) {
+		return func() error {
+			p, err := s.requestTermination(a, "cancelled")
+			if err != nil {
+				return err
+			}
+			if p != nil && !s.launch(func() { s.driveTermination(a, p) }) {
+				return errors.New("supervisor is closing")
+			}
+			return nil
+		}, nil
+	})
 }
 
 func (s *Service) requestTermination(a *active, reason string) (physical, error) {
@@ -1224,6 +1233,8 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	if req.LeaseMs < 1000 || req.LeaseMs > s.config.MaxWallTimeMs {
 		return failure("invalid-request", "invalid lease duration")
 	}
+	a.controlMu.Lock()
+	defer a.controlMu.Unlock()
 	a.leaseMu.Lock()
 	defer a.leaseMu.Unlock()
 	a.mu.Lock()
@@ -1269,6 +1280,7 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	}
 	next := a.run
 	setLeaseState(&next, lease)
+	next.Generation++
 	a.run = next
 	if _, err := s.store.Update(next, &model.Event{Kind: model.EventLeaseRenewed, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{Lease: &model.LeaseEventPayload{Generation: lease.generation, ExpiresAt: lease.expiry}}}); err != nil {
 		s.launch(func() { s.markUncertain(a, "lease renewal durability failed") })
