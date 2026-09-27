@@ -11,8 +11,8 @@ import (
 )
 
 // Config is supervisor-owned safety policy loaded from stateDir/config.json.
-// A missing file uses deterministic defaults. Zero is invalid for every field
-// so a partial JSON file retains the default for omitted fields.
+// A missing file uses deterministic defaults. Zero disables optional host
+// envelope ceilings; other zero fields retain their defaults in partial JSON.
 type Config struct {
 	SampleIntervalMs    int64 `json:"sampleIntervalMs"`
 	TerminationGraceMs  int64 `json:"terminationGraceMs"`
@@ -22,6 +22,9 @@ type Config struct {
 	MaxMemoryBytes      int64 `json:"maxMemoryBytes"`
 	MaxProcessCount     int64 `json:"maxProcessCount"`
 	MaxTaskCount        int64 `json:"maxTaskCount"`
+	HostMemoryBytes     int64 `json:"hostMemoryBytes"`
+	HostTaskCount       int64 `json:"hostTaskCount"`
+	MaxActiveRuns       int64 `json:"maxActiveRuns"`
 	EventRetentionCount int   `json:"eventRetentionCount"`
 	EventRetentionBytes int64 `json:"eventRetentionBytes"`
 }
@@ -76,6 +79,9 @@ func loadConfig(root string) (Config, error) {
 	}
 	if config.MaxMemoryBytes < 1 || config.MaxProcessCount < 1 || config.MaxTaskCount < 1 {
 		return Config{}, errors.New("invalid resource safety ceilings")
+	}
+	if config.HostMemoryBytes < 0 || config.HostTaskCount < 0 || config.MaxActiveRuns < 0 {
+		return Config{}, errors.New("host safety ceilings must be non-negative")
 	}
 	if config.EventRetentionCount < 16 || config.EventRetentionCount > 1000000 || config.EventRetentionBytes < 256<<10 || config.EventRetentionBytes > 1<<30 {
 		return Config{}, errors.New("invalid event retention bounds")

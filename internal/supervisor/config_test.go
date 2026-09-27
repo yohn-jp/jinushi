@@ -17,19 +17,22 @@ func TestLoadConfigDefaultsAndBounds(t *testing.T) {
 		t.Fatalf("invalid defaults: %+v", defaults)
 	}
 	path := filepath.Join(root, "config.json")
-	if err := os.WriteFile(path, []byte(`{"sampleIntervalMs":100,"maxOutputBytes":2097152}`), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"sampleIntervalMs":100,"maxOutputBytes":2097152,"hostMemoryBytes":1073741824,"hostTaskCount":128,"maxActiveRuns":8}`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	configured, err := loadConfig(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if configured.SampleIntervalMs != 100 || configured.MaxOutputBytes != 2097152 || configured.TerminationGraceMs != defaults.TerminationGraceMs {
+	if configured.SampleIntervalMs != 100 || configured.MaxOutputBytes != 2097152 || configured.TerminationGraceMs != defaults.TerminationGraceMs || configured.HostMemoryBytes != 1073741824 || configured.HostTaskCount != 128 || configured.MaxActiveRuns != 8 {
 		t.Fatalf("partial config was not applied with defaults: %+v", configured)
 	}
 	for _, document := range []string{
 		`{"sampleIntervalMs":0}`,
 		`{"maxOutputBytes":1024}`,
+		`{"hostMemoryBytes":-1}`,
+		`{"hostTaskCount":-1}`,
+		`{"maxActiveRuns":-1}`,
 		`{"unrecognized":1}`,
 		`{"sampleIntervalMs":100} {"sampleIntervalMs":200}`,
 	} {
