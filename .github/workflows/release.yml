@@ -1,0 +1,18 @@
+name: Go development release
+
+# Managed by yohn-jp/.github after Jinushi joins the organization sync target.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release:
+    uses: yohn-jp/.github/.github/workflows/go-release.yml@main
+    with:
+      binary-name: jinushi
+      build-target: ./cmd/jinushi
+    permissions:
+      actions: read
+      contents: write
