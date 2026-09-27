@@ -154,6 +154,95 @@ func TestWriterLeaseExpiryAllowsReconnectAndRejectsOldToken(t *testing.T) {
 	}
 }
 
+func TestWriterLeaseClearRun(t *testing.T) {
+	manager, _ := newTestWriterLeaseManager(t, time.Minute)
+	lease, err := manager.Acquire("run_1", "att_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.ClearRun("run_1")
+	manager.ClearRun("run_1")
+	if err := manager.Validate("run_1", lease.Token); !errors.Is(err, ErrWriterStale) {
+		t.Fatalf("cleared-token validation error = %v, want stale", err)
+	}
+	if _, err := manager.Acquire("run_1", "att_2"); err != nil {
+		t.Fatalf("acquire after Run cleanup: %v", err)
+	}
+}
+
+func TestWriterLeaseHandoffWaitsForValidatedMutation(t *testing.T) {
+	manager, _ := newTestWriterLeaseManager(t, time.Minute)
+	lease, err := manager.Acquire("run_1", "att_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutationEntered := make(chan struct{})
+	finishMutation := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- manager.WithValidatedWriter("run_1", lease.Token, func() error {
+			close(mutationEntered)
+			<-finishMutation
+			return nil
+		})
+	}()
+	<-mutationEntered
+
+	// The gate must retain the manager lock for the entire physical mutation,
+	// preventing detach/reconnect from handing ownership to another writer.
+	if manager.mu.TryLock() {
+		manager.mu.Unlock()
+		t.Fatal("writer lock was released while physical mutation was in progress")
+	}
+	detachStarted := make(chan struct{})
+	detachDone := make(chan struct{})
+	go func() {
+		close(detachStarted)
+		manager.Detach("run_1", "att_old")
+		close(detachDone)
+	}()
+	<-detachStarted
+	select {
+	case <-detachDone:
+		t.Fatal("detach completed before the validated mutation returned")
+	default:
+	}
+
+	close(finishMutation)
+	if err := <-mutationDone; err != nil {
+		t.Fatalf("validated mutation: %v", err)
+	}
+	<-detachDone
+	newLease, err := manager.Acquire("run_1", "att_new")
+	if err != nil {
+		t.Fatalf("acquire after serialized detach: %v", err)
+	}
+	if err := manager.Validate("run_1", lease.Token); !errors.Is(err, ErrWriterStale) {
+		t.Fatalf("previous token after handoff = %v, want stale", err)
+	}
+	if err := manager.Validate("run_1", newLease.Token); err != nil {
+		t.Fatalf("new writer token after handoff: %v", err)
+	}
+}
+
+func TestWriterLeaseGateDoesNotRunStaleMutation(t *testing.T) {
+	manager, _ := newTestWriterLeaseManager(t, time.Minute)
+	called := false
+	if err := manager.WithValidatedWriter("run_1", "stale", func() error {
+		called = true
+		return nil
+	}); !errors.Is(err, ErrWriterStale) {
+		t.Fatalf("stale writer gate error = %v, want stale", err)
+	}
+	if called {
+		t.Fatal("stale writer mutation was called")
+	}
+	if err := manager.WithValidatedWriter("run_1", "token", nil); !errors.Is(err, ErrWriterMutationRequired) {
+		t.Fatalf("nil writer mutation error = %v, want mutation-required", err)
+	}
+}
+
 func TestWriterLeaseRequiresRunAndAttachmentIdentity(t *testing.T) {
 	manager, _ := newTestWriterLeaseManager(t, time.Minute)
 	if _, err := manager.Acquire("", "att"); !errors.Is(err, ErrWriterIdentityRequired) {

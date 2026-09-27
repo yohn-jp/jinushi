@@ -19,6 +19,8 @@ var (
 	ErrWriterTokenRequired = errors.New("interactive writer token is required")
 	// ErrWriterIdentityRequired means a Run or attachment identity was omitted.
 	ErrWriterIdentityRequired = errors.New("Run and attachment identities are required")
+	// ErrWriterMutationRequired means a validated writer operation omitted its mutation.
+	ErrWriterMutationRequired = errors.New("writer mutation is required")
 )
 
 const (
@@ -141,8 +143,10 @@ func (m *WriterLeaseManager) Release(runID, attachmentID, token string) error {
 	return nil
 }
 
-// Validate is called before every physical input, resize, or close-input
-// mutation. It does not renew the lease; renewal is an explicit operation.
+// Validate checks the current lease without renewing it. It is suitable for a
+// non-mutating preflight; physical input, resize, and close-input operations
+// should use WithValidatedWriter so ownership cannot change between validation
+// and the physical side effect.
 func (m *WriterLeaseManager) Validate(runID, token string) error {
 	if runID == "" {
 		return ErrWriterIdentityRequired
@@ -160,6 +164,30 @@ func (m *WriterLeaseManager) Validate(runID, token string) error {
 	return nil
 }
 
+// WithValidatedWriter verifies the current token and holds the manager lock
+// until mutation returns. This makes writer validation and the physical side
+// effect one serialized operation relative to acquire, renew, release, detach,
+// expiry, and Run cleanup. The callback must not call this manager.
+func (m *WriterLeaseManager) WithValidatedWriter(runID, token string, mutation func() error) error {
+	if runID == "" {
+		return ErrWriterIdentityRequired
+	}
+	if token == "" {
+		return ErrWriterTokenRequired
+	}
+	if mutation == nil {
+		return ErrWriterMutationRequired
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, ok := m.currentLocked(runID, m.now())
+	if !ok || !sameWriterToken(current.token, token) {
+		return ErrWriterStale
+	}
+	return mutation()
+}
+
 // Detach releases the writer lease, if any, held by attachmentID. It is safe
 // to call this for read-only attachments and does not affect the Run lifetime.
 func (m *WriterLeaseManager) Detach(runID, attachmentID string) {
@@ -172,6 +200,17 @@ func (m *WriterLeaseManager) Detach(runID, attachmentID string) {
 	if ok && current.attachmentID == attachmentID {
 		delete(m.leases, runID)
 	}
+}
+
+// ClearRun removes any writer lease for a Run that has become terminal or
+// uncertain. It is idempotent and does not affect the Run itself.
+func (m *WriterLeaseManager) ClearRun(runID string) {
+	if runID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.leases, runID)
 }
 
 // SweepExpired removes expired writer leases and returns the number removed.
