@@ -295,6 +295,17 @@ func TestTelemetryRejectsMissingStatusAndMalformedProcessIdentity(t *testing.T) 
 	if _, err := db.AppendTelemetry(run.ID, badIdentity); !errors.Is(err, ErrInvalidTelemetry) {
 		t.Fatalf("bad process identity error = %v, want ErrInvalidTelemetry", err)
 	}
+	exitAt := time.Now().UTC()
+	exitEvidence := testTelemetrySample(exitAt, 0, 0)
+	exitEvidence.ProcessChanges = []model.ProcessEvidenceChange{{
+		ObservedAt:         exitAt,
+		Kind:               model.ProcessExited,
+		Process:            model.ProcessIdentity{PID: 18, StartTimeTicks: 55},
+		PreviousMembership: model.ProcessMembershipOwned,
+	}}
+	if _, err := db.AppendTelemetry(run.ID, exitEvidence); err != nil {
+		t.Fatalf("exit evidence with last membership rejected: %v", err)
+	}
 }
 
 func TestTelemetryAggregateRetainsUnavailableAndUnsupportedCounts(t *testing.T) {

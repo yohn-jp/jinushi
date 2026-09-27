@@ -497,11 +497,11 @@ func validateTelemetrySample(sample model.TelemetrySample, options TelemetryOpti
 		}
 		switch change.Kind {
 		case model.ProcessStarted:
-			if !validMembership(change.Membership) {
+			if !validMembership(change.Membership) || change.PreviousMembership != "" {
 				return ErrInvalidTelemetry
 			}
 		case model.ProcessExited:
-			if change.Membership != "" || change.PreviousMembership != "" {
+			if change.Membership != "" || change.PreviousMembership != "" && !validMembership(change.PreviousMembership) {
 				return ErrInvalidTelemetry
 			}
 		case model.ProcessMembershipChanged:
