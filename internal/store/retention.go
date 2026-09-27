@@ -256,9 +256,9 @@ func (s *Store) Usage() (Usage, error) {
 					return err
 				}
 				usage.TerminalEvidenceBytes += bytes
-			case "submissions", "submission-runs", "submission-expiry":
+			case submissionsBucketName, submissionRunsBucketName, submissionExpiryBucketName:
 				usage.SubmissionBytes += bytes
-			case "control-requests", "control-request-expiry":
+			case controlRequestsBucketName, controlRequestExpiryBucket:
 				usage.ControlRequestBytes += bytes
 			case "watch-index":
 				usage.WatchIndexBytes = bytes
@@ -270,14 +270,14 @@ func (s *Store) Usage() (Usage, error) {
 				}
 			}
 		}
-		if submissions := tx.Bucket([]byte("submissions")); submissions != nil {
+		if submissions := tx.Bucket([]byte(submissionsBucketName)); submissions != nil {
 			if err := submissions.ForEach(func(_, raw []byte) error {
 				if raw == nil {
 					return nil
 				}
-				var binding submissionRetentionRecord
-				if err := json.Unmarshal(raw, &binding); err != nil {
-					return fmt.Errorf("decode submission binding for usage: %w", err)
+				binding, err := decodeSubmissionBinding(raw)
+				if err != nil {
+					return err
 				}
 				if !binding.ExpiresAt.IsZero() && !binding.ExpiresAt.After(time.Now()) {
 					usage.ExpiredBindingCount++
@@ -309,14 +309,6 @@ func (s *Store) Usage() (Usage, error) {
 	}
 	usage.DatabaseBytes = info.Size()
 	return usage, nil
-}
-
-type submissionRetentionRecord struct {
-	RunID        string     `json:"runId"`
-	SpecDigest   string     `json:"specDigest"`
-	CreatedAt    time.Time  `json:"createdAt"`
-	ExpiresAt    time.Time  `json:"expiresAt"`
-	CollectedRun *model.Run `json:"collectedRun,omitempty"`
 }
 
 func txBucketNames(tx *bolt.Tx) []string {
@@ -391,8 +383,8 @@ func runEvidenceBytesTx(tx *bolt.Tx, runID string) (int64, error) {
 func isGlobalRetentionBucket(name string) bool {
 	switch name {
 	case tombstonesBucketName, retentionBucketName,
-		"submissions", "submission-runs", "submission-expiry",
-		"control-requests", "control-request-expiry", "watch-index", "idempotency":
+		submissionsBucketName, submissionRunsBucketName, submissionExpiryBucketName,
+		controlRequestsBucketName, controlRequestExpiryBucket, "watch-index", "idempotency":
 		return true
 	default:
 		return false
@@ -401,7 +393,7 @@ func isGlobalRetentionBucket(name string) bool {
 
 func submissionReplayStubBytesTx(tx *bolt.Tx) (int64, error) {
 	var total int64
-	submissions := tx.Bucket([]byte("submissions"))
+	submissions := tx.Bucket([]byte(submissionsBucketName))
 	if submissions == nil {
 		return 0, nil
 	}
@@ -409,9 +401,9 @@ func submissionReplayStubBytesTx(tx *bolt.Tx) (int64, error) {
 		if raw == nil {
 			return nil
 		}
-		var binding submissionRetentionRecord
-		if err := json.Unmarshal(raw, &binding); err != nil {
-			return fmt.Errorf("decode submission replay stub: %w", err)
+		binding, err := decodeSubmissionBinding(raw)
+		if err != nil {
+			return err
 		}
 		if binding.CollectedRun == nil {
 			return nil
@@ -430,27 +422,6 @@ func submissionReplayStubBytesTx(tx *bolt.Tx) (int64, error) {
 		return nil
 	})
 	return total, err
-}
-
-func collectedRunSnapshot(run model.Run) model.Run {
-	receipt := compactTerminalReceipt(run.Receipt)
-	finishedAt := run.FinishedAt
-	if finishedAt == nil {
-		copy := receipt.FinishedAt
-		finishedAt = &copy
-	}
-	var startedAt *time.Time
-	if run.StartedAt != nil {
-		copy := *run.StartedAt
-		startedAt = &copy
-	}
-	return model.Run{
-		ID: run.ID, State: model.Terminal, Generation: run.Generation,
-		CreatedAt: run.CreatedAt, StartedAt: startedAt, FinishedAt: finishedAt,
-		Resources: receipt.Resources, Output: receipt.Output,
-		EffectiveCapabilities: receipt.EffectiveCapabilities,
-		Receipt:               &receipt, TerminationReason: run.TerminationReason, ResourceGap: true,
-	}
 }
 
 func compactTerminalReceipt(original *model.Receipt) model.Receipt {

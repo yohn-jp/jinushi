@@ -2,7 +2,6 @@ package store
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -63,6 +62,16 @@ func TestCollectTerminalBoundsCountAndLeavesExplicitTombstone(t *testing.T) {
 		len(tombstone.Reasons) != 1 || tombstone.Reasons[0] != EvictionTerminalCount {
 		t.Fatalf("eviction tombstone = %#v", tombstone)
 	}
+	if tombstone.Receipt.Outcome != "exited" || !tombstone.Receipt.EvidenceIncomplete ||
+		tombstone.Receipt.EventHistoryComplete || tombstone.Receipt.Output.HistoryComplete ||
+		tombstone.Receipt.Resources.MemoryBytes.Status != "unavailable" ||
+		tombstone.Receipt.Resources.TaskCount.Status != "unsupported" {
+		t.Fatalf("compact tombstone receipt = %#v", tombstone.Receipt)
+	}
+	snapshot := tombstone.RunSnapshot()
+	if snapshot.ID != tombstone.RunID || snapshot.State != model.Terminal || snapshot.Receipt == nil || snapshot.Spec.Argv != nil || snapshot.Ownership != nil {
+		t.Fatalf("tombstone Run snapshot = %#v", snapshot)
+	}
 	if _, err := s.GetTombstone("run-retention-new"); !errors.Is(err, ErrTombstoneNotFound) {
 		t.Fatalf("un-evicted Run tombstone error = %v", err)
 	}
@@ -80,22 +89,12 @@ func TestCollectTerminalDeletesAllPerRunEvidenceAtomically(t *testing.T) {
 	t.Cleanup(func() { _ = s.Close() })
 	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
 	makeTerminalForRetention(t, s, "run-retention-evidence", now.Add(-time.Hour))
-	if err := s.db.Update(func(tx *bolt.Tx) error {
-		telemetry, err := tx.CreateBucketIfNotExists([]byte("telemetry"))
-		if err != nil {
-			return err
-		}
-		root, err := telemetry.CreateBucketIfNotExists([]byte("run-retention-evidence"))
-		if err != nil {
-			return err
-		}
-		raw, err := root.CreateBucketIfNotExists([]byte("raw"))
-		if err != nil {
-			return err
-		}
-		return raw.Put([]byte("sample"), []byte("telemetry evidence"))
-	}); err != nil {
+	if _, err := s.AppendTelemetry("run-retention-evidence", testTelemetrySample(now, 1024, 42)); err != nil {
 		t.Fatal(err)
+	}
+	beforeTelemetry, err := s.TelemetryStoreUsage()
+	if err != nil || beforeTelemetry.Runs != 1 || beforeTelemetry.Bytes == 0 {
+		t.Fatalf("telemetry before collection = %#v, err=%v", beforeTelemetry, err)
 	}
 	policy := RetentionPolicy{MaxAge: time.Minute, MaxTerminalRuns: 100, MaxStateBytes: 1 << 30,
 		PreserveTombstones: true, MaxTombstones: 10, MaxTombstoneAge: 24 * time.Hour}
@@ -112,13 +111,9 @@ func TestCollectTerminalDeletesAllPerRunEvidenceAtomically(t *testing.T) {
 	if _, _, _, _, err := s.ReadOutput("run-retention-evidence", "stdout", 0, 100); !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("output after collection = %v, want ErrRunNotFound", err)
 	}
-	if err := s.db.View(func(tx *bolt.Tx) error {
-		if bucket := tx.Bucket([]byte("telemetry")).Bucket([]byte("run-retention-evidence")); bucket != nil {
-			t.Fatal("GC left telemetry bucket for evicted Run")
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
+	afterTelemetry, err := s.TelemetryStoreUsage()
+	if err != nil || afterTelemetry.Runs != 0 || afterTelemetry.Bytes != 0 {
+		t.Fatalf("telemetry after collection = %#v, err=%v", afterTelemetry, err)
 	}
 }
 
@@ -154,49 +149,11 @@ func TestCollectTerminalRetainsRetryIdentityAndPrunesExpiredSubmissionBinding(t 
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
-	makeTerminalForRetention(t, s, "run-bound-active", now.Add(-time.Hour))
-	makeTerminalForRetention(t, s, "run-bound-expired", now.Add(-2*time.Hour))
-	if err := s.db.Update(func(tx *bolt.Tx) error {
-		submissions, err := tx.CreateBucketIfNotExists([]byte("submissions"))
-		if err != nil {
-			return err
-		}
-		indices, err := tx.CreateBucketIfNotExists([]byte("submission-runs"))
-		if err != nil {
-			return err
-		}
-		expiry, err := tx.CreateBucketIfNotExists([]byte("submission-expiry"))
-		if err != nil {
-			return err
-		}
-		for _, binding := range []struct {
-			id      string
-			runID   string
-			created time.Time
-			expires time.Time
-		}{
-			{id: "submission-active", runID: "run-bound-active", created: now.Add(-time.Hour), expires: now.Add(time.Hour)},
-			{id: "submission-expired", runID: "run-bound-expired", created: now.Add(-2 * time.Hour), expires: now.Add(-time.Second)},
-		} {
-			record := submissionRetentionRecord{RunID: binding.runID, SpecDigest: strings.Repeat("a", 64), CreatedAt: binding.created, ExpiresAt: binding.expires}
-			encoded, err := json.Marshal(record)
-			if err != nil {
-				return err
-			}
-			if err := submissions.Put([]byte(binding.id), encoded); err != nil {
-				return err
-			}
-			if err := indices.Put([]byte(binding.runID), []byte(binding.id)); err != nil {
-				return err
-			}
-			if err := expiry.Put(retentionExpiryIndexKey(binding.expires, []byte(binding.id)), nil); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	digest := strings.Repeat("a", 64)
+	makeSubmissionBoundTerminalForRetention(t, s, "run-bound-active", "submission-active", digest,
+		now.Add(-time.Hour), now.Add(-time.Minute))
+	makeSubmissionBoundTerminalForRetention(t, s, "run-bound-expired", "submission-expired", strings.Repeat("b", 64),
+		now.Add(-31*24*time.Hour), now.Add(-31*24*time.Hour+time.Hour))
 	policy := RetentionPolicy{MaxAge: 0, MaxTerminalRuns: 0, MaxStateBytes: 0, MaxTombstones: 0}
 	result, err := s.CollectTerminal(policy, now)
 	if err != nil {
@@ -211,34 +168,105 @@ func TestCollectTerminalRetainsRetryIdentityAndPrunesExpiredSubmissionBinding(t 
 	if _, err := s.Get("run-bound-expired"); !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("expired binding Run Get error = %v", err)
 	}
-	if err := s.db.View(func(tx *bolt.Tx) error {
-		submissions := tx.Bucket([]byte("submissions"))
-		activeRaw := submissions.Get([]byte("submission-active"))
-		if activeRaw == nil {
-			t.Fatal("GC deleted unexpired idempotency binding")
-		}
-		var active submissionRetentionRecord
-		if err := json.Unmarshal(activeRaw, &active); err != nil {
+	stub, found, err := s.ResolveSubmission("submission-active", digest, now)
+	if err != nil || !found || stub.ID != "run-bound-active" || stub.State != model.Terminal ||
+		stub.Receipt == nil || stub.Receipt.Outcome != "exited" || !stub.Receipt.EvidenceIncomplete ||
+		stub.Receipt.EventHistoryComplete || stub.Receipt.Output.HistoryComplete ||
+		stub.Receipt.EffectiveCapabilities == nil || stub.Receipt.EffectiveCapabilities.Backend != "retention-fixture" ||
+		stub.Spec.Argv != nil || stub.Ownership != nil || stub.Receipt.Resources.MemoryBytes.Status != "unavailable" ||
+		stub.Receipt.Resources.MemoryBytes.Value != 0 || stub.Receipt.Resources.TaskCount.Status != "unsupported" {
+		t.Fatalf("resolved collected submission = %#v, found=%v, err=%v", stub, found, err)
+	}
+	retry, err := s.AcceptSubmission(testRun("run-submission-duplicate"), nil, "submission-active", digest, now.Add(time.Second))
+	if err != nil || retry.Created || retry.Run.ID != "run-bound-active" {
+		t.Fatalf("same submission retry = %#v, err=%v; it must resolve without creating a Run", retry, err)
+	}
+	if _, found, err := s.ResolveSubmission("submission-expired", strings.Repeat("b", 64), now); err != nil || found {
+		t.Fatalf("expired submission resolve = found %v, err %v", found, err)
+	}
+	usage, err := s.Usage()
+	if err != nil || usage.SubmissionReplayStubBytes <= 0 || usage.SubmissionBytes <= usage.SubmissionReplayStubBytes {
+		t.Fatalf("submission replay stub usage = %#v, err=%v", usage, err)
+	}
+}
+
+func TestCollectTerminalRejectsCorruptSubmissionExpiryIndexAtomically(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	acceptedAt := now.Add(-time.Hour)
+	const submissionID = "submission-missing-expiry-index"
+	makeSubmissionBoundTerminalForRetention(t, s, "run-missing-expiry-index", submissionID,
+		strings.Repeat("d", 64), acceptedAt, now.Add(-time.Minute))
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(submissionExpiryBucketName)).Delete(
+			expiryIndexKey(acceptedAt.Add(SubmissionRetentionWindow), []byte(submissionID)))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	policy := RetentionPolicy{MaxAge: 0, MaxTerminalRuns: 0, MaxStateBytes: 0, MaxTombstones: 0}
+	if result, err := s.CollectTerminal(policy, now); err == nil || result.EvictedRuns != 0 {
+		t.Fatalf("collection with corrupt idempotency index = %#v, err=%v; want atomic failure", result, err)
+	}
+	run, err := s.Get("run-missing-expiry-index")
+	if err != nil || run.State != model.Terminal || run.Receipt == nil {
+		t.Fatalf("terminal Run after rejected collection = %#v, err=%v", run, err)
+	}
+	if _, err := s.GetTombstone(run.ID); !errors.Is(err, ErrTombstoneNotFound) {
+		t.Fatalf("tombstone after rejected collection = %v", err)
+	}
+}
+
+func TestCollectTerminalPreservesControlRequestsAndWatchIndex(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	run, _, err := s.Create(testRun("run-global-retention-index"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := s.BeginControlRequest(run.ID, "request-retention", strings.Repeat("c", 64), run.Generation, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CompleteControlRequest(run.ID, "request-retention", ControlRequestSucceeded, "", "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		watchIndex, err := tx.CreateBucketIfNotExists([]byte("watch-index"))
+		if err != nil {
 			return err
 		}
-		if active.CollectedRun == nil || active.CollectedRun.ID != "run-bound-active" || active.CollectedRun.State != model.Terminal ||
-			active.CollectedRun.Receipt == nil || active.CollectedRun.Receipt.Outcome != "exited" ||
-			!active.CollectedRun.Receipt.EvidenceIncomplete || active.CollectedRun.Receipt.EventHistoryComplete ||
-			active.CollectedRun.Receipt.Output.HistoryComplete {
-			t.Fatalf("active submission replay stub = %#v", active.CollectedRun)
+		return watchIndex.Put([]byte("fixture-watch-record"), []byte(control.Request.RunID))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	finishRunningRunForRetention(t, s, control.Run, now.Add(-time.Minute))
+	policy := RetentionPolicy{MaxAge: 0, MaxTerminalRuns: 0, MaxStateBytes: 0, MaxTombstones: 0}
+	result, err := s.CollectTerminal(policy, now)
+	if err != nil || result.EvictedRuns != 1 {
+		t.Fatalf("terminal GC = %#v, err=%v", result, err)
+	}
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket([]byte(controlRequestsBucketName)).Get(controlRequestKey(run.ID, "request-retention")) == nil {
+			t.Fatal("terminal GC removed retained control request")
 		}
-		if submissions.Get([]byte("submission-expired")) != nil ||
-			tx.Bucket([]byte("submission-runs")).Get([]byte("run-bound-expired")) != nil ||
-			bucketHasKey(tx.Bucket([]byte("submission-expiry")), retentionExpiryIndexKey(now.Add(-time.Second), []byte("submission-expired"))) {
-			t.Fatal("GC retained expired idempotency binding/index")
-		}
-		if string(tx.Bucket([]byte("submission-runs")).Get([]byte("run-bound-active"))) != "submission-active" ||
-			!bucketHasKey(tx.Bucket([]byte("submission-expiry")), retentionExpiryIndexKey(now.Add(time.Hour), []byte("submission-active"))) {
-			t.Fatal("GC removed active binding index or expiry entry")
+		if got := string(tx.Bucket([]byte("watch-index")).Get([]byte("fixture-watch-record"))); got != run.ID {
+			t.Fatalf("terminal GC changed global watch index record: %q", got)
 		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+	usage, err := s.Usage()
+	if err != nil || usage.ControlRequestBytes == 0 || usage.WatchIndexBytes == 0 {
+		t.Fatalf("global index usage = %#v, err=%v", usage, err)
 	}
 }
 
@@ -448,6 +476,24 @@ func makeTerminalForRetention(t *testing.T, s *Store, id string, finished time.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	return finishRunningRunForRetention(t, s, run, finished)
+}
+
+func makeSubmissionBoundTerminalForRetention(t *testing.T, s *Store, id, submissionID, digest string, acceptedAt, finished time.Time) model.Run {
+	t.Helper()
+	accepted, err := s.AcceptSubmission(testRun(id), nil, submissionID, digest, acceptedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !accepted.Created || accepted.Run.ID != id {
+		t.Fatalf("initial accepted submission = %#v", accepted)
+	}
+	return finishRunningRunForRetention(t, s, accepted.Run, finished)
+}
+
+func finishRunningRunForRetention(t *testing.T, s *Store, run model.Run, finished time.Time) model.Run {
+	t.Helper()
+	id := run.ID
 	run.State = model.Running
 	run.Generation++
 	if _, err := s.Update(run, nil); err != nil {
@@ -459,22 +505,25 @@ func makeTerminalForRetention(t *testing.T, s *Store, id string, finished time.T
 	if _, err := s.AppendOutput(id, "stdout", []byte("bounded output evidence"), 1024); err != nil {
 		t.Fatal(err)
 	}
-	run, err = s.Get(id)
+	stored, err := s.Get(id)
 	if err != nil {
 		t.Fatal(err)
 	}
+	run = stored
 	run.State = model.Terminal
 	run.Generation++
 	finished = finished.UTC()
 	run.FinishedAt = &finished
+	caps := model.Capabilities{Backend: "retention-fixture", Signals: []string{"TERM"}}
+	run.EffectiveCapabilities = &caps
+	run.Resources = model.Resources{
+		MemoryBytes: model.Metric{Status: "measured", Value: 1024},
+		TaskCount:   model.Metric{Status: "unsupported"},
+	}
 	run.Receipt = &model.Receipt{
-		Version:    model.ProtocolVersion,
-		RunID:      id,
-		Outcome:    "exited",
-		FinishedAt: finished,
-		Resources:  model.Resources{},
-		Output:     run.Output,
-		Cleanup:    "complete",
+		Version: model.ProtocolVersion, RunID: id, Outcome: "exited", FinishedAt: finished,
+		Resources: run.Resources, Output: run.Output, Cleanup: "complete",
+		EffectiveCapabilities: &caps, Capabilities: caps,
 	}
 	if _, err := s.Update(run, nil); err != nil {
 		t.Fatal(err)
