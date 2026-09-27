@@ -615,9 +615,11 @@ jinushi resize
 
 `watch` has a bounded all-Run page/follow surface with a reconnectable opaque
 cursor. Event and output follow, including PTY attach output, use runtime
-subscriptions and report retained-history gaps. The `telemetry` operation is
-available through the local protocol for bounded telemetry queries; there is
-not a dedicated telemetry CLI command.
+subscriptions and report retained-history gaps. The local `telemetry` operation
+supports bounded queries and wakeup-driven follow using `follow: true` and a
+`telemetryQuery`; a Run ID must be supplied in the request or query, and both
+values must agree when both are present. Telemetry follow is available through
+the protocol, but there is no dedicated telemetry CLI command.
 
 The resident service is started with `jinushi supervisor`; its lifecycle remains independent of client command lifetimes.
 
@@ -728,10 +730,16 @@ Event payloads use bounded typed/versioned shapes. Free-form nested arbitrary JS
 High-rate resource telemetry is exposed separately from the lifecycle/control
 journal. The local protocol `telemetry` operation accepts a bounded
 `TelemetryQuery` (`runId`, optional time bounds, `resolution`, `limit`, and
-cursor) and returns raw samples, aggregates, gaps, retained-range metadata, and
-history completeness. Resolution is `raw`, `10s`, or `adaptive`; telemetry
-cursors are independent of event sequence numbers and may become stale after
-compaction.
+cursor) and returns the Run snapshot plus a bounded `TelemetryResponse` with
+raw samples, aggregates, gaps, retained-range metadata, and history
+completeness. Resolution is `raw`, `10s`, or `adaptive`; telemetry cursors are
+opaque and independent of event sequence numbers. `watermark` is the cursor
+represented by the delivered points in that response; `nextCursor` is set when
+more points remain beyond the current page and is also that page's watermark.
+With no points, the watermark encodes the query cursor position (the initial
+position when no cursor was supplied).
+Compaction can invalidate a cursor; the protocol reports
+`stale-telemetry-cursor` rather than implying complete history.
 
 Telemetry queries/subscriptions expose:
 
@@ -741,6 +749,15 @@ Telemetry queries/subscriptions expose:
 - min/max/last and cumulative/delta values where applicable;
 - explicit gaps;
 - retained-from / available-range metadata.
+
+Telemetry follow requires a query and one consistent Run ID. It subscribes
+before its initial read, delivers bounded samples/aggregates, then waits on a
+coalescing per-Run notifier before reading again. A full wake buffer does not
+queue per-sample notifications: the next read uses the durable telemetry
+cursor. Telemetry additions wake matching telemetry subscribers, without
+waking lifecycle, output, or all-Run subscribers. Retained gaps are reported
+initially and newly appearing gaps are emitted once during a live follow. Once
+a Run is terminal, follow drains the remaining retained page and then ends.
 
 Linux telemetry may include CPU, memory, process count, task/PID count, I/O counters, and PSI pressure metrics where supported.
 

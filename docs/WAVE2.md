@@ -87,6 +87,7 @@ Required work:
 - process start/exit/membership evidence;
 - separate high-rate telemetry storage/retention from lifecycle/control events;
 - telemetry downsampling/aggregation with explicit resolution/gaps;
+- bounded local telemetry queries and wakeup-driven Follow with independent opaque cursor/watermark semantics;
 - Linux cgroup I/O counters where supported;
 - PSI CPU/memory/I/O pressure where supported;
 - input/resize physical activity timestamps/counters without retaining input contents.
@@ -119,6 +120,7 @@ Required work:
 
 - Supervisor-internal wakeup/notifier on event/output/terminal changes;
 - wakeup-driven per-Run event following;
+- wakeup-driven telemetry-window following with bounded/coalesced per-Run notifications;
 - bounded all-Run watch/multiplex surface;
 - reconnectable cursor/watermark behavior;
 - wakeup-driven PTY/output following;
@@ -151,15 +153,15 @@ Completion gate: long-running use has bounded historical state and an explicit r
 
 ## Current implementation status
 
-This status snapshot was reviewed against `main@651e818`:
+This status snapshot was reviewed against `main@cde4e1c`:
 
 | Track / issue | Status | Notes |
 | --- | --- | --- |
 | A / #4 — canonical contract | Implemented | Shared event, process/task, capability, receipt, retention, deadline, and Linux safety contracts are implemented. |
 | B / #5 — idempotent control | Implemented | Run submission and retry-sensitive control identities are implemented. |
-| C / #6 — physical evidence | Partial | Per-process Linux evidence and bounded raw/aggregate/gap telemetry are persisted separately from lifecycle events and exposed through the local protocol query. Telemetry window subscriptions remain unimplemented at this review HEAD. Kernel I/O/PSI availability remains capability-dependent. |
+| C / #6 — physical evidence | Implemented | Per-process Linux evidence and bounded raw/aggregate/gap telemetry are persisted separately from lifecycle events and exposed through bounded local queries and wakeup-driven Follow with independent watermarks. Kernel I/O/PSI availability remains capability-dependent. |
 | D / #7 — host envelope | Implemented | Host workload limits, admission, capability reporting, and host status projection are implemented. Host-specific cgroup and kernel proofs remain environment-dependent. |
-| E / #8 — observation and writer ownership | Partial | Event, output, PTY, and bounded all-Run watch follow use reconnectable cursors; interactive input and resize use single-writer leases. Telemetry window subscriptions remain unimplemented at this review HEAD. |
+| E / #8 — observation and writer ownership | Implemented | Event, output, PTY, telemetry, and bounded all-Run watch follow use reconnectable cursors; telemetry wakeups coalesce per Run. Interactive input and resize use single-writer leases. |
 | F / #9 — operational lifetime | Implemented | Automatic terminal GC/tombstones, status usage, bbolt online compaction, capability-gated pause/resume and mutable controls, and fail-closed Guardian-loss recovery are wired through the Supervisor. |
 
 These code-track statuses do not complete Epic #3's separate Canonical Audit.

@@ -127,7 +127,7 @@ jinushi capabilities
 jinushi status
 ```
 
-Run submission and non-idempotent physical mutations use caller-provided retry identities/current generation. `watch` provides bounded all-Run event pages and reconnectable cursors; event/output/PTY attach follow modes use runtime notifications. Pause, resume, and mutable resource controls are accepted only when the Run's effective backend capabilities permit them.
+Run submission and non-idempotent physical mutations use caller-provided retry identities/current generation. `watch` provides bounded all-Run event pages and reconnectable cursors; event/output/PTY attach follow modes use runtime notifications. Telemetry follow is available over the local protocol. Pause, resume, and mutable resource controls are accepted only when the Run's effective backend capabilities permit them.
 
 ## What Jinushi observes
 
@@ -146,7 +146,7 @@ Jinushi records physical execution facts, including:
 - explicit signals, cancellation, forced termination, and cleanup outcome;
 - a terminal receipt describing the final physical execution outcome.
 
-Resource telemetry is time-series evidence, not only a final peak. High-rate samples are stored separately from the lifecycle/control journal. The local protocol's `telemetry` operation returns bounded raw samples and coarser aggregates with process identity/evidence, I/O/PSI values where supported, resolution, retained ranges, and gaps. There is no dedicated telemetry CLI command. Output byte totals and elapsed wall time are available through Run/output events and the terminal receipt rather than the high-rate telemetry sample itself.
+Resource telemetry is time-series evidence, not only a final peak. High-rate samples are stored separately from the lifecycle/control journal. The local protocol's `telemetry` operation returns bounded raw samples and coarser aggregates with process identity/evidence, I/O/PSI values where supported, resolution, retained ranges, and gaps. Set `follow` with a `telemetryQuery` to receive wakeup-driven bounded pages; `watermark` is the cursor represented by a response, while `nextCursor` is present when more points remain. Notifications coalesce per Run, and a telemetry cursor made stale by compaction returns an explicit error. There is no dedicated telemetry CLI command. Output byte totals and elapsed wall time are available through Run/output events and the terminal receipt rather than the high-rate telemetry sample itself.
 
 Terminal retention runs automatically on supervisor startup and at `retentionIntervalMs`. It only collects terminal Runs with a complete receipt. When configured to preserve tombstones, later `inspect` and `await` calls return the compact terminal outcome and an explicit incomplete-evidence marker after detailed evidence has been removed.
 

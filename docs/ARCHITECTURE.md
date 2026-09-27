@@ -587,9 +587,9 @@ This is a physical safety boundary, not scheduling. Jinushi may reject or constr
 
 Long-lived clients should not require model-driven or tight polling.
 
-Jinushi exposes wakeup-driven subscriptions for lifecycle/control changes, output availability, telemetry windows, and terminal state. A local all-Run watch surface may multiplex physical Run events for an orchestrator.
+Jinushi exposes wakeup-driven subscriptions for lifecycle/control changes, output availability, telemetry windows, and terminal state. Telemetry subscriptions are scoped to one Run and use an opaque telemetry cursor independent of its event sequence. Each telemetry response carries the cursor represented by its delivered points as `watermark`; `nextCursor` indicates that more points remain beyond that bounded page. A local all-Run watch surface may multiplex physical Run events for an orchestrator.
 
-Subscription transport remains bounded and reconnectable. Sequence/watermark semantics make missed history explicit.
+Subscription transport remains bounded and reconnectable. Notifications coalesce per Run so high-rate telemetry does not enqueue one wakeup per sample or wake lifecycle/output/all-Run subscribers. Sequence/watermark semantics make missed history explicit; a cursor invalidated by telemetry compaction produces an explicit stale-cursor response.
 
 ## 27. Interactive writer ownership
 
