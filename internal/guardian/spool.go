@@ -16,14 +16,16 @@ import (
 const maxSpoolRead = (1<<20)*3/4 - 1024
 
 type spool struct {
-	mu          sync.Mutex
-	dir         string
-	streamLimit int64
-	files       map[string]*os.File
-	stats       map[string]model.OutputStream
-	lastWriteAt map[string]time.Time
-	failed      bool
-	closed      bool
+	mu           sync.Mutex
+	dir          string
+	streamLimit  int64
+	files        map[string]*os.File
+	stats        map[string]model.OutputStream
+	lastWriteAt  map[string]time.Time
+	lastWriteSeq map[string]uint64
+	writeSeq     uint64
+	failed       bool
+	closed       bool
 }
 
 func openSpool(dir string, maxBytes int64) (*spool, error) {
@@ -34,11 +36,12 @@ func openSpool(dir string, maxBytes int64) (*spool, error) {
 		return nil, fmt.Errorf("guardian: create spool directory: %w", err)
 	}
 	s := &spool{
-		dir:         dir,
-		streamLimit: maxBytes / 3,
-		files:       make(map[string]*os.File, 3),
-		stats:       make(map[string]model.OutputStream, 3),
-		lastWriteAt: make(map[string]time.Time, 3),
+		dir:          dir,
+		streamLimit:  maxBytes,
+		files:        make(map[string]*os.File, 3),
+		stats:        make(map[string]model.OutputStream, 3),
+		lastWriteAt:  make(map[string]time.Time, 3),
+		lastWriteSeq: make(map[string]uint64, 3),
 	}
 	for _, name := range []string{"stdout", "stderr", "pty"} {
 		path := filepath.Join(dir, name+".out")
@@ -97,8 +100,8 @@ func (w streamWriter) Write(p []byte) (int, error) {
 	}
 	oldObserved := stat.ObservedBytes
 	newObserved := oldObserved + int64(len(p))
-	newRetained := min64(newObserved, s.streamLimit)
-	newFrom := newObserved - newRetained
+	newFrom := max64(stat.RetainedFrom, newObserved-s.streamLimit)
+	newRetained := newObserved - newFrom
 	writeOffset := max64(oldObserved, newFrom)
 	drop := writeOffset - oldObserved
 	if drop < int64(len(p)) {
@@ -118,12 +121,52 @@ func (w streamWriter) Write(p []byte) (int, error) {
 	stat.ObservedBytes = newObserved
 	if len(p) > 0 {
 		s.lastWriteAt[w.name] = time.Now().UTC()
+		s.writeSeq++
+		s.lastWriteSeq[w.name] = s.writeSeq
 	}
 	if newFrom > 0 || s.failed {
 		stat.Truncated = true
 	}
 	s.stats[w.name] = stat
+	s.enforceAggregateLocked()
 	return len(p), nil
+}
+
+// enforceAggregateLocked keeps the logical retained total within the Run
+// budget. A stream that has not written recently gives up older evidence
+// first; stream offsets remain absolute and report the resulting gap.
+func (s *spool) enforceAggregateLocked() {
+	var retained int64
+	for _, stat := range s.stats {
+		retained += stat.RetainedBytes
+	}
+	for retained > s.streamLimit {
+		oldest := ""
+		for _, name := range []string{"stdout", "stderr", "pty"} {
+			if s.stats[name].RetainedBytes == 0 {
+				continue
+			}
+			if oldest == "" || s.lastWriteSeq[name] < s.lastWriteSeq[oldest] {
+				oldest = name
+			}
+		}
+		if oldest == "" {
+			s.failed = true
+			return
+		}
+		stat := s.stats[oldest]
+		drop := min64(retained-s.streamLimit, stat.RetainedBytes)
+		stat.RetainedFrom += drop
+		stat.RetainedBytes -= drop
+		stat.Truncated = true
+		if stat.RetainedBytes == 0 {
+			if err := s.files[oldest].Truncate(0); err != nil {
+				s.failed = true
+			}
+		}
+		s.stats[oldest] = stat
+		retained -= drop
+	}
 }
 
 func writeRing(file *os.File, data []byte, absoluteOffset, capacity int64) error {

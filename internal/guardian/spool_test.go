@@ -11,7 +11,7 @@ import (
 func TestSpoolFloodRetainsBoundedTailAndReportsGap(t *testing.T) {
 	spoolDir := filepath.Join(t.TempDir(), "run")
 	const aggregateLimit = int64(96 << 10)
-	const retainedLimit = aggregateLimit / 3
+	const retainedLimit = aggregateLimit
 	spool, err := openSpool(spoolDir, aggregateLimit)
 	if err != nil {
 		t.Fatal(err)
@@ -57,6 +57,31 @@ func TestSpoolFloodRetainsBoundedTailAndReportsGap(t *testing.T) {
 		if b != 'x' {
 			t.Fatalf("ring wrap returned wrong byte %q", b)
 		}
+	}
+}
+
+func TestSpoolSharesAggregateBudgetAcrossStdioAndPTY(t *testing.T) {
+	spool, err := openSpool(filepath.Join(t.TempDir(), "run"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.close()
+	if _, err := spool.writer("stdout").Write([]byte("abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spool.writer("stderr").Write([]byte("123456")); err != nil {
+		t.Fatal(err)
+	}
+	out := spool.output()
+	if out.Stdout.RetainedBytes+out.Stderr.RetainedBytes+out.PTY.RetainedBytes != 10 || out.Stdout.RetainedFrom != 2 || out.Stderr.RetainedBytes != 6 {
+		t.Fatalf("stdio retention did not share the aggregate budget: %+v", out)
+	}
+	if _, err := spool.writer("pty").Write([]byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+	out = spool.output()
+	if out.PTY.RetainedBytes != 10 || out.Stdout.RetainedBytes != 0 || out.Stderr.RetainedBytes != 0 {
+		t.Fatalf("PTY did not receive the full aggregate budget: %+v", out)
 	}
 }
 

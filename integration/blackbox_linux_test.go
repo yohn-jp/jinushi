@@ -948,9 +948,7 @@ func TestSupervisorRestartPreservesTruncatedOutputCursor(t *testing.T) {
 	h := newHarness(t)
 	gate := filepath.Join(t.TempDir(), "write-suffix")
 	const retention = int64(64)
-	// OutputBytes is an aggregate Run ceiling divided across stdout, stderr,
-	// and PTY retention by the Store, so reserve three stream ceilings here.
-	const outputLimit = retention * 3
+	const outputLimit = retention
 	prefix := strings.Repeat("P", 160)
 	suffix := strings.Repeat("S", 32)
 	script := `printf '%s' "$2"; while [ ! -e "$1" ]; do sleep 0.02; done; printf '%s' "$3"`
