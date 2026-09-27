@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "architecture",
+  "name": "Architecture",
+  "description": "Change to boundaries, contracts, or architectural decisions",
+  "title": "refactor: ",
+  "sections": [
+    {
+      "id": "context",
+      "kind": "input",
+      "type": "string",
+      "label": "Context",
+      "description": "Current boundary or design problem and supporting evidence",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "decision",
+      "kind": "input",
+      "type": "string",
+      "label": "Decision",
+      "description": "Architectural choice that becomes the intended design",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "invariants",
+      "kind": "input",
+      "type": "string",
+      "label": "Invariants",
+      "description": "Boundaries and contracts that must hold",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "alternatives",
+      "kind": "input",
+      "type": "string",
+      "label": "Alternatives",
+      "description": "Meaningful alternatives considered and why they were rejected",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "consequences",
+      "kind": "input",
+      "type": "string",
+      "label": "Consequences",
+      "description": "Operational, compatibility, security, release, or complexity consequences that follow from the decision",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "non_goals",
+      "kind": "input",
+      "type": "string",
+      "label": "Non-goals",
+      "description": "Boundaries not changed in this work",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "migration",
+      "kind": "input",
+      "type": "string",
+      "label": "Migration",
+      "description": "Rollout, migration, or compatibility plan when needed",
+      "required": false,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Verifiable design and implementation completion criteria",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    }
+  ]
+}

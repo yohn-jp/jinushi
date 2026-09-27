@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "bug",
+  "name": "Bug",
+  "description": "Reproducible defect",
+  "title": "fix: ",
+  "labels": ["bug"],
+  "sections": [
+    {
+      "id": "summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Summary",
+      "description": "Concise defect description",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "reproduction",
+      "kind": "input",
+      "type": "string",
+      "label": "Reproduction",
+      "description": "Minimal steps, input, and environment needed to reproduce the defect",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "expected_behavior",
+      "kind": "input",
+      "type": "string",
+      "label": "Expected behavior",
+      "description": "Expected observable behavior or invariant",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "actual_behavior",
+      "kind": "input",
+      "type": "string",
+      "label": "Actual behavior",
+      "description": "Observed behavior or error",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Completion criteria, including regression proof where applicable",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    },
+    {
+      "id": "context",
+      "kind": "input",
+      "type": "string",
+      "label": "Context",
+      "description": "Logs, workaround, related Issues, or environment details",
+      "required": false,
+      "element": "textarea"
+    }
+  ]
+}

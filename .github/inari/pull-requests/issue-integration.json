@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "kind": "pull_request",
+  "id": "issue-integration",
+  "name": "issue-integration",
+  "sections": [
+    {
+      "id": "issue_integration_pr",
+      "kind": "input",
+      "type": "string",
+      "label": "Issue integration PR",
+      "placeholder": "Issue integration PRs converge one source Issue's Implementation leaves into its parent Epic. This is an integration boundary, not an Implementation execution leaf.",
+      "headingLevel": 1
+    },
+    {
+      "id": "source_issue",
+      "kind": "input",
+      "type": "string",
+      "label": "Source Issue",
+      "placeholder": "<!-- The source Issue whose Implementation set is being converged. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Summary",
+      "placeholder": "<!-- Concisely summarize the source-Issue capability delivered by this convergence. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "integration_objective",
+      "kind": "input",
+      "type": "string",
+      "label": "Integration objective / exit criteria",
+      "placeholder": "<!-- What this source-Issue integration must achieve and how completion is judged. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "implementation_set",
+      "kind": "input",
+      "type": "string",
+      "label": "Integrated Implementation set",
+      "placeholder": "<!-- Enumerate the Implementation Issues and PRs included in this convergence. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "change_summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Integrated change summary",
+      "placeholder": "<!-- Summarize the composed changes delivered for the source Issue. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "validation",
+      "kind": "input",
+      "type": "checklist",
+      "label": "Validation",
+      "options": [
+        {
+          "label": "Typecheck",
+          "id": "typecheck",
+          "required": false
+        },
+        {
+          "label": "Tests",
+          "id": "tests",
+          "required": false
+        },
+        {
+          "label": "Build",
+          "id": "build",
+          "required": false
+        }
+      ],
+      "placeholder": "<!-- Commands or targeted checks actually run for the composed source-Issue branch. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "review_focus",
+      "kind": "input",
+      "type": "string",
+      "label": "Review focus",
+      "placeholder": "<!-- Source-Issue acceptance, integration boundaries, and remaining risks reviewers must assess. -->",
+      "headingLevel": 2
+    }
+  ]
+}

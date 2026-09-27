@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "kind": "pull_request",
+  "id": "authority",
+  "name": "authority",
+  "sections": [
+    {
+      "id": "authority_pr",
+      "kind": "input",
+      "type": "string",
+      "label": "Runtime Authority PR",
+      "placeholder": "Runtime Authority PRs change a trust-root under `.github/inari/authorities/**`.\nThis is a trust-boundary change, not an ordinary implementation change.",
+      "headingLevel": 1
+    },
+    {
+      "id": "change_type",
+      "kind": "input",
+      "type": "string",
+      "label": "Change type",
+      "placeholder": "bootstrap / rotation-add / revoke",
+      "headingLevel": 2
+    },
+    {
+      "id": "authority_id",
+      "kind": "input",
+      "type": "string",
+      "label": "Runtime Authority ID",
+      "placeholder": "<!-- The Runtime Authority identifier this change applies to. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "key_fingerprint",
+      "kind": "input",
+      "type": "string",
+      "label": "Public-key fingerprint",
+      "placeholder": "<!-- Fingerprint of the public key being added, rotated, or revoked. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "validity_window",
+      "kind": "input",
+      "type": "string",
+      "label": "Validity window",
+      "placeholder": "- Not before:\n- Not after:",
+      "headingLevel": 2
+    },
+    {
+      "id": "max_session_ttl",
+      "kind": "input",
+      "type": "string",
+      "label": "Maximum Session TTL",
+      "placeholder": "<!-- Maximum session lifetime this Runtime Authority may issue. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "capability_ceiling",
+      "kind": "input",
+      "type": "string",
+      "label": "Capability ceiling",
+      "placeholder": "<!-- Maximum capability/permission scope this Runtime Authority may grant. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "no_private_key_material",
+      "kind": "input",
+      "type": "string",
+      "label": "No private-key material",
+      "placeholder": "Confirmed: no private-key material is present in Git, this PR, logs, or\nartifacts.",
+      "headingLevel": 2
+    },
+    {
+      "id": "signer_provisioning",
+      "kind": "input",
+      "type": "string",
+      "label": "Signer provisioning",
+      "placeholder": "<!-- Signer provisioning target/plan. Do not include secret material. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "rollback_recovery",
+      "kind": "input",
+      "type": "string",
+      "label": "Rollback / recovery",
+      "placeholder": "<!-- Rollback and recovery implications if this change must be reverted. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "review_focus",
+      "kind": "input",
+      "type": "string",
+      "label": "Review focus",
+      "placeholder": "<!-- Trust-boundary impact reviewers must specifically assess. -->",
+      "headingLevel": 2
+    }
+  ]
+}

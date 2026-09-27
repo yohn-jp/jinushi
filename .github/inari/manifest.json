@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "kind": "inari-governance-manifest",
+  "source": {
+    "repository": "yohn-jp/.github",
+    "directory": ".github/inari"
+  },
+  "revision": "sha256:cb1d695708b92437d911fb98ab6260a56ba1689a848c8944e2a22c890e38ee1a",
+  "files": [
+    {
+      "path": ".github/inari/issues/architecture.json",
+      "sha256": "7e40ac16dd3000d15e93f2b59440670ed9a86b7e38802f85d4a6bb3f1a32950b",
+      "bytes": 2243
+    },
+    {
+      "path": ".github/inari/issues/bug.json",
+      "sha256": "f49a590e17919e71ed4d89403d799e6b2afb962fe816a8233c0ab735fe3e4c98",
+      "bytes": 1662
+    },
+    {
+      "path": ".github/inari/issues/epic.json",
+      "sha256": "8134fd006456843ffcf75619c8c4aa1cdc9f219d37eede634a81fc0fae79c14f",
+      "bytes": 2251
+    },
+    {
+      "path": ".github/inari/issues/feature.json",
+      "sha256": "7dfa1f6054e44eb465c55ca5830101bbf27945551e570569a61b244013b52c32",
+      "bytes": 1721
+    },
+    {
+      "path": ".github/inari/issues/implementation.json",
+      "sha256": "8c3516b4eef49f053871485ecca6a980c32636c0596e4d5395b5ee907e737781",
+      "bytes": 6826
+    },
+    {
+      "path": ".github/inari/issues/maintenance.json",
+      "sha256": "794634f0f3bb6cfc23bab31c7303efbb2cf0cc37167819441780d365fe789c73",
+      "bytes": 1177
+    },
+    {
+      "path": ".github/inari/issues/research.json",
+      "sha256": "c4f9d7bef9947b3d55de8695f8bc3621b48a07a68e4d521d25e0c233da1c9a1d",
+      "bytes": 1692
+    },
+    {
+      "path": ".github/inari/pull-requests/authority.json",
+      "sha256": "5dcecee8d38ed1e331fc095e6d726b0da2363f2db9a6b2597d4d4e5ca39f9451",
+      "bytes": 2852
+    },
+    {
+      "path": ".github/inari/pull-requests/default.json",
+      "sha256": "bd33763255b5498cb86a66596b4bba16a717e626c435ecdf93f1ca7e0d3e7435",
+      "bytes": 1659
+    },
+    {
+      "path": ".github/inari/pull-requests/epic.json",
+      "sha256": "5edba63d3e22cacdaf61bf3cd0ae9c7c2384718c999c97b9d9a866323b08d146",
+      "bytes": 2241
+    },
+    {
+      "path": ".github/inari/pull-requests/issue-integration.json",
+      "sha256": "dc4c119f4cd5a34b30e3ce20800aa6ac6d22cfec9de84283996216c47cc68103",
+      "bytes": 2634
+    },
+    {
+      "path": ".github/inari/pull-requests/release.json",
+      "sha256": "324f8a7cfde491a4c74effdab264ae1cfe971d4b3d685618bc8423b64b5c8441",
+      "bytes": 1839
+    },
+    {
+      "path": ".github/inari/pr-policy.yml",
+      "sha256": "da5ac5663b75025fe6d9aa647ea849f732f97fa0ceb4f8563810d46a0513b444",
+      "bytes": 382
+    }
+  ]
+}

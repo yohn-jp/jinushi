@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "research",
+  "name": "Research",
+  "description": "Pre-implementation research or technical validation",
+  "title": "docs: research ",
+  "sections": [
+    {
+      "id": "question",
+      "kind": "input",
+      "type": "string",
+      "label": "Question",
+      "description": "Specific unresolved question",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "motivation",
+      "kind": "input",
+      "type": "string",
+      "label": "Motivation",
+      "description": "Why resolving it matters and which decision it blocks",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "evaluation_criteria",
+      "kind": "input",
+      "type": "string",
+      "label": "Evaluation criteria",
+      "description": "Dimensions and thresholds used to compare evidence",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "scope",
+      "kind": "input",
+      "type": "string",
+      "label": "Scope",
+      "description": "Candidates, experiments, sources, and explicit research boundary",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "deliverable",
+      "kind": "input",
+      "type": "string",
+      "label": "Deliverable",
+      "description": "Expected recommendation, measurement, or result",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Evidence required before the research is complete",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    }
+  ]
+}

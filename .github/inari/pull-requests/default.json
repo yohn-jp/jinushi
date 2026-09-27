@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "kind": "pull_request",
+  "id": "default",
+  "name": "default",
+  "sections": [
+    {
+      "id": "summary",
+      "kind": "input",
+      "type": "string",
+      "label": "Summary",
+      "placeholder": "<!-- Concisely describe the delivered result. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "linked_issue",
+      "kind": "input",
+      "type": "string",
+      "label": "Linked issue",
+      "placeholder": "Closes #",
+      "headingLevel": 2
+    },
+    {
+      "id": "changes",
+      "kind": "input",
+      "type": "string",
+      "label": "Changes",
+      "placeholder": "<!-- Material implementation and behavioral changes. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "validation",
+      "kind": "input",
+      "type": "checklist",
+      "label": "Validation",
+      "options": [
+        {
+          "label": "Typecheck",
+          "id": "typecheck",
+          "required": false
+        },
+        {
+          "label": "Tests",
+          "id": "tests",
+          "required": false
+        },
+        {
+          "label": "Build",
+          "id": "build",
+          "required": false
+        }
+      ],
+      "placeholder": "<!-- Commands or targeted checks actually run. CI remains authoritative for\nautomated validation state; do not reproduce full CI evidence matrices. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "review_focus",
+      "kind": "input",
+      "type": "string",
+      "label": "Review focus",
+      "placeholder": "<!-- Optional. Areas requiring reviewer attention, including any material\nbreaking, migration, security, or release concern. -->",
+      "headingLevel": 2
+    }
+  ]
+}

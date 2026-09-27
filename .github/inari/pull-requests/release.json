@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "kind": "pull_request",
+  "id": "release",
+  "name": "release",
+  "sections": [
+    {
+      "id": "release_pr",
+      "kind": "input",
+      "type": "string",
+      "label": "Release PR",
+      "placeholder": "Release PRs use a `release/<semver>` head branch, for example\n`release/1.2.3`. This naming convention is an operational classification only;\nit is not an authorization or security boundary.",
+      "headingLevel": 1
+    },
+    {
+      "id": "version",
+      "kind": "input",
+      "type": "string",
+      "label": "Version",
+      "placeholder": "- Target version:\n- Version bump (patch/minor/major):",
+      "headingLevel": 2
+    },
+    {
+      "id": "release_notes",
+      "kind": "input",
+      "type": "string",
+      "label": "Release notes",
+      "placeholder": "<!-- User/reviewer-facing release summary. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "breaking_migration",
+      "kind": "input",
+      "type": "string",
+      "label": "Breaking changes / migration",
+      "placeholder": "None. <!-- If not None, describe the breaking change and migration path. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "publish_plan",
+      "kind": "input",
+      "type": "string",
+      "label": "Publish plan",
+      "placeholder": "<!-- Intended package/tag/GitHub Release path. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "post_release_verification",
+      "kind": "input",
+      "type": "string",
+      "label": "Post-release verification",
+      "placeholder": "<!-- Checks that must happen after publication. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "tracking",
+      "kind": "input",
+      "type": "string",
+      "label": "Tracking",
+      "placeholder": "<!-- Optional. Linked Issue or release tracking reference. -->",
+      "headingLevel": 2
+    }
+  ]
+}

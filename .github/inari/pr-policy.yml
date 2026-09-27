@@ -1,0 +1,17 @@
+version: 1
+templates:
+  - template: default
+    sections:
+      - section: summary
+        required: true
+      - section: linked_issue
+        linkedIssue: true
+      - section: changes
+        required: true
+      - section: validation
+        checklist:
+          requireComplete: true
+      - section: review_focus
+        required: false
+  - template: release
+    sections: []

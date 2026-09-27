@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "maintenance",
+  "name": "Maintenance",
+  "description": "Maintenance, dependency updates, or development infrastructure",
+  "title": "chore: ",
+  "sections": [
+    {
+      "id": "task",
+      "kind": "input",
+      "type": "string",
+      "label": "Task",
+      "description": "Concrete maintenance work",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "reason",
+      "kind": "input",
+      "type": "string",
+      "label": "Reason",
+      "description": "Debt, deadline, operational need, or dependency reason",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Verifiable completion criteria",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    },
+    {
+      "id": "constraints",
+      "kind": "input",
+      "type": "string",
+      "label": "Constraints",
+      "description": "Rollback, compatibility, or operational constraints when material",
+      "required": false,
+      "element": "textarea"
+    }
+  ]
+}

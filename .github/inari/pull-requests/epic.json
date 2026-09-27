@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "kind": "pull_request",
+  "id": "epic",
+  "name": "epic",
+  "sections": [
+    {
+      "id": "epic_pr",
+      "kind": "input",
+      "type": "string",
+      "label": "Epic integration PR",
+      "placeholder": "Epic PRs use an `epic/<issue-number>-<slug>` head branch, for example\n`epic/890-runtime-certification`. This is an integration/routing object, not\nan implementation leaf.",
+      "headingLevel": 1
+    },
+    {
+      "id": "parent_epic_issue",
+      "kind": "input",
+      "type": "string",
+      "label": "Parent Epic / tracking Issue",
+      "placeholder": "<!-- The tracking Epic Issue this integration branch belongs to. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "integration_objective",
+      "kind": "input",
+      "type": "string",
+      "label": "Integration objective / exit criteria",
+      "placeholder": "<!-- What this Epic integration must achieve and how completion is judged. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "child_inventory",
+      "kind": "input",
+      "type": "string",
+      "label": "Child Issue/PR inventory",
+      "placeholder": "<!-- Enumerate child Issues and their PRs targeting this Epic branch. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "dependency_notes",
+      "kind": "input",
+      "type": "string",
+      "label": "Dependency / ordering notes",
+      "placeholder": "None. <!-- If not None, describe cross-child dependencies or required order. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "integration_status",
+      "kind": "input",
+      "type": "string",
+      "label": "Integration status",
+      "placeholder": "<!-- Current status and remaining children before this Epic can close. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "certification_gates",
+      "kind": "input",
+      "type": "string",
+      "label": "Validation / certification gates",
+      "placeholder": "<!-- Gates required before Epic closure. -->",
+      "headingLevel": 2
+    },
+    {
+      "id": "implementation_boundary",
+      "kind": "input",
+      "type": "string",
+      "label": "Implementation boundary",
+      "placeholder": "Implementation belongs to child leaves, not this Epic PR.",
+      "headingLevel": 2
+    }
+  ]
+}

@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "epic",
+  "name": "Epic",
+  "description": "Integration authority for a fixed set of source Issues",
+  "title": "epic: ",
+  "sections": [
+    {
+      "id": "objective",
+      "kind": "input",
+      "type": "string",
+      "label": "Objective",
+      "description": "Composed product outcome this Epic must deliver",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "scope",
+      "kind": "input",
+      "type": "string",
+      "label": "Scope",
+      "description": "Fixed child Issue set owned by this Epic; one Issue per line",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "integration_model",
+      "kind": "input",
+      "type": "string",
+      "label": "Integration model",
+      "description": "Epic branch, child integration boundaries, and review model",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "dependency_order",
+      "kind": "input",
+      "type": "string",
+      "label": "Dependency order",
+      "description": "Producer/consumer ordering or explicit parallel waves",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "invariants",
+      "kind": "input",
+      "type": "string",
+      "label": "Invariants",
+      "description": "Architectural and governance truths that must remain true across the composed Epic",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "integration_gates",
+      "kind": "input",
+      "type": "string",
+      "label": "Integration gates",
+      "description": "Requirements each child must satisfy before integration",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "final_acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Final acceptance",
+      "description": "Verifiable composed-tree certification and closure criteria",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    },
+    {
+      "id": "non_goals",
+      "kind": "input",
+      "type": "string",
+      "label": "Non-goals",
+      "description": "Explicit boundaries not owned by this Epic",
+      "required": true,
+      "element": "textarea"
+    }
+  ]
+}

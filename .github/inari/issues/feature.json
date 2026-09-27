@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "kind": "issue",
+  "id": "feature",
+  "name": "Feature",
+  "description": "New capability or extension to an existing capability",
+  "title": "feat: ",
+  "labels": ["enhancement"],
+  "sections": [
+    {
+      "id": "problem",
+      "kind": "input",
+      "type": "string",
+      "label": "Problem",
+      "description": "User or system limitation being solved and supporting context",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "capability",
+      "kind": "input",
+      "type": "string",
+      "label": "Capability",
+      "description": "Capability to add and its intended observable behavior",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "contract",
+      "kind": "input",
+      "type": "string",
+      "label": "Contract",
+      "description": "API, CLI, behavioral invariant, or compatibility contract",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "acceptance",
+      "kind": "input",
+      "type": "string",
+      "label": "Acceptance criteria",
+      "description": "Verifiable completion criteria",
+      "required": true,
+      "element": "textarea",
+      "defaultValue": "- [ ] "
+    },
+    {
+      "id": "non_goals",
+      "kind": "input",
+      "type": "string",
+      "label": "Non-goals",
+      "description": "Explicit boundary of the feature",
+      "required": true,
+      "element": "textarea"
+    },
+    {
+      "id": "constraints",
+      "kind": "input",
+      "type": "string",
+      "label": "Constraints",
+      "description": "Compatibility, performance, security, or implementation constraints when material",
+      "required": false,
+      "element": "textarea"
+    }
+  ]
+}
