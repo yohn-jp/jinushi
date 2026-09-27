@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/yohn-jp/jinushi/internal/backend"
-	"github.com/yohn-jp/jinushi/internal/ipc"
 	"github.com/yohn-jp/jinushi/internal/model"
 )
 
@@ -48,6 +47,19 @@ func validateLaunchConfig(config launchConfig) error {
 	if config.MaxOutputBytes < 0 || config.MaxOutputBytes > 1<<40 {
 		return errors.New("guardian: invalid output retention limit")
 	}
+	if config.TerminationGraceMs < 100 || config.TerminationGraceMs > 30000 {
+		return errors.New("guardian: invalid termination grace")
+	}
+	if config.SampleIntervalMs < 50 || config.SampleIntervalMs > 60000 {
+		return errors.New("guardian: invalid sample interval")
+	}
+	if config.Spec.Lifetime.Mode == "lease-bound" {
+		if config.InitialLeaseExpiry == nil || config.InitialLeaseExpiry.IsZero() || config.LeaseGeneration == 0 {
+			return errors.New("guardian: lease-bound Run lacks an initial lease")
+		}
+	} else if config.InitialLeaseExpiry != nil || config.LeaseGeneration != 0 {
+		return errors.New("guardian: detached Run has lease metadata")
+	}
 	return nil
 }
 
@@ -62,16 +74,23 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 		spool:      spool,
 		terminal:   make(chan struct{}),
 	}
-	state.snapshot = Snapshot{Version: ProtocolVersion, RunID: config.RunID, State: model.Starting, Resources: unavailableResources()}
+	state.snapshot = Snapshot{
+		Version: ProtocolVersion, RunID: config.RunID, State: model.Starting,
+		Resources: unavailableResources(), LeaseExpiry: config.InitialLeaseExpiry,
+		LeaseGeneration: config.LeaseGeneration,
+	}
 	if err := state.persist(); err != nil {
 		return err
 	}
-	listener, err := ipc.Listen(config.Dir)
+	listener, err := listenControl(config.Dir)
 	if err != nil {
 		state.markStartupFailure("guardian-control-endpoint-failed")
 		return err
 	}
-	defer listener.Close()
+	defer func() {
+		_ = listener.Close()
+		cleanupControl(config.Dir)
+	}()
 	go state.serve(listener)
 
 	selected := factory()
@@ -83,8 +102,18 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 	if config.Spec.Interactive {
 		stdout, stderr = spool.writer("pty"), spool.writer("pty")
 	}
+	state.controlMu.Lock()
+	state.mu.Lock()
+	leaseExpired := state.snapshot.LeaseExpiry != nil && !time.Now().Before(*state.snapshot.LeaseExpiry)
+	state.mu.Unlock()
+	if leaseExpired {
+		state.controlMu.Unlock()
+		state.markNoStartTerminal("cancelled", "lease-expired")
+		return nil
+	}
 	process, err := selected.Start(config.Spec, stdout, stderr)
 	if err != nil {
+		state.controlMu.Unlock()
 		var uncertain *backend.UncertainError
 		if errors.As(err, &uncertain) {
 			state.markUncertainWithOwnership(uncertain.Ownership, "backend-start-cleanup-unproven")
@@ -93,22 +122,31 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 		state.markStartupFailure("backend-start-failed-clean")
 		return nil
 	}
+	if process == nil {
+		state.controlMu.Unlock()
+		state.markStartupFailure("backend-start-returned-no-process")
+		return nil
+	}
 	state.mu.Lock()
 	state.process = process
 	owner := process.Ownership()
-	startedAt := time.Now().UTC()
+	startedMono := time.Now()
+	startedAt := startedMono.UTC()
 	state.snapshot.State = model.Running
 	state.snapshot.Ownership = &owner
 	state.snapshot.StartedAt = &startedAt
+	state.startedMono = startedMono
 	state.snapshot.Output = spool.output()
 	state.snapshot.Resources = unavailableResources()
 	err = state.persistLocked()
 	state.mu.Unlock()
+	state.controlMu.Unlock()
 	if err != nil {
 		// Ownership exists in memory and remains controlled by this helper.
 		// The persisted `starting` state cannot be upgraded safely, so report
 		// uncertainty over the authenticated endpoint and keep owning the Run.
 		state.setMemoryUncertain(owner, "running-ownership-persist-failed")
+		go state.monitor()
 		return state.waitForTerminal()
 	}
 	go state.monitor()
@@ -116,17 +154,16 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 }
 
 type runState struct {
-	mu         sync.Mutex
-	controlMu  sync.Mutex
-	descriptor launchConfig
-	spool      *spool
-	process    backend.Process
-	snapshot   Snapshot
-	terminal   chan struct{}
-	termOnce   sync.Once
+	mu          sync.Mutex
+	controlMu   sync.Mutex
+	descriptor  launchConfig
+	spool       *spool
+	process     backend.Process
+	snapshot    Snapshot
+	startedMono time.Time
+	terminal    chan struct{}
+	termOnce    sync.Once
 }
-
-const limitTerminationGrace = 5 * time.Second
 
 func (s *runState) serve(listener net.Listener) {
 	for {
@@ -196,6 +233,18 @@ func (s *runState) dispatch(request rpcRequest) rpcResponse {
 			return rpcResponse{Error: "output-read-failed"}
 		}
 		return rpcResponse{Chunk: &chunk}
+	case "lease-renew":
+		snapshot, err := s.renewLease(request.LeaseGeneration, request.LeaseMs)
+		if errors.Is(err, ErrLeaseExpired) {
+			return rpcResponse{Error: "lease-expired"}
+		}
+		if errors.Is(err, ErrStaleGeneration) {
+			return rpcResponse{Error: "stale-generation"}
+		}
+		if err != nil {
+			return rpcResponse{Error: "lease-renewal-failed"}
+		}
+		return rpcResponse{Snapshot: &snapshot}
 	default:
 		return rpcResponse{Error: "unsupported operation"}
 	}
@@ -314,19 +363,81 @@ func (s *runState) closeInput() error {
 	return process.CloseInput()
 }
 
+func (s *runState) renewLease(expectedGeneration uint64, leaseMs int64) (Snapshot, error) {
+	if leaseMs < 1000 || leaseMs > maxLeaseDurationMs {
+		return Snapshot{}, errors.New("guardian: lease duration is out of range")
+	}
+	s.controlMu.Lock()
+	s.mu.Lock()
+	current := s.snapshot
+	if current.LeaseExpiry == nil || current.LeaseGeneration == 0 {
+		s.mu.Unlock()
+		s.controlMu.Unlock()
+		return Snapshot{}, errors.New("guardian: Run is not lease-bound")
+	}
+	if !time.Now().Before(*current.LeaseExpiry) {
+		s.mu.Unlock()
+		s.controlMu.Unlock()
+		go s.terminate(time.Duration(s.descriptor.TerminationGraceMs)*time.Millisecond, "lease-expired")
+		return Snapshot{}, ErrLeaseExpired
+	}
+	if current.LeaseGeneration == expectedGeneration+1 && current.LastLeaseExpectedGeneration == expectedGeneration && current.LastLeaseMs == leaseMs {
+		s.mu.Unlock()
+		s.controlMu.Unlock()
+		return current, nil
+	}
+	if current.LeaseGeneration != expectedGeneration {
+		s.mu.Unlock()
+		s.controlMu.Unlock()
+		return Snapshot{}, ErrStaleGeneration
+	}
+	if current.State != model.Starting && current.State != model.Running {
+		s.mu.Unlock()
+		s.controlMu.Unlock()
+		return Snapshot{}, ErrUncertain
+	}
+	now := time.Now().UTC()
+	expiry := now.Add(time.Duration(leaseMs) * time.Millisecond)
+	next := current
+	next.LastLeaseExpectedGeneration = expectedGeneration
+	next.LastLeaseMs = leaseMs
+	next.LeaseGeneration++
+	next.LeaseExpiry = &expiry
+	if err := writeSnapshot(s.descriptor.Dir, next); err != nil {
+		s.mu.Unlock()
+		s.controlMu.Unlock()
+		return Snapshot{}, ErrUncertain
+	}
+	s.snapshot = next
+	s.mu.Unlock()
+	s.controlMu.Unlock()
+	return next, nil
+}
+
 func (s *runState) monitor() {
-	sample := time.NewTicker(time.Second)
+	sample := time.NewTicker(time.Duration(s.descriptor.SampleIntervalMs) * time.Millisecond)
 	defer sample.Stop()
+	deadline := time.NewTicker(50 * time.Millisecond)
+	defer deadline.Stop()
 	wait := make(chan struct{})
 	go func() {
 		defer close(wait)
+		var exit backend.Exit
+		waitProven := false
 		for {
-			exit, err := s.process.Wait()
-			if err == nil {
-				s.finish(exit)
+			if !waitProven {
+				observed, err := s.process.Wait()
+				if err != nil {
+					s.markUncertain("owned-tree-empty-unproven")
+					time.Sleep(time.Second)
+					continue
+				}
+				exit = observed
+				waitProven = true
+			}
+			if s.finish(exit) {
 				return
 			}
-			s.markUncertain("owned-tree-empty-unproven")
 			time.Sleep(time.Second)
 		}
 	}()
@@ -338,7 +449,29 @@ func (s *runState) monitor() {
 			return
 		case <-sample.C:
 			s.sample()
+		case <-deadline.C:
+			s.enforceDeadlines()
 		}
+	}
+}
+
+func (s *runState) enforceDeadlines() {
+	s.mu.Lock()
+	if s.snapshot.State != model.Running || s.snapshot.Termination.Requested {
+		s.mu.Unlock()
+		return
+	}
+	startedAt := s.startedMono
+	leaseExpiry := s.snapshot.LeaseExpiry
+	reason := ""
+	if s.descriptor.Spec.Limits.WallTimeMs > 0 && !startedAt.IsZero() && time.Since(startedAt) >= time.Duration(s.descriptor.Spec.Limits.WallTimeMs)*time.Millisecond {
+		reason = "timed-out"
+	} else if leaseExpiry != nil && !time.Now().Before(*leaseExpiry) {
+		reason = "lease-expired"
+	}
+	s.mu.Unlock()
+	if reason != "" {
+		_, _ = s.terminate(time.Duration(s.descriptor.TerminationGraceMs)*time.Millisecond, reason)
 	}
 }
 
@@ -361,21 +494,29 @@ func (s *runState) sample() {
 	}
 	s.snapshot.Output = s.spool.output()
 	err := s.persistLocked()
-	triggerLimit := err == nil && s.snapshot.LimitOutcome != "" && s.snapshot.State != model.Terminal && !s.snapshot.Termination.TreeEmpty
-	outcome := s.snapshot.LimitOutcome
+	terminationReason := ""
+	if err == nil && s.snapshot.State == model.Running && !s.snapshot.Termination.Requested {
+		if s.snapshot.LimitOutcome != "" {
+			terminationReason = s.snapshot.LimitOutcome
+		} else if s.descriptor.Spec.Limits.WallTimeMs > 0 && !s.startedMono.IsZero() && time.Since(s.startedMono) >= time.Duration(s.descriptor.Spec.Limits.WallTimeMs)*time.Millisecond {
+			terminationReason = "timed-out"
+		} else if s.snapshot.LeaseExpiry != nil && !time.Now().Before(*s.snapshot.LeaseExpiry) {
+			terminationReason = "lease-expired"
+		}
+	}
 	s.mu.Unlock()
-	if triggerLimit {
-		_, _ = s.terminate(limitTerminationGrace, outcome)
+	if terminationReason != "" {
+		_, _ = s.terminate(time.Duration(s.descriptor.TerminationGraceMs)*time.Millisecond, terminationReason)
 	}
 }
 
-func (s *runState) finish(exit backend.Exit) {
+func (s *runState) finish(exit backend.Exit) bool {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
-	if err := s.spool.sync(); err != nil {
-		s.markUncertain("output-spool-sync-failed")
-		return
-	}
+	// Physical terminal proof is independent from output durability. A failed
+	// spool sync marks history incomplete but must not turn a proven empty tree
+	// into an uncertain process outcome.
+	_ = s.spool.sync()
 	s.mu.Lock()
 	resources := s.snapshot.Resources
 	limitOutcome := s.snapshot.LimitOutcome
@@ -420,6 +561,12 @@ func (s *runState) finish(exit backend.Exit) {
 		limitOutcome = s.snapshot.LimitOutcome
 		outcome = "resource-limit"
 	}
+	switch s.snapshot.TerminationReason {
+	case "timed-out":
+		outcome = "timed-out"
+	case "lease-expired", "cancelled":
+		outcome = "cancelled"
+	}
 	s.snapshot.State = model.Terminal
 	s.snapshot.LimitOutcome = limitOutcome
 	s.snapshot.Resources = resources
@@ -441,10 +588,11 @@ func (s *runState) finish(exit backend.Exit) {
 		s.snapshot.Reason = "terminal-receipt-persist-failed"
 		_ = s.persistLocked()
 		s.mu.Unlock()
-		return
+		return false
 	}
 	s.termOnce.Do(func() { close(s.terminal) })
 	s.mu.Unlock()
+	return true
 }
 
 func (s *runState) markStartupFailure(reason string) {
@@ -454,8 +602,29 @@ func (s *runState) markStartupFailure(reason string) {
 	s.snapshot.State = model.Terminal
 	s.snapshot.Reason = boundedReason(reason)
 	s.snapshot.FinishedAt = &finished
+	s.snapshot.Termination.TreeEmpty = true
 	s.snapshot.Output = s.spool.output()
 	receipt := model.Receipt{Version: 1, RunID: s.snapshot.RunID, Outcome: "startup-failed", FinishedAt: finished, Resources: unavailableResources(), Output: s.snapshot.Output, Cleanup: "complete"}
+	s.snapshot.Receipt = &receipt
+	_ = s.persistLocked()
+	s.termOnce.Do(func() { close(s.terminal) })
+	s.mu.Unlock()
+}
+
+func (s *runState) markNoStartTerminal(outcome, reason string) {
+	finished := time.Now().UTC()
+	s.mu.Lock()
+	s.snapshot.State = model.Terminal
+	s.snapshot.Reason = boundedReason(reason)
+	s.snapshot.TerminationReason = boundedReason(reason)
+	s.snapshot.Termination.TreeEmpty = true
+	s.snapshot.FinishedAt = &finished
+	s.snapshot.Output = s.spool.output()
+	receipt := model.Receipt{
+		Version: 1, RunID: s.snapshot.RunID, Outcome: outcome,
+		FinishedAt: finished, Resources: unavailableResources(),
+		Output: s.snapshot.Output, Cleanup: "complete",
+	}
 	s.snapshot.Receipt = &receipt
 	_ = s.persistLocked()
 	s.termOnce.Do(func() { close(s.terminal) })

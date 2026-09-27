@@ -23,15 +23,21 @@ var (
 	ErrUnavailable     = errors.New("guardian: helper is unavailable")
 	ErrAlreadyStarted  = errors.New("guardian: run directory already has a descriptor")
 	ErrInvalidIdentity = errors.New("guardian: invalid run identity")
+	ErrLeaseExpired    = errors.New("guardian: lease has expired")
+	ErrStaleGeneration = errors.New("guardian: stale lease generation")
 )
 
 // Config is transient launch data. Spec, including its environment values,
 // travels to the helper over stdin and is never written to the state dir.
 type Config struct {
-	RunID          string
-	Dir            string
-	Spec           model.RunSpec
-	MaxOutputBytes int64
+	RunID              string
+	Dir                string
+	Spec               model.RunSpec
+	MaxOutputBytes     int64
+	InitialLeaseExpiry *time.Time
+	LeaseGeneration    uint64
+	TerminationGraceMs int64
+	SampleIntervalMs   int64
 }
 
 // Descriptor contains only a private state path for reconnect. Authentication
@@ -53,20 +59,24 @@ type privateDescriptor struct {
 // longer reachable. A running snapshot does not itself prove the current OS
 // state; callers must reconnect or ask the backend to reconcile ownership.
 type Snapshot struct {
-	Version           int                       `json:"version"`
-	RunID             string                    `json:"runId"`
-	State             model.State               `json:"state"`
-	Ownership         *model.Ownership          `json:"ownership,omitempty"`
-	Resources         model.Resources           `json:"resources"`
-	Output            model.Output              `json:"output"`
-	StartedAt         *time.Time                `json:"startedAt,omitempty"`
-	FinishedAt        *time.Time                `json:"finishedAt,omitempty"`
-	Receipt           *model.Receipt            `json:"receipt,omitempty"`
-	LimitOutcome      string                    `json:"limitOutcome,omitempty"`
-	Termination       backend.TerminationResult `json:"termination"`
-	TerminationReason string                    `json:"terminationReason,omitempty"`
-	Reason            string                    `json:"reason,omitempty"`
-	Live              bool                      `json:"-"`
+	Version                     int                       `json:"version"`
+	RunID                       string                    `json:"runId"`
+	State                       model.State               `json:"state"`
+	Ownership                   *model.Ownership          `json:"ownership,omitempty"`
+	Resources                   model.Resources           `json:"resources"`
+	Output                      model.Output              `json:"output"`
+	StartedAt                   *time.Time                `json:"startedAt,omitempty"`
+	FinishedAt                  *time.Time                `json:"finishedAt,omitempty"`
+	Receipt                     *model.Receipt            `json:"receipt,omitempty"`
+	LimitOutcome                string                    `json:"limitOutcome,omitempty"`
+	LeaseExpiry                 *time.Time                `json:"leaseExpiry,omitempty"`
+	LeaseGeneration             uint64                    `json:"leaseGeneration"`
+	LastLeaseExpectedGeneration uint64                    `json:"lastLeaseExpectedGeneration"`
+	LastLeaseMs                 int64                     `json:"lastLeaseMs"`
+	Termination                 backend.TerminationResult `json:"termination"`
+	TerminationReason           string                    `json:"terminationReason,omitempty"`
+	Reason                      string                    `json:"reason,omitempty"`
+	Live                        bool                      `json:"-"`
 }
 
 // Evidence is an immutable completed execution receipt plus its final
@@ -135,6 +145,10 @@ func (h *Handle) Observe(ctx context.Context) (Snapshot, error) {
 func (h *Handle) Probe(ctx context.Context) (Snapshot, error) { return h.probe(ctx) }
 
 func (h *Handle) Wait(ctx context.Context) (Evidence, error) { return h.wait(ctx) }
+
+func (h *Handle) RenewLease(ctx context.Context, expectedGeneration uint64, leaseMs int64) (Snapshot, error) {
+	return h.renewLease(ctx, expectedGeneration, leaseMs)
+}
 
 func (h *Handle) Signal(ctx context.Context, name string) error {
 	return h.signal(ctx, name)

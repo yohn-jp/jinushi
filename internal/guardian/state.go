@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/yohn-jp/jinushi/internal/model"
 )
@@ -17,12 +18,16 @@ const (
 )
 
 type launchConfig struct {
-	Version        int          `json:"version"`
-	RunID          string       `json:"runId"`
-	Dir            string       `json:"dir"`
-	Spec           modelRunSpec `json:"spec"`
-	MaxOutputBytes int64        `json:"maxOutputBytes"`
-	Token          string       `json:"token"`
+	Version            int          `json:"version"`
+	RunID              string       `json:"runId"`
+	Dir                string       `json:"dir"`
+	Spec               modelRunSpec `json:"spec"`
+	MaxOutputBytes     int64        `json:"maxOutputBytes"`
+	InitialLeaseExpiry *time.Time   `json:"initialLeaseExpiry,omitempty"`
+	LeaseGeneration    uint64       `json:"leaseGeneration,omitempty"`
+	TerminationGraceMs int64        `json:"terminationGraceMs"`
+	SampleIntervalMs   int64        `json:"sampleIntervalMs"`
+	Token              string       `json:"token"`
 }
 
 // modelRunSpec keeps the JSON protocol internal without changing or

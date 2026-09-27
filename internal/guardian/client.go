@@ -17,31 +17,35 @@ import (
 	"time"
 
 	"github.com/yohn-jp/jinushi/internal/backend"
-	"github.com/yohn-jp/jinushi/internal/ipc"
 	"github.com/yohn-jp/jinushi/internal/model"
 )
 
 const (
-	defaultMaxOutputBytes = int64(8 << 20)
-	startupWait           = 15 * time.Second
-	outputPollInterval    = 100 * time.Millisecond
+	defaultMaxOutputBytes     = int64(8 << 20)
+	defaultTerminationGraceMs = int64(2000)
+	defaultSampleIntervalMs   = int64(1000)
+	maxLeaseDurationMs        = int64((30 * 24 * time.Hour) / time.Millisecond)
+	startupWait               = 15 * time.Second
+	outputPollInterval        = 100 * time.Millisecond
 )
 
 var runIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 type rpcRequest struct {
-	Version int    `json:"version"`
-	Token   string `json:"token"`
-	Op      string `json:"op"`
-	Signal  string `json:"signal,omitempty"`
-	Data    []byte `json:"data,omitempty"`
-	Rows    uint16 `json:"rows,omitempty"`
-	Cols    uint16 `json:"cols,omitempty"`
-	GraceMS int64  `json:"graceMs,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-	Stream  string `json:"stream,omitempty"`
-	Offset  int64  `json:"offset,omitempty"`
-	Limit   int64  `json:"limit,omitempty"`
+	Version         int    `json:"version"`
+	Token           string `json:"token"`
+	Op              string `json:"op"`
+	Signal          string `json:"signal,omitempty"`
+	Data            []byte `json:"data,omitempty"`
+	Rows            uint16 `json:"rows,omitempty"`
+	Cols            uint16 `json:"cols,omitempty"`
+	GraceMS         int64  `json:"graceMs,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+	Stream          string `json:"stream,omitempty"`
+	Offset          int64  `json:"offset,omitempty"`
+	Limit           int64  `json:"limit,omitempty"`
+	LeaseGeneration uint64 `json:"leaseGeneration,omitempty"`
+	LeaseMs         int64  `json:"leaseMs,omitempty"`
 }
 
 type rpcResponse struct {
@@ -82,6 +86,25 @@ func startHelper(ctx context.Context, executable string, config Config) (*Handle
 	if config.MaxOutputBytes == 0 {
 		config.MaxOutputBytes = defaultMaxOutputBytes
 	}
+	if config.TerminationGraceMs == 0 {
+		config.TerminationGraceMs = defaultTerminationGraceMs
+	}
+	if config.SampleIntervalMs == 0 {
+		config.SampleIntervalMs = defaultSampleIntervalMs
+	}
+	if config.TerminationGraceMs < 100 || config.TerminationGraceMs > 30000 {
+		return nil, errors.New("guardian: termination grace is out of range")
+	}
+	if config.SampleIntervalMs < 50 || config.SampleIntervalMs > 60000 {
+		return nil, errors.New("guardian: sample interval is out of range")
+	}
+	if config.Spec.Lifetime.Mode == "lease-bound" {
+		if config.InitialLeaseExpiry == nil || config.InitialLeaseExpiry.IsZero() || config.LeaseGeneration == 0 {
+			return nil, errors.New("guardian: initial lease expiry and generation are required")
+		}
+	} else if config.InitialLeaseExpiry != nil || config.LeaseGeneration != 0 {
+		return nil, errors.New("guardian: lease metadata requires a lease-bound Run")
+	}
 	if config.Spec.Limits.OutputBytes > 0 && config.Spec.Limits.OutputBytes < config.MaxOutputBytes {
 		config.MaxOutputBytes = config.Spec.Limits.OutputBytes
 	}
@@ -103,14 +126,20 @@ func startHelper(ctx context.Context, executable string, config Config) (*Handle
 	if err := writeDescriptor(descriptor); err != nil {
 		return nil, err
 	}
-	initial := Snapshot{Version: ProtocolVersion, RunID: config.RunID, State: model.Starting, Resources: unavailableResources()}
+	initial := Snapshot{
+		Version: ProtocolVersion, RunID: config.RunID, State: model.Starting,
+		Resources: unavailableResources(), LeaseExpiry: config.InitialLeaseExpiry,
+		LeaseGeneration: config.LeaseGeneration,
+	}
 	if err := writeSnapshot(dir, initial); err != nil {
 		_ = os.Remove(filepath.Join(dir, descriptorName))
 		return nil, err
 	}
 	lcfg := launchConfig{
 		Version: ProtocolVersion, RunID: config.RunID, Dir: dir, Spec: config.Spec,
-		MaxOutputBytes: config.MaxOutputBytes, Token: token,
+		MaxOutputBytes: config.MaxOutputBytes, InitialLeaseExpiry: config.InitialLeaseExpiry,
+		LeaseGeneration: config.LeaseGeneration, TerminationGraceMs: config.TerminationGraceMs,
+		SampleIntervalMs: config.SampleIntervalMs, Token: token,
 	}
 	configBytes, err := json.Marshal(lcfg)
 	if err != nil {
@@ -303,6 +332,20 @@ func (h *Handle) signal(ctx context.Context, name string) error {
 	return err
 }
 
+func (h *Handle) renewLease(ctx context.Context, expectedGeneration uint64, leaseMs int64) (Snapshot, error) {
+	if leaseMs < 1000 || leaseMs > maxLeaseDurationMs {
+		return Snapshot{}, errors.New("guardian: lease duration is out of range")
+	}
+	response, err := h.call(ctx, rpcRequest{Op: "lease-renew", LeaseGeneration: expectedGeneration, LeaseMs: leaseMs})
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if response.Snapshot == nil {
+		return Snapshot{}, errors.New("guardian: helper returned no lease state")
+	}
+	return *response.Snapshot, nil
+}
+
 func (h *Handle) terminate(ctx context.Context, grace time.Duration, reason string) (backend.TerminationResult, error) {
 	snapshot, err := readSnapshot(h.descriptor.Dir)
 	if err == nil && snapshot.State == model.Terminal {
@@ -448,7 +491,7 @@ func (h *Handle) call(ctx context.Context, request rpcRequest) (rpcResponse, err
 	if len(data) > maxRPCBytes {
 		return rpcResponse{}, errors.New("guardian: request exceeds bounded frame")
 	}
-	conn, err := ipc.Dial(ctx, h.descriptor.Dir)
+	conn, err := dialControl(ctx, h.descriptor.Dir)
 	if err != nil {
 		return rpcResponse{}, ErrUnavailable
 	}
@@ -470,6 +513,12 @@ func (h *Handle) call(ctx context.Context, request rpcRequest) (rpcResponse, err
 		return rpcResponse{}, errors.New("guardian: unsupported response version")
 	}
 	if response.Error != "" {
+		switch response.Error {
+		case "lease-expired":
+			return rpcResponse{}, ErrLeaseExpired
+		case "stale-generation":
+			return rpcResponse{}, ErrStaleGeneration
+		}
 		return rpcResponse{}, errors.New("guardian: " + response.Error)
 	}
 	return response, nil
