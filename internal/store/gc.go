@@ -216,8 +216,11 @@ func (s *Store) CollectTerminal(policy RetentionPolicy, now time.Time) (GCResult
 		return GCResult{}, err
 	}
 	snapshot, snapshotErr := s.db.databaseUsageSnapshot()
+	if snapshotErr != nil {
+		return result, fmt.Errorf("inspect database after terminal collection: %w", snapshotErr)
+	}
 	freeBytes := int64(snapshot.stats.FreePageN+snapshot.stats.PendingPageN) * int64(snapshot.pageSize)
-	if snapshotErr == nil && policy.CompactMinFreeBytes > 0 && freeBytes >= policy.CompactMinFreeBytes {
+	if policy.CompactMinFreeBytes > 0 && freeBytes >= policy.CompactMinFreeBytes {
 		freeRatio := float64(freeBytes) / float64(max(snapshot.databaseBytes, int64(1)))
 		result.CompactionRecommended = policy.CompactMinFreeRatio <= 0 || freeRatio >= policy.CompactMinFreeRatio
 	}
