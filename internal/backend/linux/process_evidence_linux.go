@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	maxEvidenceProcesses    = 4096
+	maxEvidenceProcesses    = 1024
 	maxEvidenceProcEntries  = 65536
 	maxEvidenceCommBytes    = 256
 	maxEvidenceProcStatSize = 8192
@@ -41,6 +41,10 @@ func (p *Process) Evidence() (model.TelemetrySample, error) {
 }
 
 func (p *Process) collectEvidenceLocked(observedAt time.Time) (model.TelemetrySample, error) {
+	return p.collectEvidenceAtProcRootLocked(observedAt, "/proc")
+}
+
+func (p *Process) collectEvidenceAtProcRootLocked(observedAt time.Time, procRoot string) (model.TelemetrySample, error) {
 	sample := model.TelemetrySample{
 		Version:    model.TelemetrySchemaVersion,
 		ObservedAt: observedAt.UTC(),
@@ -72,7 +76,7 @@ func (p *Process) collectEvidenceLocked(observedAt time.Time) (model.TelemetrySa
 			sample.IO = observeCgroupIO(p.cg)
 			sample.PSI = observeCgroupPSI(p.cg)
 			var err error
-			current, complete, err = scanCgroupProcessEvidence(p.cg, "/proc")
+			current, complete, err = scanCgroupProcessEvidence(p.cg, procRoot)
 			if err != nil {
 				reason = "cgroup-process-membership-unavailable"
 				if errors.Is(err, errEvidenceTruncated) {
@@ -88,7 +92,7 @@ func (p *Process) collectEvidenceLocked(observedAt time.Time) (model.TelemetrySa
 			failures = append(failures, err)
 		} else {
 			var infos []procInfo
-			infos, complete, err = scanSubreaperProcInfosBounded("/proc", parsed.Subreaper)
+			infos, complete, err = scanSubreaperProcInfosBounded(procRoot, parsed.Subreaper)
 			if err != nil {
 				reason = "subreaper-process-membership-unavailable"
 				if errors.Is(err, errEvidenceTruncated) {
@@ -100,7 +104,7 @@ func (p *Process) collectEvidenceLocked(observedAt time.Time) (model.TelemetrySa
 				sample.Resources = unavailableResources()
 			} else {
 				var factsComplete bool
-				current, factsComplete = processEvidenceFromInfos("/proc", infos)
+				current, factsComplete = processEvidenceFromInfos(procRoot, infos)
 				if !factsComplete {
 					complete = false
 					reason = "process-evidence-incomplete"

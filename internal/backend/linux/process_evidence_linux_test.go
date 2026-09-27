@@ -75,6 +75,68 @@ func TestCgroupPIDEvidenceParserIsBoundedAndRejectsInvalidIdentity(t *testing.T)
 	}
 }
 
+func TestProcessEvidenceTruncationMatchesStoreProcessLimit(t *testing.T) {
+	bootID, err := readBootID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reaper := subreaperIdentity{PID: 10, StartTime: 100}
+
+	for _, test := range []struct {
+		name         string
+		processCount int
+		wantStatus   model.EvidenceStatus
+		wantReason   string
+		wantComplete bool
+	}{
+		{
+			name:         "at store limit",
+			processCount: maxEvidenceProcesses,
+			wantStatus:   model.EvidenceMeasured,
+			wantReason:   "membership-baseline-established",
+			wantComplete: false,
+		},
+		{
+			name:         "one over store limit",
+			processCount: maxEvidenceProcesses + 1,
+			wantStatus:   model.EvidenceUnavailable,
+			wantReason:   "process-membership-truncated",
+			wantComplete: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			procRoot := t.TempDir()
+			writeProcFixture(t, procRoot, reaper.PID, "reaper", 1, 10, 10, 0, 0, reaper.StartTime, 1)
+			for index := 0; index < test.processCount; index++ {
+				pid := 1000 + index
+				writeProcFixture(t, procRoot, pid, "worker", reaper.PID, 10, 10, 1, 0, uint64(200+index), 1)
+			}
+
+			process := &Process{ownership: model.Ownership{
+				Backend:      "linux",
+				PID:          1000,
+				ProcessGroup: 10,
+				Token:        ownershipTokenWithSubreaper(bootID, 10, reaper),
+			}}
+			sample, err := process.collectEvidenceAtProcRootLocked(time.Now().UTC(), procRoot)
+			if err != nil {
+				t.Fatalf("collect process evidence: %v", err)
+			}
+			if sample.ProcessEvidenceStatus != test.wantStatus || sample.ProcessEvidenceReason != test.wantReason || sample.ProcessEvidenceComplete != test.wantComplete {
+				t.Fatalf("process evidence status = (%q, %q, complete=%t), want (%q, %q, complete=%t)",
+					sample.ProcessEvidenceStatus, sample.ProcessEvidenceReason, sample.ProcessEvidenceComplete,
+					test.wantStatus, test.wantReason, test.wantComplete)
+			}
+			if len(sample.Processes) > maxEvidenceProcesses {
+				t.Fatalf("producer emitted %d processes above the store limit %d", len(sample.Processes), maxEvidenceProcesses)
+			}
+			if test.processCount == maxEvidenceProcesses && len(sample.Processes) != maxEvidenceProcesses {
+				t.Fatalf("at-limit process evidence count = %d, want %d", len(sample.Processes), maxEvidenceProcesses)
+			}
+		})
+	}
+}
+
 func TestProcessEvidenceCommIsBoundedAndSanitized(t *testing.T) {
 	if got := sanitizeProcessComm([]byte("tool\x00name\r\n")); got != "tool�name�" {
 		t.Fatalf("sanitized comm = %q", got)
