@@ -49,6 +49,42 @@ client / orchestrator / CLI
 
 The CLI is a client of the same local runtime protocol; it is not the runtime's semantic authority.
 
+## Run it locally
+
+Build with Go 1.26 or newer, then start one resident supervisor in a separate terminal:
+
+```sh
+go build -o jinushi ./cmd/jinushi
+./jinushi supervisor --state-dir ./jinushi-state
+```
+
+Submit a command from another terminal. The JSON response contains the stable `runId`; use it for observation and control:
+
+```sh
+./jinushi run --state-dir ./jinushi-state -- /bin/sh -c 'printf hello'
+./jinushi await --state-dir ./jinushi-state <run-id>
+./jinushi output --state-dir ./jinushi-state <run-id>
+./jinushi events --state-dir ./jinushi-state <run-id>
+./jinushi capabilities --state-dir ./jinushi-state
+```
+
+On Windows, supply a Windows executable instead of `/bin/sh`. `run --wait` waits for the physical terminal receipt. Closing a client does not cancel a detached Run. Hard resource limits are accepted only when `capabilities` reports native enforcement on that host.
+
+The supervisor reads optional `config.json` from its state directory at startup. Omitted fields use built-in defaults; invalid or unknown fields prevent startup. For example:
+
+```json
+{
+  "sampleIntervalMs": 250,
+  "terminationGraceMs": 2000,
+  "defaultOutputBytes": 1048576,
+  "maxOutputBytes": 67108864,
+  "eventRetentionCount": 4096,
+  "eventRetentionBytes": 16777216
+}
+```
+
+Other supervisor ceilings are `maxWallTimeMs`, `maxMemoryBytes`, and `maxProcessCount`. Per-Run requests may narrow these limits. The state directory is local private runtime data, and environment values are not returned by normal Run observation.
+
 Representative public operations:
 
 ```text
