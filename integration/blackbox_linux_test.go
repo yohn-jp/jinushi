@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,13 +30,12 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		fmt.Fprintln(os.Stderr, "locate blackbox test source")
+	var err error
+	buildRoot, err = moduleRoot()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "locate Jinushi module root:", err)
 		os.Exit(1)
 	}
-	buildRoot = filepath.Dir(filepath.Dir(source))
-	var err error
 	buildDir, err := os.MkdirTemp("", "jinushi-blackbox-build-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "create blackbox build directory:", err)
@@ -60,10 +58,27 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+func moduleRoot() (string, error) {
+	current, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for directory := current; ; directory = filepath.Dir(directory) {
+		if _, err := os.Stat(filepath.Join(directory, "go.mod")); err == nil {
+			return directory, nil
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			break
+		}
+	}
+	return "", fmt.Errorf("no go.mod found above %s", current)
+}
+
 func buildBinary(dir, output, packagePath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", output, packagePath)
+	cmd := exec.CommandContext(ctx, "go", "build", "-buildvcs=false", "-o", output, packagePath)
 	cmd.Dir = dir
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
