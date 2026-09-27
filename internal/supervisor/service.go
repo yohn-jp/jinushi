@@ -776,12 +776,28 @@ func (s *Service) events(req protocol.Request) protocol.Response {
 		return failure("run-not-found", "Run not found")
 	}
 	out := response()
-	out.Events = events
 	out.RetainedFrom = from
 	out.Gap = gap
 	if run, err := s.store.Get(req.RunID); err == nil {
-		clean := publicRun(run)
-		out.Run = &clean
+		// Event consumers need the current lifecycle state. Keeping this
+		// projection small leaves room for an individually bounded event.
+		out.Run = &model.Run{ID: run.ID, State: run.State, Generation: run.Generation}
+	}
+	base, err := json.Marshal(out)
+	if err != nil {
+		return failure("storage-failure", "event response could not be encoded")
+	}
+	used := len(base) + len(`,"events":[]`)
+	for _, event := range events {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			return failure("storage-failure", "event could not be encoded")
+		}
+		if used+len(encoded)+1 >= protocol.MaxFrame-4096 {
+			break
+		}
+		out.Events = append(out.Events, event)
+		used += len(encoded) + 1
 	}
 	return out
 }
@@ -1026,6 +1042,16 @@ func (s *Service) resize(req protocol.Request) protocol.Response {
 }
 
 func (s *Service) signal(req protocol.Request) protocol.Response {
+	allowed := false
+	for _, name := range s.backend.Capabilities().Signals {
+		if req.Signal == name {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return failure("invalid-request", "signal is not supported by this backend")
+	}
 	a, out := s.lookupActive(req.RunID)
 	if a == nil {
 		return out

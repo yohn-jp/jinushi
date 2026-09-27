@@ -95,3 +95,33 @@ func TestOversizedAcceptedResponseDoesNotCreateRun(t *testing.T) {
 		t.Fatalf("oversized request persisted %d Runs: %v", len(runs), err)
 	}
 }
+
+func TestEventPagesBoundBytesAndResumeWithoutGap(t *testing.T) {
+	db, err := store.Open(t.TempDir()+"/state.db", store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	run := model.Run{ID: "run-events", State: model.Accepted, Generation: 1, Spec: model.RunSpec{Argv: []string{"true"}, Cwd: "/"}}
+	if _, _, err := db.Create(run, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := db.AppendEvent(run.ID, model.Event{Kind: "large.observation", Body: map[string]any{"data": strings.Repeat("x", 230000)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := newService(t.TempDir(), db, nil, defaultConfig())
+	first := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "events", RunID: run.ID, Limit: 100})
+	if first.Error != nil || first.Gap || len(first.Events) != 4 {
+		t.Fatalf("first event page: error=%+v gap=%v count=%d", first.Error, first.Gap, len(first.Events))
+	}
+	encoded, err := json.Marshal(first)
+	if err != nil || len(encoded) >= protocol.MaxFrame {
+		t.Fatalf("first event frame size=%d err=%v", len(encoded), err)
+	}
+	second := svc.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "events", RunID: run.ID, After: first.Events[len(first.Events)-1].Seq, Limit: 100})
+	if second.Error != nil || second.Gap || len(second.Events) != 1 || second.Events[0].Seq != 5 {
+		t.Fatalf("second event page: error=%+v gap=%v events=%v", second.Error, second.Gap, second.Events)
+	}
+}
