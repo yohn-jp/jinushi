@@ -22,6 +22,12 @@ type guardedExecutor struct {
 	config     Config
 }
 
+type cleanStartTerminal struct{ outcome string }
+
+func (e *cleanStartTerminal) Error() string {
+	return "workload finished before ownership establishment: " + e.outcome
+}
+
 func newGuardedExecutor(root string, config Config) (*guardedExecutor, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -38,22 +44,29 @@ func (g *guardedExecutor) Capabilities() model.Capabilities {
 
 func (g *guardedExecutor) runDir(id string) string { return filepath.Join(g.root, "runs", id) }
 
-func (g *guardedExecutor) Start(id string, spec model.RunSpec, stdout, stderr io.Writer) (physical, error) {
+func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stderr io.Writer) (physical, error) {
 	max := spec.Limits.OutputBytes
 	if max == 0 {
 		max = g.config.DefaultOutputBytes
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	h, err := guardian.Start(ctx, g.executable, guardian.Config{RunID: id, Dir: g.runDir(id), Spec: spec, MaxOutputBytes: max})
+	h, err := guardian.Start(ctx, g.executable, guardian.Config{
+		RunID: run.ID, Dir: g.runDir(run.ID), Spec: spec, MaxOutputBytes: max,
+		InitialLeaseExpiry: run.LeaseExpiry, LeaseGeneration: run.LeaseGeneration,
+		TerminationGraceMs: g.config.TerminationGraceMs, SampleIntervalMs: g.config.SampleIntervalMs,
+	})
 	if h == nil {
 		return nil, err
 	}
 	p := newGuardianPhysical(h, spec.Interactive, stdout, stderr)
 	if snap, obErr := h.Observe(ctx); obErr == nil && snap.Ownership != nil {
 		p.ownership = *snap.Ownership
-	} else if obErr == nil && snap.State == model.Terminal && snap.Receipt != nil && snap.Receipt.Outcome == "startup-failed" && snap.Receipt.Cleanup == "complete" {
-		return nil, fmt.Errorf("workload startup failed")
+	} else if obErr == nil && snap.State == model.Terminal && snap.Receipt != nil && snap.Receipt.Cleanup == "complete" {
+		if snap.Receipt.Outcome == "startup-failed" {
+			return nil, fmt.Errorf("workload startup failed")
+		}
+		return nil, &cleanStartTerminal{outcome: snap.Receipt.Outcome}
 	}
 	if err != nil {
 		return p, err
@@ -88,7 +101,7 @@ func (g *guardedExecutor) Reconcile(id string, owned *model.Ownership, interacti
 		if snap.LimitOutcome != "" {
 			outcome = snap.LimitOutcome
 		}
-		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason}, nil
+		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap)}, nil
 	}
 	if snap.Ownership == nil {
 		return reconcileResult{}, errors.New("guardian ownership absent")
@@ -106,7 +119,11 @@ func (g *guardedExecutor) Reconcile(id string, owned *model.Ownership, interacti
 	if err := p.syncOutput(); err != nil {
 		return reconcileResult{}, err
 	}
-	return reconcileResult{live: true, process: p, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason}, nil
+	return reconcileResult{live: true, process: p, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap)}, nil
+}
+
+func leaseFromSnapshot(snap guardian.Snapshot) leaseState {
+	return leaseState{expiry: snap.LeaseExpiry, generation: snap.LeaseGeneration, lastExpectedGeneration: snap.LastLeaseExpectedGeneration, lastMs: snap.LastLeaseMs}
 }
 
 type outputGapRecorder interface{ RecordGap(int64) error }
@@ -210,6 +227,16 @@ func (p *guardianPhysical) Observe() (model.Resources, error) {
 		return model.Resources{}, err
 	}
 	return snap.Resources, nil
+}
+
+func (p *guardianPhysical) RenewLease(expectedGeneration uint64, leaseMs int64) (leaseState, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	snapshot, err := p.h.RenewLease(ctx, expectedGeneration, leaseMs)
+	if err != nil {
+		return leaseState{}, err
+	}
+	return leaseFromSnapshot(snapshot), nil
 }
 
 func (p *guardianPhysical) Signal(name string) error {

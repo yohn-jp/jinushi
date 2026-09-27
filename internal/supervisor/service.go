@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yohn-jp/jinushi/internal/guardian"
 	"github.com/yohn-jp/jinushi/internal/model"
 	"github.com/yohn-jp/jinushi/internal/protocol"
 	"github.com/yohn-jp/jinushi/internal/store"
@@ -45,6 +46,14 @@ type reconcileResult struct {
 	ownership         *model.Ownership
 	state             model.State
 	terminationReason string
+	lease             leaseState
+}
+
+type leaseState struct {
+	expiry                 *time.Time
+	generation             uint64
+	lastExpectedGeneration uint64
+	lastMs                 int64
 }
 
 type physical interface {
@@ -60,12 +69,13 @@ type physical interface {
 
 type executor interface {
 	Capabilities() model.Capabilities
-	Start(string, model.RunSpec, io.Writer, io.Writer) (physical, error)
+	Start(model.Run, model.RunSpec, io.Writer, io.Writer) (physical, error)
 	Reconcile(string, *model.Ownership, bool, io.Writer, io.Writer) (reconcileResult, error)
 }
 
 type active struct {
 	mu          sync.Mutex
+	leaseMu     sync.Mutex
 	run         model.Run
 	spec        model.RunSpec
 	process     physical
@@ -343,6 +353,8 @@ func (s *Service) transition(a *active, state model.State, kind string, body map
 }
 
 func (s *Service) start(a *active) {
+	a.leaseMu.Lock()
+	defer a.leaseMu.Unlock()
 	a.mu.Lock()
 	if a.terminating {
 		a.mu.Unlock()
@@ -354,14 +366,20 @@ func (s *Service) start(a *active) {
 		s.markUncertain(a, "storage failure before spawn")
 		return
 	}
+	run := a.run
 	a.mu.Unlock()
 	stdout := &capture{s: s, a: a, stream: "stdout"}
 	stderr := &capture{s: s, a: a, stream: "stderr"}
 	if a.spec.Interactive {
 		stdout.stream = "pty"
 	}
-	p, err := s.backend.Start(a.run.ID, a.spec, stdout, stderr)
+	p, err := s.backend.Start(run, a.spec, stdout, stderr)
 	if err != nil {
+		var cleanTerminal *cleanStartTerminal
+		if errors.As(err, &cleanTerminal) {
+			s.finish(a, cleanTerminal.outcome, exitResult{outcome: cleanTerminal.outcome}, false, "complete")
+			return
+		}
 		if p != nil {
 			a.mu.Lock()
 			a.process = p
@@ -1054,6 +1072,8 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	if req.LeaseMs < 1000 || req.LeaseMs > s.config.MaxWallTimeMs {
 		return failure("invalid-request", "invalid lease duration")
 	}
+	a.leaseMu.Lock()
+	defer a.leaseMu.Unlock()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.run.Spec.Lifetime.Mode != "lease-bound" {
@@ -1075,13 +1095,32 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	if a.terminating {
 		return failure("already-terminal", "Run is terminating")
 	}
+	renewer, ok := a.process.(interface {
+		RenewLease(uint64, int64) (leaseState, error)
+	})
+	if !ok {
+		return failure("ownership-uncertain", "Run lease guardian is unavailable")
+	}
+	lease, err := renewer.RenewLease(req.LeaseGeneration, req.LeaseMs)
+	if err != nil {
+		if errors.Is(err, guardian.ErrLeaseExpired) {
+			go s.terminate(a, "lease-expired")
+			return failure("lease-expired", "lease has expired")
+		}
+		if errors.Is(err, guardian.ErrStaleGeneration) {
+			return failure("stale-generation", "stale lease generation")
+		}
+		go s.markUncertain(a, "lease renewal ownership unproven")
+		return failure("ownership-uncertain", "lease renewal was not proven")
+	}
+	if lease.expiry == nil || lease.generation != req.LeaseGeneration+1 || lease.lastExpectedGeneration != req.LeaseGeneration || lease.lastMs != req.LeaseMs {
+		go s.markUncertain(a, "lease renewal evidence mismatch")
+		return failure("ownership-uncertain", "lease renewal evidence did not match the request")
+	}
 	next := a.run
-	next.LastLeaseExpectedGeneration = req.LeaseGeneration
-	next.LastLeaseMs = req.LeaseMs
-	next.LeaseGeneration++
-	expiry := time.Now().UTC().Add(time.Duration(req.LeaseMs) * time.Millisecond)
-	next.LeaseExpiry = &expiry
+	setLeaseState(&next, lease)
 	if _, err := s.store.Update(next, &model.Event{Kind: "lease.renewed", ObservedAt: time.Now().UTC()}); err != nil {
+		go s.markUncertain(a, "lease renewal durability failed")
 		return failure("storage-failure", err.Error())
 	}
 	a.run = next
@@ -1089,6 +1128,36 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	r := publicRun(a.run)
 	out.Run = &r
 	return out
+}
+
+func setLeaseState(run *model.Run, lease leaseState) {
+	run.LeaseExpiry = lease.expiry
+	run.LeaseGeneration = lease.generation
+	run.LastLeaseExpectedGeneration = lease.lastExpectedGeneration
+	run.LastLeaseMs = lease.lastMs
+}
+
+func importLeaseState(run *model.Run, lease leaseState) error {
+	if run.Spec.Lifetime.Mode != "lease-bound" {
+		if lease.expiry != nil || lease.generation != 0 {
+			return errors.New("detached Run has guardian lease evidence")
+		}
+		return nil
+	}
+	if lease.expiry == nil || lease.generation < run.LeaseGeneration {
+		return errors.New("guardian lease evidence is missing or older than durable state")
+	}
+	if lease.generation == run.LeaseGeneration {
+		if run.LeaseExpiry == nil || !lease.expiry.Equal(*run.LeaseExpiry) || lease.lastExpectedGeneration != run.LastLeaseExpectedGeneration || lease.lastMs != run.LastLeaseMs {
+			return errors.New("guardian lease evidence conflicts with durable state")
+		}
+		return nil
+	}
+	if lease.lastExpectedGeneration != lease.generation-1 || lease.lastMs <= 0 {
+		return errors.New("guardian lease advance is invalid")
+	}
+	setLeaseState(run, lease)
+	return nil
 }
 
 func (s *Service) reconcile() error {
@@ -1114,10 +1183,17 @@ func (s *Service) reconcile() error {
 				stdout.stream = "pty"
 			}
 			result, e := s.backend.Reconcile(run.ID, run.Ownership, run.Spec.Interactive, stdout, stderr)
+			refreshed, readErr := s.store.Get(run.ID)
+			if readErr != nil {
+				return readErr
+			}
+			run = refreshed
+			a.run = refreshed
+			if e == nil {
+				e = importLeaseState(&run, result.lease)
+				a.run = run
+			}
 			if e == nil && result.terminal {
-				if refreshed, readErr := s.store.Get(run.ID); readErr == nil {
-					run = refreshed
-				}
 				priorReason := run.TerminationReason
 				now := time.Now().UTC()
 				run.State = model.Terminal
