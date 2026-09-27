@@ -93,6 +93,19 @@ func TestStartOwnsAndTerminatesRealDescendants(t *testing.T) {
 	}
 }
 
+func TestFastCommandKeepsPhysicalExitReceipt(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		process, err := New().Start(testSpec(t, "/bin/sh", "-c", "exit 0"), io.Discard, io.Discard)
+		if err != nil {
+			t.Fatalf("iteration %d: start fast command: %v", i, err)
+		}
+		exit, err := process.Wait()
+		if err != nil || exit.ExitCode == nil || *exit.ExitCode != 0 || exit.Outcome != "exited" {
+			t.Fatalf("iteration %d: physical exit=%+v err=%v", i, exit, err)
+		}
+	}
+}
+
 func TestCompletedNoCgroupCPUTimeIsUnavailable(t *testing.T) {
 	process, err := New().Start(testSpec(t, "/bin/sh", "-c", "exit 0"), io.Discard, io.Discard)
 	if err != nil {
