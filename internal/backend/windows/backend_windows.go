@@ -135,7 +135,7 @@ func Capabilities() model.Capabilities {
 		CPUTelemetry:            true,
 		ProcessTelemetry:        true,
 		RestartReconciliation:   "guardian-required; missing-job-is-uncertain",
-		Signals:                 []string{"ctrl-break", "terminate"},
+		Signals:                 []string{"terminate"},
 	}
 	if err := windows.NewLazySystemDLL("kernel32.dll").NewProc("CreatePseudoConsole").Find(); err == nil {
 		c.PTY = true
@@ -375,19 +375,7 @@ func (p *Process) Resize(rows, cols uint16) error {
 func (p *Process) Signal(name string) error {
 	switch strings.ToLower(name) {
 	case "ctrl-break", "break", "sigint", "interrupt":
-		p.mu.Lock()
-		closed := p.closed || p.job == 0
-		p.mu.Unlock()
-		if closed {
-			return errProcessExited
-		}
-		if err := p.validateRootProcess(); err != nil {
-			return err
-		}
-		if err := windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, p.pid); err != nil {
-			return fmt.Errorf("send CTRL_BREAK_EVENT to owned Run: %w", err)
-		}
-		return nil
+		return fmt.Errorf("console control signals are unsupported for detached Runs: %w", errUnsupported)
 	case "terminate", "kill", "sigterm", "sigkill":
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -403,7 +391,10 @@ func (p *Process) Signal(name string) error {
 	}
 }
 
-func (p *Process) Terminate(grace time.Duration) (backend.TerminationResult, error) {
+// Terminate immediately kills the owned Job Object. The detached guardian
+// does not share a console with its workload, so there is no safe graceful
+// control-event phase to wait through on Windows.
+func (p *Process) Terminate(_ time.Duration) (backend.TerminationResult, error) {
 	p.drainCompletionPort()
 	p.mu.Lock()
 	if p.closed || p.job == 0 {
@@ -425,44 +416,14 @@ func (p *Process) Terminate(grace time.Duration) (backend.TerminationResult, err
 		p.drainCompletionPort()
 		return backend.TerminationResult{TreeEmpty: true, Outcome: p.terminationOutcome("exited")}, nil
 	}
-	p.mu.Unlock()
 	result := backend.TerminationResult{Requested: true, Outcome: "forced-termination"}
-	if grace < 0 {
-		grace = 0
-	}
-	if err := p.validateRootProcess(); err == nil {
-		_ = windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, p.pid)
-	}
-	deadline := time.Now().Add(grace)
-	for time.Now().Before(deadline) {
-		active, err := p.activeProcessCount()
-		if err != nil {
-			return result, fmt.Errorf("observe owned Job Object during graceful termination: %w", err)
-		}
-		if active == 0 {
-			result.TreeEmpty = true
-			p.drainCompletionPort()
-			result.Outcome = p.terminationOutcome("cancelled")
-			return result, nil
-		}
-		time.Sleep(min(25*time.Millisecond, time.Until(deadline)))
-	}
-
-	p.mu.Lock()
-	job, closed := p.job, p.closed
-	if closed || job == 0 {
-		p.mu.Unlock()
-		result.TreeEmpty = true
-		result.Outcome = p.terminationOutcome("cancelled")
-		return result, nil
-	}
 	if err := windows.TerminateJobObject(job, 1); err != nil {
 		p.mu.Unlock()
 		return result, fmt.Errorf("terminate owned Job Object: %w", err)
 	}
 	p.mu.Unlock()
 	result.Forced = true
-	deadline = time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		active, err := p.activeProcessCount()
 		if err != nil {
@@ -858,29 +819,6 @@ func (p *Process) activeProcessCount() (uint32, error) {
 	return activeProcessCount(p.job)
 }
 
-func (p *Process) validateRootProcess() error {
-	process, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, p.pid)
-	if err != nil {
-		return fmt.Errorf("revalidate owned root process: %w", err)
-	}
-	defer windows.CloseHandle(process)
-	var creation, exit, kernel, user windows.Filetime
-	if err := windows.GetProcessTimes(process, &creation, &exit, &kernel, &user); err != nil {
-		return fmt.Errorf("revalidate owned root process identity: %w", err)
-	}
-	if uint64(creation.Nanoseconds()) != p.startTime {
-		return errors.New("owned root PID no longer identifies the original Run process")
-	}
-	state, err := windows.WaitForSingleObject(process, 0)
-	if err != nil {
-		return fmt.Errorf("observe owned root process: %w", err)
-	}
-	if state == windows.WAIT_OBJECT_0 {
-		return errors.New("owned root process has exited; a root-only control signal is no longer safe")
-	}
-	return nil
-}
-
 type preparedProcess struct {
 	info        windows.ProcessInformation
 	ownership   model.Ownership
@@ -1014,7 +952,7 @@ func createSuspended(spec model.RunSpec, appName, cmdLine, cwd *uint16, env []ui
 		inherit = true
 	}
 
-	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_NEW_PROCESS_GROUP)
+	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
 	if err := windows.CreateProcess(appName, cmdLine, nil, nil, inherit, flags, &env[0], cwd, &si.StartupInfo, &prepared.info); err != nil {
 		if prepared.pty != 0 {
 			windows.ClosePseudoConsole(prepared.pty)

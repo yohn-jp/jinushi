@@ -4,6 +4,7 @@ package windows
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -132,6 +133,14 @@ func TestJobObjectTerminatesDescendants(t *testing.T) {
 	}, &stdout, &stderr)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, signal := range Capabilities().Signals {
+		if strings.EqualFold(signal, "ctrl-break") {
+			t.Fatal("detached Windows backend must not advertise CTRL_BREAK support")
+		}
+	}
+	if err := process.Signal("ctrl-break"); !errors.Is(err, errUnsupported) {
+		t.Fatalf("CTRL_BREAK should be explicitly unsupported for detached Runs, got %v", err)
 	}
 	if err := waitForFile(marker, 5*time.Second); err != nil {
 		t.Fatal(err)
