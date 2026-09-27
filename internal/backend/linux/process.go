@@ -21,27 +21,28 @@ import (
 )
 
 type Process struct {
-	cmd          *exec.Cmd
-	ownership    model.Ownership
-	startedAt    time.Time
-	cg           *cgroup
-	ptyMaster    *os.File
-	input        io.WriteCloser
-	output       io.Reader
-	inputMu      sync.Mutex
-	waitDone     chan struct{}
-	outputDone   chan struct{}
-	resultMu     sync.RWMutex
-	exit         backend.Exit
-	waitErr      error
-	outputErr    error
-	peakMemory   int64
-	peakPIDs     int64
-	treeEmpty    bool
-	limitOutcome string
-	requested    bool
-	forced       bool
-	reason       string
+	cmd            *exec.Cmd
+	ownership      model.Ownership
+	startedAt      time.Time
+	cg             *cgroup
+	ptyMaster      *os.File
+	input          io.WriteCloser
+	output         io.Reader
+	inputMu        sync.Mutex
+	waitDone       chan struct{}
+	outputDone     chan struct{}
+	resultMu       sync.RWMutex
+	exit           backend.Exit
+	waitErr        error
+	outputErr      error
+	peakMemory     int64
+	peakPIDs       int64
+	treeEmpty      bool
+	limitOutcome   string
+	finalResources *model.Resources
+	requested      bool
+	forced         bool
+	reason         string
 }
 
 func (p *Process) Ownership() model.Ownership { return p.ownership }
@@ -222,6 +223,13 @@ func (p *Process) CloseInput() error {
 }
 
 func (p *Process) Observe() (model.Resources, error) {
+	p.resultMu.RLock()
+	if p.finalResources != nil {
+		resources := *p.finalResources
+		p.resultMu.RUnlock()
+		return resources, nil
+	}
+	p.resultMu.RUnlock()
 	if p.cg != nil {
 		if err := validateCgroupOwnership(p.ownership, p.cg); err != nil {
 			return unavailableResources(), err
@@ -394,6 +402,14 @@ func (p *Process) waitForExit() {
 		waitErr = errors.Join(waitErr, fmt.Errorf("PTY output writer: %w", copyErr))
 	}
 	if p.cg != nil {
+		// Keep the final kernel counters before removing the owned cgroup.
+		// Guardian's terminal receipt observes the Process after Wait returns.
+		if err := validateCgroupOwnership(p.ownership, p.cg); err == nil {
+			resources := p.observeCgroup()
+			p.resultMu.Lock()
+			p.finalResources = &resources
+			p.resultMu.Unlock()
+		}
 		p.cg.close()
 	}
 

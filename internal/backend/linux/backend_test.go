@@ -124,6 +124,25 @@ func TestCompletedNoCgroupCPUTimeIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestCgroupFinalResourcesRemainObservableAfterWait(t *testing.T) {
+	process, err := New().Start(testSpec(t, "/bin/sh", "-c", "sleep 0.1"), io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if process.(*Process).cg == nil {
+		waitWithTimeout(t, process)
+		t.Skip("writable cgroup v2 is unavailable on this host")
+	}
+	waitWithTimeout(t, process)
+	resources, err := process.Observe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.CPUTimeNs.Status != "measured" || resources.PeakMemoryBytes.Status != "measured" || resources.ProcessCount.Status != "measured" {
+		t.Fatalf("final cgroup counters were lost after cleanup: %+v", resources)
+	}
+}
+
 func TestSetsidDescendantRemainsOwnedAfterRootExit(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "escaped-pid")
 	executable, err := os.Executable()

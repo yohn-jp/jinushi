@@ -1234,6 +1234,22 @@ func TestMemoryLimitEnforcementWhenKernelDelegatesIt(t *testing.T) {
 	}
 }
 
+func TestWritableCgroupTerminalReceiptRetainsFinalResourceCounters(t *testing.T) {
+	h := newHarness(t)
+	if caps := h.getCapabilities(); !caps.MemoryEnforcement {
+		t.Skipf("writable cgroup v2 is unavailable on this host; capabilities: %+v", caps)
+	}
+	started := h.run("--", "/bin/sh", "-c", "sleep 0.3")
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code != 0 || completed.Receipt == nil || completed.Receipt.Outcome != "exited" || completed.Receipt.Cleanup != "complete" {
+		t.Fatalf("cgroup Run did not exit cleanly: code=%d run=%+v", code, completed)
+	}
+	final := completed.Receipt.Resources
+	if final.CPUTimeNs.Status != "measured" || final.PeakMemoryBytes.Status != "measured" || final.ProcessCount.Status != "measured" || completed.Receipt.EvidenceIncomplete {
+		t.Fatalf("terminal receipt lost final cgroup counters: resources=%+v evidenceIncomplete=%v", final, completed.Receipt.EvidenceIncomplete)
+	}
+}
+
 func TestLeaseExpiryTerminatesOwnedRun(t *testing.T) {
 	h := newHarness(t)
 	started := h.run("--lifetime", "lease-bound", "--lease-ms", "1500", "--", helperBinary, "wait", "60000")
