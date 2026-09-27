@@ -6,35 +6,38 @@ This document freezes the initial external semantics of the Jinushi runtime. Exa
 
 A Run request describes one physical execution. It does not contain task semantics.
 
-Illustrative machine shape:
+Current v1 local-protocol request shape (optional fields are omitted when
+unused):
 
 ```json
 {
-  "protocolVersion": 1,
-  "argv": ["codex", "exec", "..."],
-  "cwd": "/absolute/worktree",
-  "environment": {
-    "mode": "inherit-supervisor",
-    "set": {},
-    "unset": []
-  },
-  "interactive": true,
-  "lifetime": {
-    "mode": "detached"
-  },
-  "limits": {
-    "memoryBytes": 8589934592,
-    "taskCount": 256,
-    "wallTimeMs": 14400000
-  },
-  "parentRunId": null,
-  "correlation": {
-    "owner": "opaque-caller-reference"
+  "version": 1,
+  "op": "run",
+  "submissionId": "submission_01...",
+  "spec": {
+    "argv": ["codex", "exec", "..."],
+    "cwd": "/absolute/worktree",
+    "environment": {
+      "mode": "inherit-supervisor"
+    },
+    "interactive": true,
+    "lifetime": {
+      "mode": "detached"
+    },
+    "limits": {
+      "memoryBytes": 8589934592,
+      "taskCount": 256,
+      "wallTimeMs": 14400000
+    },
+    "correlation": {
+      "owner": "opaque-caller-reference"
+    }
   }
 }
 ```
 
-The serialized shape above is illustrative until implementation freezes the schema. The semantic rules below are normative.
+The envelope and field names match the local v1 JSON protocol. The semantic
+rules below are normative.
 
 ### argv
 
@@ -84,14 +87,21 @@ A backend must not accept a limit it cannot enforce while reporting it as enforc
 
 On acceptance, Jinushi returns an opaque Run ID.
 
-Example:
+Example accepted v1 response (selected Run fields):
 
 ```json
 {
-  "runId": "run_01...",
-  "state": "accepted"
+  "version": 1,
+  "nextCursor": "",
+  "run": {
+    "runId": "run_01...",
+    "state": "accepted"
+  }
 }
 ```
+
+A full response wraps the Run in the same envelope and includes the other
+Run fields described in this contract.
 
 A Run ID:
 
@@ -140,41 +150,66 @@ Exit code zero is only a physical process fact. It does not mean semantic task s
 
 `inspect(runId)` returns one bounded current physical snapshot.
 
-Illustrative result (metric status is `measured`, `unavailable`, or
-`unsupported`; unavailable values are never encoded as zero):
+Illustrative v1 inspect response with selected fields (metric status is
+`measured`, `unavailable`, or `unsupported`; unavailable values are never
+encoded as zero):
 
 ```json
 {
-  "runId": "run_01...",
-  "state": "running",
-  "generation": 4,
-  "startedAt": "2026-09-27T03:00:00Z",
-  "effectiveCapabilities": {
-    "backend": "linux-cgroup-v2",
-    "pty": true,
-    "memoryEnforcement": true,
-    "cpuQuotaEnforcement": true,
-    "processCountEnforcement": false,
-    "taskCountEnforcement": true,
-    "memoryTelemetry": true,
-    "cpuTelemetry": true,
-    "processTelemetry": true,
-    "taskTelemetry": true,
-    "restartReconciliation": "strong",
-    "signals": ["TERM", "KILL"]
-  },
-  "activity": {
+  "version": 1,
+  "nextCursor": "",
+  "run": {
+    "runId": "run_01...",
+    "spec": {
+      "argv": ["codex", "exec"],
+      "cwd": "/absolute/worktree",
+      "interactive": true,
+      "lifetime": {"mode": "detached"},
+      "limits": {"taskCount": 256}
+    },
+    "state": "running",
+    "generation": 4,
+    "createdAt": "2026-09-27T02:59:59Z",
+    "startedAt": "2026-09-27T03:00:00Z",
+    "effectiveCapabilities": {
+      "backend": "linux",
+      "pty": true,
+      "memoryEnforcement": true,
+      "cpuQuotaEnforcement": true,
+      "processCountEnforcement": false,
+      "taskCountEnforcement": true,
+      "memoryTelemetry": true,
+      "cpuTelemetry": true,
+      "processTelemetry": true,
+      "taskTelemetry": true,
+      "cgroupFreeze": true,
+      "memoryHighControl": true,
+      "cpuQuotaControl": true,
+      "restartReconciliation": "cgroup-v2",
+      "signals": ["SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"]
+    },
+    "resources": {
+      "memoryBytes": {"status": "measured", "value": 612368384},
+      "peakMemoryBytes": {"status": "measured", "value": 1308622848},
+      "cpuTimeNs": {"status": "measured", "value": 81930112000},
+      "processCount": {"status": "measured", "value": 7},
+      "peakProcessCount": {"status": "measured", "value": 9},
+      "taskCount": {"status": "measured", "value": 19},
+      "peakTaskCount": {"status": "measured", "value": 23},
+      "sampleIntervalMs": 250
+    },
+    "output": {
+      "stdout": {"observedBytes": 0, "retainedBytes": 0, "retainedFrom": 0, "truncated": false},
+      "stderr": {"observedBytes": 0, "retainedBytes": 0, "retainedFrom": 0, "truncated": false},
+      "pty": {"observedBytes": 1024, "retainedBytes": 1024, "retainedFrom": 0, "truncated": false},
+      "historyComplete": true
+    },
     "lastOutputAt": "2026-09-27T03:04:11Z",
+    "lastResourceSampleAt": "2026-09-27T03:04:12Z",
+    "resourceGap": false,
     "lastCpuActivityAt": "2026-09-27T03:04:12Z",
-    "lastProcessChangeAt": "2026-09-27T03:03:59Z"
-  },
-  "resources": {
-    "memoryBytes": {"status": "measured", "value": 612368384},
-    "peakMemoryBytes": {"status": "measured", "value": 1308622848},
-    "cpuTimeNs": {"status": "measured", "value": 81930112000},
-    "processCount": {"status": "measured", "value": 7},
-    "taskCount": {"status": "measured", "value": 19},
-    "sampleIntervalMs": 250
+    "lastProcessChangeAt": "2026-09-27T03:03:59Z",
+    "attachments": 1
   }
 }
 ```
@@ -432,7 +467,7 @@ Jinushi never auto-relaunches a missing process as recovery.
 
 A terminal receipt is immutable execution evidence.
 
-Illustrative shape:
+Illustrative receipt JSON using the current wire field names:
 
 ```json
 {
@@ -440,22 +475,51 @@ Illustrative shape:
   "runId": "run_01...",
   "outcome": "exited",
   "exitCode": 0,
-  "signal": null,
   "startedAt": "2026-09-27T03:00:00Z",
   "finishedAt": "2026-09-27T03:10:13Z",
   "resources": {
+    "memoryBytes": {"status": "measured", "value": 524288000},
     "peakMemoryBytes": {"status": "measured", "value": 1308622848},
     "cpuTimeNs": {"status": "measured", "value": 81930112000},
+    "processCount": {"status": "measured", "value": 7},
     "peakProcessCount": {"status": "measured", "value": 12},
-    "peakTaskCount": {"status": "measured", "value": 37}
+    "taskCount": {"status": "measured", "value": 19},
+    "peakTaskCount": {"status": "measured", "value": 37},
+    "sampleIntervalMs": 250
   },
   "effectiveCapabilities": {
-    "backend": "linux-cgroup-v2",
+    "backend": "linux",
+    "pty": false,
+    "memoryEnforcement": true,
+    "cpuQuotaEnforcement": true,
+    "processCountEnforcement": false,
     "taskCountEnforcement": true,
     "memoryTelemetry": true,
     "cpuTelemetry": true,
     "processTelemetry": true,
-    "taskTelemetry": true
+    "taskTelemetry": true,
+    "cgroupFreeze": true,
+    "memoryHighControl": true,
+    "cpuQuotaControl": true,
+    "restartReconciliation": "cgroup-v2",
+    "signals": ["SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"]
+  },
+  "capabilities": {
+    "backend": "linux",
+    "pty": false,
+    "memoryEnforcement": true,
+    "cpuQuotaEnforcement": true,
+    "processCountEnforcement": false,
+    "taskCountEnforcement": true,
+    "memoryTelemetry": true,
+    "cpuTelemetry": true,
+    "processTelemetry": true,
+    "taskTelemetry": true,
+    "cgroupFreeze": true,
+    "memoryHighControl": true,
+    "cpuQuotaControl": true,
+    "restartReconciliation": "cgroup-v2",
+    "signals": ["SIGHUP", "SIGINT", "SIGKILL", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2"]
   },
   "output": {
     "stdout": {"observedBytes": 188416, "retainedBytes": 65536, "retainedFrom": 122880, "truncated": true},
@@ -468,13 +532,9 @@ Illustrative shape:
   "eventRetainedFrom": 2,
   "eventHistoryComplete": false,
   "evidenceIncomplete": true,
-  "termination": {
-    "requested": false,
-    "forced": false
-  },
-  "cleanup": {
-    "processTree": "complete"
-  }
+  "terminationRequested": false,
+  "forced": false,
+  "cleanup": "complete"
 }
 ```
 
