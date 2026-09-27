@@ -32,8 +32,8 @@ var ErrTombstoneNotFound = errors.New("Run tombstone not found")
 //
 // MaxStateBytes measures logical bytes for terminal Run records, their
 // per-Run evidence buckets, and tombstones. It excludes live/non-terminal
-// Runs and the fixed-size idempotency binding index. Those remain separately
-// bounded by their own runtime limits.
+// Runs, compact replay projections in the fixed-capacity submission index,
+// and idempotency/control/watch indexes, which have independent hard bounds.
 type RetentionPolicy struct {
 	MaxAge              time.Duration `json:"maxAge"`
 	MaxTerminalRuns     int           `json:"maxTerminalRuns"`
@@ -62,17 +62,23 @@ func DefaultRetentionPolicy() RetentionPolicy {
 }
 
 // Tombstone is the bounded terminal record left after detailed Run evidence
-// is removed. It carries no accepted specification, output, event bodies,
-// telemetry, process observations, or full receipt. ReceiptSHA256 binds the
-// tombstone to the receipt that was evicted; EvidenceIncomplete is always true.
+// is removed. It carries no accepted specification, output bytes, event
+// bodies, telemetry, process observations, or full receipt. Its compact
+// receipt preserves terminal identity/outcome and marks removed evidence
+// unavailable. ReceiptSHA256 binds it to the original receipt.
 type Tombstone struct {
 	Version            int              `json:"version"`
 	RunID              string           `json:"runId"`
+	Generation         uint64           `json:"generation"`
+	CreatedAt          time.Time        `json:"createdAt"`
+	StartedAt          *time.Time       `json:"startedAt,omitempty"`
 	Outcome            string           `json:"outcome"`
+	TerminationReason  string           `json:"terminationReason,omitempty"`
 	FinishedAt         time.Time        `json:"finishedAt"`
 	EvictedAt          time.Time        `json:"evictedAt"`
 	Reasons            []EvictionReason `json:"reasons"`
 	ReceiptSHA256      string           `json:"receiptSha256"`
+	Receipt            model.Receipt    `json:"receipt"`
 	EvidenceIncomplete bool             `json:"evidenceIncomplete"`
 }
 
@@ -88,20 +94,21 @@ const (
 // remains after individual tombstones age out, so deletion policy and gaps in
 // detailed evidence remain machine-readable.
 type RetentionCheckpoint struct {
-	Version                int             `json:"version"`
-	Policy                 RetentionPolicy `json:"policy"`
-	PolicySHA256           string          `json:"policySha256"`
-	LastRunAt              time.Time       `json:"lastRunAt"`
-	EvictedRunsTotal       uint64          `json:"evictedRunsTotal"`
-	EvictedBytesTotal      int64           `json:"evictedBytesTotal"`
-	RemovedTombstonesTotal uint64          `json:"removedTombstonesTotal"`
-	ExpiredBindingsTotal   uint64          `json:"expiredBindingsTotal"`
-	LastEvictedRunID       string          `json:"lastEvictedRunId,omitempty"`
-	LastEvictedFinishedAt  *time.Time      `json:"lastEvictedFinishedAt,omitempty"`
-	TerminalRunsRemaining  int             `json:"terminalRunsRemaining"`
-	TerminalEvidenceBytes  int64           `json:"terminalEvidenceBytes"`
-	ProtectedTerminalRuns  int             `json:"protectedTerminalRuns"`
-	BudgetExceeded         bool            `json:"budgetExceeded"`
+	Version                    int             `json:"version"`
+	Policy                     RetentionPolicy `json:"policy"`
+	PolicySHA256               string          `json:"policySha256"`
+	LastRunAt                  time.Time       `json:"lastRunAt"`
+	EvictedRunsTotal           uint64          `json:"evictedRunsTotal"`
+	EvictedBytesTotal          int64           `json:"evictedBytesTotal"`
+	RemovedTombstonesTotal     uint64          `json:"removedTombstonesTotal"`
+	ExpiredBindingsTotal       uint64          `json:"expiredBindingsTotal"`
+	ExpiredBindingBytesTotal   int64           `json:"expiredBindingBytesTotal"`
+	SubmissionReplayStubsTotal uint64          `json:"submissionReplayStubsTotal"`
+	LastEvictedRunID           string          `json:"lastEvictedRunId,omitempty"`
+	LastEvictedFinishedAt      *time.Time      `json:"lastEvictedFinishedAt,omitempty"`
+	TerminalRunsRemaining      int             `json:"terminalRunsRemaining"`
+	TerminalEvidenceBytes      int64           `json:"terminalEvidenceBytes"`
+	BudgetExceeded             bool            `json:"budgetExceeded"`
 }
 
 // Usage describes logical bbolt contents and the physical database footprint.
@@ -110,26 +117,29 @@ type RetentionCheckpoint struct {
 // Logical byte counts omit bbolt page/allocator overhead; DatabaseBytes and
 // free-page counts expose that separate physical dimension.
 type Usage struct {
-	RunCount              int   `json:"runCount"`
-	ActiveRunCount        int   `json:"activeRunCount"`
-	TerminalRunCount      int   `json:"terminalRunCount"`
-	UncertainRunCount     int   `json:"uncertainRunCount"`
-	TombstoneCount        int   `json:"tombstoneCount"`
-	ExpiredBindingCount   int   `json:"expiredBindingCount"`
-	LogicalBytes          int64 `json:"logicalBytes"`
-	RunBytes              int64 `json:"runBytes"`
-	EventBytes            int64 `json:"eventBytes"`
-	OutputBytes           int64 `json:"outputBytes"`
-	TelemetryBytes        int64 `json:"telemetryBytes"`
-	TombstoneBytes        int64 `json:"tombstoneBytes"`
-	SubmissionBytes       int64 `json:"submissionBytes"`
-	OtherBytes            int64 `json:"otherBytes"`
-	TerminalEvidenceBytes int64 `json:"terminalEvidenceBytes"`
-	DatabaseBytes         int64 `json:"databaseBytes"`
-	PageSize              int   `json:"pageSize"`
-	FreePages             int   `json:"freePages"`
-	PendingPages          int   `json:"pendingPages"`
-	FreeBytes             int64 `json:"freeBytes"`
+	RunCount                  int   `json:"runCount"`
+	ActiveRunCount            int   `json:"activeRunCount"`
+	TerminalRunCount          int   `json:"terminalRunCount"`
+	UncertainRunCount         int   `json:"uncertainRunCount"`
+	TombstoneCount            int   `json:"tombstoneCount"`
+	ExpiredBindingCount       int   `json:"expiredBindingCount"`
+	LogicalBytes              int64 `json:"logicalBytes"`
+	RunBytes                  int64 `json:"runBytes"`
+	EventBytes                int64 `json:"eventBytes"`
+	OutputBytes               int64 `json:"outputBytes"`
+	TelemetryBytes            int64 `json:"telemetryBytes"`
+	TombstoneBytes            int64 `json:"tombstoneBytes"`
+	SubmissionBytes           int64 `json:"submissionBytes"`
+	SubmissionReplayStubBytes int64 `json:"submissionReplayStubBytes"`
+	ControlRequestBytes       int64 `json:"controlRequestBytes"`
+	WatchIndexBytes           int64 `json:"watchIndexBytes"`
+	OtherBytes                int64 `json:"otherBytes"`
+	TerminalEvidenceBytes     int64 `json:"terminalEvidenceBytes"`
+	DatabaseBytes             int64 `json:"databaseBytes"`
+	PageSize                  int   `json:"pageSize"`
+	FreePages                 int   `json:"freePages"`
+	PendingPages              int   `json:"pendingPages"`
+	FreeBytes                 int64 `json:"freeBytes"`
 }
 
 // GetTombstone returns the compact terminal record for an evicted Run.
@@ -146,6 +156,26 @@ func (s *Store) GetTombstone(runID string) (Tombstone, error) {
 		return nil
 	})
 	return tombstone, err
+}
+
+// RunSnapshot reconstructs the terminal identity and compact receipt retained
+// for a retry-safe submission after its detailed Run evidence has been
+// collected. The accepted specification and process ownership are omitted.
+func (t Tombstone) RunSnapshot() model.Run {
+	receipt := t.Receipt
+	finished := t.FinishedAt
+	var started *time.Time
+	if t.StartedAt != nil {
+		copy := *t.StartedAt
+		started = &copy
+	}
+	return model.Run{
+		ID: t.RunID, State: model.Terminal, Generation: t.Generation,
+		CreatedAt: t.CreatedAt, StartedAt: started, FinishedAt: &finished,
+		Resources: receipt.Resources, Output: receipt.Output,
+		EffectiveCapabilities: receipt.EffectiveCapabilities,
+		Receipt:               &receipt, TerminationReason: t.TerminationReason, ResourceGap: true,
+	}
 }
 
 // RetentionState returns the last persisted GC summary, or a zero checkpoint
@@ -226,8 +256,12 @@ func (s *Store) Usage() (Usage, error) {
 					return err
 				}
 				usage.TerminalEvidenceBytes += bytes
-			case "submissions", "submissionRuns":
+			case "submissions", "submission-runs", "submission-expiry":
 				usage.SubmissionBytes += bytes
+			case "control-requests", "control-request-expiry":
+				usage.ControlRequestBytes += bytes
+			case "watch-index":
+				usage.WatchIndexBytes = bytes
 			default:
 				if isTelemetryBucket(name) {
 					usage.TelemetryBytes += bytes
@@ -253,6 +287,11 @@ func (s *Store) Usage() (Usage, error) {
 				return err
 			}
 		}
+		stubBytes, err := submissionReplayStubBytesTx(tx)
+		if err != nil {
+			return err
+		}
+		usage.SubmissionReplayStubBytes = stubBytes
 		return nil
 	})
 	if err != nil {
@@ -273,8 +312,11 @@ func (s *Store) Usage() (Usage, error) {
 }
 
 type submissionRetentionRecord struct {
-	RunID     string    `json:"runId"`
-	ExpiresAt time.Time `json:"expiresAt"`
+	RunID        string     `json:"runId"`
+	SpecDigest   string     `json:"specDigest"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	ExpiresAt    time.Time  `json:"expiresAt"`
+	CollectedRun *model.Run `json:"collectedRun,omitempty"`
 }
 
 func txBucketNames(tx *bolt.Tx) []string {
@@ -348,11 +390,116 @@ func runEvidenceBytesTx(tx *bolt.Tx, runID string) (int64, error) {
 
 func isGlobalRetentionBucket(name string) bool {
 	switch name {
-	case tombstonesBucketName, retentionBucketName, "submissions", "submissionRuns", "idempotency":
+	case tombstonesBucketName, retentionBucketName,
+		"submissions", "submission-runs", "submission-expiry",
+		"control-requests", "control-request-expiry", "watch-index", "idempotency":
 		return true
 	default:
 		return false
 	}
+}
+
+func submissionReplayStubBytesTx(tx *bolt.Tx) (int64, error) {
+	var total int64
+	submissions := tx.Bucket([]byte("submissions"))
+	if submissions == nil {
+		return 0, nil
+	}
+	err := submissions.ForEach(func(key, raw []byte) error {
+		if raw == nil {
+			return nil
+		}
+		var binding submissionRetentionRecord
+		if err := json.Unmarshal(raw, &binding); err != nil {
+			return fmt.Errorf("decode submission replay stub: %w", err)
+		}
+		if binding.CollectedRun == nil {
+			return nil
+		}
+		if binding.CollectedRun.ID != binding.RunID || binding.CollectedRun.State != model.Terminal ||
+			binding.CollectedRun.Receipt == nil || binding.CollectedRun.Receipt.RunID != binding.RunID ||
+			!binding.CollectedRun.Receipt.EvidenceIncomplete || binding.CollectedRun.Receipt.EventHistoryComplete ||
+			binding.CollectedRun.Receipt.Output.HistoryComplete {
+			return fmt.Errorf("invalid submission replay stub for binding %q", key)
+		}
+		encoded, err := json.Marshal(binding.CollectedRun)
+		if err != nil {
+			return fmt.Errorf("encode submission replay stub: %w", err)
+		}
+		total += int64(len(encoded))
+		return nil
+	})
+	return total, err
+}
+
+func collectedRunSnapshot(run model.Run) model.Run {
+	receipt := compactTerminalReceipt(run.Receipt)
+	finishedAt := run.FinishedAt
+	if finishedAt == nil {
+		copy := receipt.FinishedAt
+		finishedAt = &copy
+	}
+	var startedAt *time.Time
+	if run.StartedAt != nil {
+		copy := *run.StartedAt
+		startedAt = &copy
+	}
+	return model.Run{
+		ID: run.ID, State: model.Terminal, Generation: run.Generation,
+		CreatedAt: run.CreatedAt, StartedAt: startedAt, FinishedAt: finishedAt,
+		Resources: receipt.Resources, Output: receipt.Output,
+		EffectiveCapabilities: receipt.EffectiveCapabilities,
+		Receipt:               &receipt, TerminationReason: run.TerminationReason, ResourceGap: true,
+	}
+}
+
+func compactTerminalReceipt(original *model.Receipt) model.Receipt {
+	if original == nil {
+		return model.Receipt{EvidenceIncomplete: true, EventHistoryComplete: false, Output: model.Output{HistoryComplete: false}}
+	}
+	receipt := *original
+	receipt.Resources = unavailableResources(original.Resources)
+	receipt.Output = discardOutputContent(original.Output)
+	receipt.EventRetainedFrom = nextSequenceOrMax(receipt.EventLastSeq)
+	receipt.EventHistoryComplete = false
+	receipt.EvidenceIncomplete = true
+	return receipt
+}
+
+func unavailableResources(resources model.Resources) model.Resources {
+	metric := func(value model.Metric) model.Metric {
+		if value.Status == "unsupported" {
+			return model.Metric{Status: "unsupported"}
+		}
+		return model.Metric{Status: "unavailable"}
+	}
+	return model.Resources{
+		MemoryBytes: metric(resources.MemoryBytes), PeakMemoryBytes: metric(resources.PeakMemoryBytes),
+		CPUTimeNs: metric(resources.CPUTimeNs), ProcessCount: metric(resources.ProcessCount),
+		PeakProcessCount: metric(resources.PeakProcessCount), TaskCount: metric(resources.TaskCount),
+		PeakTaskCount: metric(resources.PeakTaskCount), SampleIntervalMs: resources.SampleIntervalMs,
+	}
+}
+
+func discardOutputContent(output model.Output) model.Output {
+	compact := func(stream model.OutputStream) model.OutputStream {
+		stream.RetainedFrom = stream.ObservedBytes
+		stream.RetainedBytes = 0
+		stream.Truncated = stream.ObservedBytes > 0
+		return stream
+	}
+	output.Stdout = compact(output.Stdout)
+	output.Stderr = compact(output.Stderr)
+	output.PTY = compact(output.PTY)
+	output.HistoryComplete = false
+	return output
+}
+
+func nextSequenceOrMax(seq uint64) uint64 {
+	if seq == ^uint64(0) {
+		return seq
+	}
+	return seq + 1
 }
 
 func isTelemetryBucket(name string) bool {

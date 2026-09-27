@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -146,7 +147,7 @@ func TestRetentionAgeZeroDisablesAgeTriggerAndByteBudgetEvicts(t *testing.T) {
 	}
 }
 
-func TestCollectTerminalPreservesUnexpiredSubmissionBindings(t *testing.T) {
+func TestCollectTerminalRetainsRetryIdentityAndPrunesExpiredSubmissionBinding(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "state.db"), Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -160,19 +161,24 @@ func TestCollectTerminalPreservesUnexpiredSubmissionBindings(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		indices, err := tx.CreateBucketIfNotExists([]byte("submissionRuns"))
+		indices, err := tx.CreateBucketIfNotExists([]byte("submission-runs"))
+		if err != nil {
+			return err
+		}
+		expiry, err := tx.CreateBucketIfNotExists([]byte("submission-expiry"))
 		if err != nil {
 			return err
 		}
 		for _, binding := range []struct {
 			id      string
 			runID   string
+			created time.Time
 			expires time.Time
 		}{
-			{id: "submission-active", runID: "run-bound-active", expires: now.Add(time.Hour)},
-			{id: "submission-expired", runID: "run-bound-expired", expires: now.Add(-time.Second)},
+			{id: "submission-active", runID: "run-bound-active", created: now.Add(-time.Hour), expires: now.Add(time.Hour)},
+			{id: "submission-expired", runID: "run-bound-expired", created: now.Add(-2 * time.Hour), expires: now.Add(-time.Second)},
 		} {
-			record := submissionRetentionRecord{RunID: binding.runID, ExpiresAt: binding.expires}
+			record := submissionRetentionRecord{RunID: binding.runID, SpecDigest: strings.Repeat("a", 64), CreatedAt: binding.created, ExpiresAt: binding.expires}
 			encoded, err := json.Marshal(record)
 			if err != nil {
 				return err
@@ -181,6 +187,9 @@ func TestCollectTerminalPreservesUnexpiredSubmissionBindings(t *testing.T) {
 				return err
 			}
 			if err := indices.Put([]byte(binding.runID), []byte(binding.id)); err != nil {
+				return err
+			}
+			if err := expiry.Put(retentionExpiryIndexKey(binding.expires, []byte(binding.id)), nil); err != nil {
 				return err
 			}
 		}
@@ -193,22 +202,39 @@ func TestCollectTerminalPreservesUnexpiredSubmissionBindings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.EvictedRuns != 1 || result.ProtectedTerminalRuns != 1 || result.ExpiredSubmissionBindings != 1 || !result.BudgetExceeded {
+	if result.EvictedRuns != 2 || result.SubmissionReplayStubs != 1 || result.ExpiredSubmissionBindings != 1 || result.BudgetExceeded {
 		t.Fatalf("bound submission retention result = %#v", result)
 	}
-	if _, err := s.Get("run-bound-active"); err != nil {
-		t.Fatalf("active binding Run was collected: %v", err)
+	if _, err := s.Get("run-bound-active"); !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("active binding Run detail remains: %v", err)
 	}
 	if _, err := s.Get("run-bound-expired"); !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("expired binding Run Get error = %v", err)
 	}
 	if err := s.db.View(func(tx *bolt.Tx) error {
-		if tx.Bucket([]byte("submissions")).Get([]byte("submission-active")) == nil {
+		submissions := tx.Bucket([]byte("submissions"))
+		activeRaw := submissions.Get([]byte("submission-active"))
+		if activeRaw == nil {
 			t.Fatal("GC deleted unexpired idempotency binding")
 		}
-		if tx.Bucket([]byte("submissions")).Get([]byte("submission-expired")) != nil ||
-			tx.Bucket([]byte("submissionRuns")).Get([]byte("run-bound-expired")) != nil {
+		var active submissionRetentionRecord
+		if err := json.Unmarshal(activeRaw, &active); err != nil {
+			return err
+		}
+		if active.CollectedRun == nil || active.CollectedRun.ID != "run-bound-active" || active.CollectedRun.State != model.Terminal ||
+			active.CollectedRun.Receipt == nil || active.CollectedRun.Receipt.Outcome != "exited" ||
+			!active.CollectedRun.Receipt.EvidenceIncomplete || active.CollectedRun.Receipt.EventHistoryComplete ||
+			active.CollectedRun.Receipt.Output.HistoryComplete {
+			t.Fatalf("active submission replay stub = %#v", active.CollectedRun)
+		}
+		if submissions.Get([]byte("submission-expired")) != nil ||
+			tx.Bucket([]byte("submission-runs")).Get([]byte("run-bound-expired")) != nil ||
+			bucketHasKey(tx.Bucket([]byte("submission-expiry")), retentionExpiryIndexKey(now.Add(-time.Second), []byte("submission-expired"))) {
 			t.Fatal("GC retained expired idempotency binding/index")
+		}
+		if string(tx.Bucket([]byte("submission-runs")).Get([]byte("run-bound-active"))) != "submission-active" ||
+			!bucketHasKey(tx.Bucket([]byte("submission-expiry")), retentionExpiryIndexKey(now.Add(time.Hour), []byte("submission-active"))) {
+			t.Fatal("GC removed active binding index or expiry entry")
 		}
 		return nil
 	}); err != nil {

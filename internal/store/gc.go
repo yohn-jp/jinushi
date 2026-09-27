@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +28,8 @@ type GCResult struct {
 	RemovedTombstones         int       `json:"removedTombstones"`
 	RemovedTombstoneBytes     int64     `json:"removedTombstoneBytes"`
 	ExpiredSubmissionBindings int       `json:"expiredSubmissionBindings"`
-	ProtectedTerminalRuns     int       `json:"protectedTerminalRuns"`
+	SubmissionReplayStubs     int       `json:"submissionReplayStubs"`
+	ExpiredSubmissionBytes    int64     `json:"expiredSubmissionBytes"`
 	UncollectableTerminalRuns int       `json:"uncollectableTerminalRuns"`
 	TerminalRunsRemaining     int       `json:"terminalRunsRemaining"`
 	TerminalEvidenceBytes     int64     `json:"terminalEvidenceBytes"`
@@ -41,7 +43,6 @@ type retentionCandidate struct {
 	finishedAt    time.Time
 	detailedBytes int64
 	reasons       []EvictionReason
-	protected     bool
 	collectable   bool
 }
 
@@ -68,13 +69,15 @@ func (s *Store) CollectTerminal(policy RetentionPolicy, now time.Time) (GCResult
 			return fmt.Errorf("create retention bucket: %w", err)
 		}
 
-		activeBindings, expiredBindings, err := retentionSubmissionBindings(tx, now)
+		activeBindings, expiredBindings, expiredBindingBytes, err := retentionSubmissionBindings(tx, now)
 		if err != nil {
 			return err
 		}
 		result.ExpiredSubmissionBindings = expiredBindings
+		result.ExpiredSubmissionBytes = expiredBindingBytes
+		result.NetLogicalBytesFreed += expiredBindingBytes
 
-		candidates, terminalCount, historicalBytes, err := readRetentionCandidates(tx, activeBindings)
+		candidates, terminalCount, historicalBytes, err := readRetentionCandidates(tx)
 		if err != nil {
 			return err
 		}
@@ -100,10 +103,6 @@ func (s *Store) CollectTerminal(policy RetentionPolicy, now time.Time) (GCResult
 			if len(candidate.reasons) == 0 {
 				continue
 			}
-			if candidate.protected {
-				result.ProtectedTerminalRuns++
-				continue
-			}
 			if !candidate.collectable {
 				result.UncollectableTerminalRuns++
 				continue
@@ -118,11 +117,16 @@ func (s *Store) CollectTerminal(policy RetentionPolicy, now time.Time) (GCResult
 				tombstone := Tombstone{
 					Version:            retentionSchema,
 					RunID:              candidate.runID,
+					Generation:         candidate.run.Generation,
+					CreatedAt:          candidate.run.CreatedAt,
+					StartedAt:          candidate.run.StartedAt,
 					Outcome:            candidate.run.Receipt.Outcome,
+					TerminationReason:  candidate.run.TerminationReason,
 					FinishedAt:         candidate.finishedAt,
 					EvictedAt:          now,
 					Reasons:            append([]EvictionReason(nil), candidate.reasons...),
 					ReceiptSHA256:      digest,
+					Receipt:            compactTerminalReceipt(candidate.run.Receipt),
 					EvidenceIncomplete: true,
 				}
 				encoded, err := json.Marshal(tombstone)
@@ -133,6 +137,14 @@ func (s *Store) CollectTerminal(policy RetentionPolicy, now time.Time) (GCResult
 					return fmt.Errorf("persist Run tombstone: %w", err)
 				}
 				tombstoneBytes = int64(len(candidate.runID) + len(encoded))
+			}
+			stubBytes, addedStub, err := storeSubmissionReplayStub(tx, candidate.run, now, activeBindings)
+			if err != nil {
+				return err
+			}
+			if addedStub {
+				result.SubmissionReplayStubs++
+				result.NetLogicalBytesFreed -= stubBytes
 			}
 
 			runs := tx.Bucket([]byte(runsBucketName))
@@ -182,7 +194,8 @@ func (s *Store) CollectTerminal(policy RetentionPolicy, now time.Time) (GCResult
 		checkpoint.ExpiredBindingsTotal = satAddUint64(checkpoint.ExpiredBindingsTotal, uint64(result.ExpiredSubmissionBindings))
 		checkpoint.TerminalRunsRemaining = terminalCount
 		checkpoint.TerminalEvidenceBytes = result.TerminalEvidenceBytes
-		checkpoint.ProtectedTerminalRuns = result.ProtectedTerminalRuns
+		checkpoint.ExpiredBindingBytesTotal = satAddInt64(checkpoint.ExpiredBindingBytesTotal, result.ExpiredSubmissionBytes)
+		checkpoint.SubmissionReplayStubsTotal = satAddUint64(checkpoint.SubmissionReplayStubsTotal, uint64(result.SubmissionReplayStubs))
 		checkpoint.BudgetExceeded = result.BudgetExceeded
 		if result.EvictedRuns > 0 {
 			checkpoint.LastEvictedRunID = lastEvictedRunID
@@ -225,7 +238,7 @@ func validateRetentionPolicy(policy RetentionPolicy) error {
 	return nil
 }
 
-func readRetentionCandidates(tx *bolt.Tx, activeBindings map[string]bool) ([]retentionCandidate, int, int64, error) {
+func readRetentionCandidates(tx *bolt.Tx) ([]retentionCandidate, int, int64, error) {
 	runs := tx.Bucket([]byte(runsBucketName))
 	if runs == nil {
 		return nil, 0, 0, fmt.Errorf("Run bucket is missing")
@@ -267,7 +280,6 @@ func readRetentionCandidates(tx *bolt.Tx, activeBindings map[string]bool) ([]ret
 			runID:         runID,
 			finishedAt:    finishedAt,
 			detailedBytes: detailedBytes,
-			protected:     activeBindings[runID],
 			collectable:   collectable,
 		})
 		return nil
@@ -300,14 +312,21 @@ func evictionReasons(finishedAt, now time.Time, policy RetentionPolicy, terminal
 	return reasons
 }
 
-func retentionSubmissionBindings(tx *bolt.Tx, now time.Time) (map[string]bool, int, error) {
+func retentionSubmissionBindings(tx *bolt.Tx, now time.Time) (map[string]bool, int, int64, error) {
 	active := make(map[string]bool)
 	submissions := tx.Bucket([]byte("submissions"))
 	if submissions == nil {
-		return active, 0, nil
+		return active, 0, 0, nil
+	}
+	runIndex := tx.Bucket([]byte("submission-runs"))
+	expiry := tx.Bucket([]byte("submission-expiry"))
+	if runIndex == nil || expiry == nil {
+		return nil, 0, 0, fmt.Errorf("submission idempotency indexes are missing")
 	}
 	var expiredKeys [][]byte
 	var expiredRunIDs []string
+	var expiredRawBytes []int
+	var expiryKeys [][]byte
 	if err := submissions.ForEach(func(key, raw []byte) error {
 		if raw == nil {
 			return nil
@@ -316,31 +335,156 @@ func retentionSubmissionBindings(tx *bolt.Tx, now time.Time) (map[string]bool, i
 		if err := json.Unmarshal(raw, &record); err != nil {
 			return fmt.Errorf("decode submission binding during retention: %w", err)
 		}
-		if record.RunID == "" || record.ExpiresAt.IsZero() {
+		if record.RunID == "" || record.SpecDigest == "" || record.CreatedAt.IsZero() || record.ExpiresAt.IsZero() {
 			return fmt.Errorf("invalid submission binding during retention")
 		}
 		if record.ExpiresAt.After(now) {
+			if active[record.RunID] {
+				return fmt.Errorf("multiple active submission bindings for Run %q", record.RunID)
+			}
+			if !bytes.Equal(runIndex.Get([]byte(record.RunID)), key) {
+				return fmt.Errorf("submission Run index mismatch for %q", record.RunID)
+			}
+			expiryKey := retentionExpiryIndexKey(record.ExpiresAt, key)
+			if !bucketHasKey(expiry, expiryKey) {
+				return fmt.Errorf("submission expiry index missing for %q", record.RunID)
+			}
 			active[record.RunID] = true
 		} else {
 			expiredKeys = append(expiredKeys, append([]byte(nil), key...))
 			expiredRunIDs = append(expiredRunIDs, record.RunID)
+			expiredRawBytes = append(expiredRawBytes, len(raw))
+			expiryKeys = append(expiryKeys, retentionExpiryIndexKey(record.ExpiresAt, key))
 		}
 		return nil
 	}); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	indices := tx.Bucket([]byte("submissionRuns"))
+	var bytesRemoved int64
 	for i, key := range expiredKeys {
+		runID := expiredRunIDs[i]
 		if err := submissions.Delete(key); err != nil {
-			return nil, 0, fmt.Errorf("delete expired submission binding: %w", err)
+			return nil, 0, 0, fmt.Errorf("delete expired submission binding: %w", err)
 		}
-		if indices != nil && bytes.Equal(indices.Get([]byte(expiredRunIDs[i])), key) {
-			if err := indices.Delete([]byte(expiredRunIDs[i])); err != nil {
-				return nil, 0, fmt.Errorf("delete expired submission index: %w", err)
+		bytesRemoved += int64(len(key) + expiredRawBytes[i])
+		if bytes.Equal(runIndex.Get([]byte(runID)), key) {
+			if err := runIndex.Delete([]byte(runID)); err != nil {
+				return nil, 0, 0, fmt.Errorf("delete expired submission index: %w", err)
 			}
+			bytesRemoved += int64(len(runID) + len(key))
 		}
+		if err := expiry.Delete(expiryKeys[i]); err != nil {
+			return nil, 0, 0, fmt.Errorf("delete expired submission expiry index: %w", err)
+		}
+		bytesRemoved += int64(len(expiryKeys[i]))
 	}
-	return active, len(expiredKeys), nil
+	// Remove stale indexes whose binding is gone. Active bindings were checked
+	// above and remain fully indexed.
+	var staleRuns [][]byte
+	if err := runIndex.ForEach(func(key, value []byte) error {
+		if value == nil {
+			return nil
+		}
+		if submissions.Get(value) == nil {
+			staleRuns = append(staleRuns, append([]byte(nil), key...))
+		}
+		return nil
+	}); err != nil {
+		return nil, 0, 0, err
+	}
+	for _, runID := range staleRuns {
+		value := runIndex.Get(runID)
+		if err := runIndex.Delete(runID); err != nil {
+			return nil, 0, 0, fmt.Errorf("delete orphaned submission Run index: %w", err)
+		}
+		bytesRemoved += int64(len(runID) + len(value))
+	}
+	var staleExpiry [][]byte
+	if err := expiry.ForEach(func(key, _ []byte) error {
+		if len(key) < 8 {
+			return fmt.Errorf("invalid submission expiry index key")
+		}
+		submissionID := key[8:]
+		raw := submissions.Get(submissionID)
+		if raw == nil {
+			staleExpiry = append(staleExpiry, append([]byte(nil), key...))
+			return nil
+		}
+		var record submissionRetentionRecord
+		if err := json.Unmarshal(raw, &record); err != nil {
+			return fmt.Errorf("decode submission expiry binding: %w", err)
+		}
+		if !bytes.Equal(key, retentionExpiryIndexKey(record.ExpiresAt, submissionID)) {
+			staleExpiry = append(staleExpiry, append([]byte(nil), key...))
+		}
+		return nil
+	}); err != nil {
+		return nil, 0, 0, err
+	}
+	for _, key := range staleExpiry {
+		if err := expiry.Delete(key); err != nil {
+			return nil, 0, 0, fmt.Errorf("delete stale submission expiry index: %w", err)
+		}
+		bytesRemoved += int64(len(key))
+	}
+	return active, len(expiredKeys), bytesRemoved, nil
+}
+
+func bucketHasKey(bucket *bolt.Bucket, key []byte) bool {
+	if bucket == nil {
+		return false
+	}
+	found, _ := bucket.Cursor().Seek(key)
+	return bytes.Equal(found, key)
+}
+
+func retentionExpiryIndexKey(expiry time.Time, key []byte) []byte {
+	indexed := make([]byte, 8+len(key))
+	binary.BigEndian.PutUint64(indexed[:8], uint64(expiry.UnixNano()))
+	copy(indexed[8:], key)
+	return indexed
+}
+
+func storeSubmissionReplayStub(tx *bolt.Tx, run model.Run, now time.Time, activeBindings map[string]bool) (int64, bool, error) {
+	if !activeBindings[run.ID] {
+		return 0, false, nil
+	}
+	submissions := tx.Bucket([]byte("submissions"))
+	runIndex := tx.Bucket([]byte("submission-runs"))
+	if submissions == nil || runIndex == nil {
+		return 0, false, fmt.Errorf("live submission binding indexes are missing")
+	}
+	submissionID := runIndex.Get([]byte(run.ID))
+	if submissionID == nil {
+		return 0, false, fmt.Errorf("live submission Run index is missing")
+	}
+	raw := submissions.Get(submissionID)
+	if raw == nil {
+		return 0, false, fmt.Errorf("live submission binding is missing")
+	}
+	var record submissionRetentionRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return 0, false, fmt.Errorf("decode submission binding before Run collection: %w", err)
+	}
+	if record.RunID != run.ID || !record.ExpiresAt.After(now) {
+		return 0, false, fmt.Errorf("submission binding changed during Run collection")
+	}
+	if record.CollectedRun != nil {
+		if record.CollectedRun.ID != run.ID || record.CollectedRun.State != model.Terminal {
+			return 0, false, fmt.Errorf("invalid existing submission replay stub")
+		}
+		return 0, false, nil
+	}
+	stub := collectedRunSnapshot(run)
+	record.CollectedRun = &stub
+	encoded, err := json.Marshal(record)
+	if err != nil {
+		return 0, false, fmt.Errorf("encode submission replay stub: %w", err)
+	}
+	if err := submissions.Put(submissionID, encoded); err != nil {
+		return 0, false, fmt.Errorf("persist submission replay stub: %w", err)
+	}
+	return int64(len(encoded) - len(raw)), true, nil
 }
 
 func deleteRunEvidenceBuckets(tx *bolt.Tx, runID string) error {
