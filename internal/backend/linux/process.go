@@ -243,7 +243,15 @@ func (p *Process) Observe() (model.Resources, error) {
 	if err != nil {
 		return unavailableResources(), err
 	}
-	return p.observeProcesses(processes), nil
+	resources := p.observeProcesses(processes)
+	if len(activeProcesses(processes)) == 0 {
+		// Session scans only see live processes. Once all members have exited,
+		// their cumulative CPU time is no longer observable without cgroup
+		// accounting; reporting the empty sum as measured zero would erase the
+		// last valid sample in the final receipt.
+		resources.CPUTimeNs = model.Metric{Status: "unavailable"}
+	}
+	return resources, nil
 }
 
 func (p *Process) observeCgroup() model.Resources {

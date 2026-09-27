@@ -79,6 +79,24 @@ func TestStartOwnsAndTerminatesRealDescendants(t *testing.T) {
 	}
 }
 
+func TestCompletedNoCgroupCPUTimeIsUnavailable(t *testing.T) {
+	process, err := New().Start(testSpec(t, "/bin/sh", "-c", "exit 0"), io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitWithTimeout(t, process)
+	if process.(*Process).cg != nil {
+		t.Skip("no-cgroup CPU accounting fallback is not active")
+	}
+	resources, err := process.Observe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.CPUTimeNs.Status != "unavailable" {
+		t.Fatalf("an empty session cannot prove cumulative CPU time, got %+v", resources.CPUTimeNs)
+	}
+}
+
 func TestInteractiveRunUsesRealPTY(t *testing.T) {
 	stdout := &lockedBuffer{}
 	process, err := New().Start(model.RunSpec{
