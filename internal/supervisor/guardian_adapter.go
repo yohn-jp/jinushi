@@ -340,16 +340,52 @@ func (p *guardianPhysical) Wait() (exitResult, error) {
 }
 
 func (p *guardianPhysical) Observe() (model.Resources, error) {
+	sample, err := p.ObserveTelemetry()
+	if err != nil {
+		return model.Resources{}, err
+	}
+	return sample.Resources, nil
+}
+
+func (p *guardianPhysical) ObserveTelemetry() (model.TelemetrySample, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	snap, err := p.h.Observe(ctx)
 	if err != nil {
-		return model.Resources{}, err
+		return model.TelemetrySample{}, err
 	}
 	if err := p.syncOutput(16); err != nil {
-		return model.Resources{}, err
+		return model.TelemetrySample{}, err
 	}
-	return snap.Resources, nil
+	if snap.TelemetrySample == nil {
+		return model.TelemetrySample{}, errors.New("guardian has no process telemetry sample")
+	}
+	return cloneTelemetryForSupervisor(*snap.TelemetrySample), nil
+}
+
+func (p *guardianPhysical) FinalTelemetry() *model.TelemetrySample {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.final == nil || p.final.Snapshot.TelemetrySample == nil {
+		return nil
+	}
+	sample := cloneTelemetryForSupervisor(*p.final.Snapshot.TelemetrySample)
+	return &sample
+}
+
+func cloneTelemetryForSupervisor(sample model.TelemetrySample) model.TelemetrySample {
+	sample.Processes = append([]model.ProcessEvidence(nil), sample.Processes...)
+	sample.ProcessChanges = append([]model.ProcessEvidenceChange(nil), sample.ProcessChanges...)
+	sample.IO.Devices = append([]model.DeviceIOMetrics(nil), sample.IO.Devices...)
+	if sample.Activity.LastInputAt != nil {
+		at := *sample.Activity.LastInputAt
+		sample.Activity.LastInputAt = &at
+	}
+	if sample.Activity.LastResizeAt != nil {
+		at := *sample.Activity.LastResizeAt
+		sample.Activity.LastResizeAt = &at
+	}
+	return sample
 }
 
 func (p *guardianPhysical) RenewLease(expectedGeneration uint64, leaseMs int64) (leaseState, error) {

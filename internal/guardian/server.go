@@ -83,7 +83,8 @@ func serveConfig(config launchConfig, factory BackendFactory) error {
 	}
 	state.snapshot = Snapshot{
 		Version: ProtocolVersion, RunID: config.RunID, State: model.Starting,
-		Resources: unavailableResourcesFor(config.SampleIntervalMs), LeaseExpiry: config.InitialLeaseExpiry,
+		Resources: unavailableResourcesFor(config.SampleIntervalMs), Activity: initialActivity(config.Spec.Interactive),
+		LeaseExpiry:     config.InitialLeaseExpiry,
 		LeaseGeneration: config.LeaseGeneration,
 	}
 	if err := state.persist(); err != nil {
@@ -747,14 +748,7 @@ func (s *runState) observe() (Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.snapshot.State != model.Terminal && s.process != nil {
-		resources, observeErr := s.process.Observe()
-		observedAt := time.Now().UTC()
-		s.snapshot.LastResourceSampleAt = &observedAt
-		if observeErr == nil {
-			s.snapshot.Resources = mergeResources(s.snapshot.Resources, resources, s.descriptor.SampleIntervalMs, s.snapshot.EffectiveCapabilities)
-		} else {
-			s.snapshot.Resources = unavailableCurrent(s.snapshot.Resources)
-		}
+		s.observeTelemetryLocked(time.Now().UTC())
 		if s.snapshot.State == model.Running && s.snapshot.Controls != nil {
 			if err := verifyPersistedControlState(s.process, s.snapshot.Controls); err != nil {
 				s.snapshot.State = model.Uncertain
@@ -892,7 +886,11 @@ func (s *runState) writeInput(data []byte) error {
 	if process == nil || state == model.Terminal {
 		return errors.New("guardian: Run is not live")
 	}
-	return process.WriteInput(data)
+	err := process.WriteInput(data)
+	if len(data) == 0 {
+		return err
+	}
+	return s.recordInputActivity(int64(len(data)), err)
 }
 
 func (s *runState) resize(rows, cols uint16) error {
@@ -904,7 +902,8 @@ func (s *runState) resize(rows, cols uint16) error {
 	if process == nil || state == model.Terminal {
 		return errors.New("guardian: Run is not live")
 	}
-	return process.Resize(rows, cols)
+	err := process.Resize(rows, cols)
+	return s.recordResizeActivity(err)
 }
 
 func (s *runState) closeInput() error {
@@ -1070,6 +1069,85 @@ func (s *runState) sample() {
 	}
 }
 
+// observeTelemetryLocked captures one process evidence sample for the
+// supervisor-facing snapshot. The monitor's periodic resource observations
+// do not advance process-membership deltas, so every returned evidence sample
+// can be persisted by the supervisor exactly once.
+func (s *runState) observeTelemetryLocked(observedAt time.Time) {
+	s.snapshot.Activity = normalizedActivity(s.snapshot.Activity, s.descriptor.Spec.Interactive)
+	sample, _ := observeTelemetry(s.process, s.snapshot.RunID, s.snapshot.EffectiveCapabilities, s.snapshot.Activity, s.descriptor.SampleIntervalMs, observedAt)
+	s.snapshot.TelemetrySample = &sample
+	at := sample.ObservedAt
+	s.snapshot.LastResourceSampleAt = &at
+	s.snapshot.Resources = mergeResources(s.snapshot.Resources, sample.Resources, s.descriptor.SampleIntervalMs, s.snapshot.EffectiveCapabilities)
+	s.snapshot.Resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
+}
+
+func (s *runState) recordInputActivity(bytes int64, effectErr error) error {
+	if bytes <= 0 {
+		return effectErr
+	}
+	s.mu.Lock()
+	s.snapshot.Activity = normalizedActivity(s.snapshot.Activity, s.descriptor.Spec.Interactive)
+	if effectErr == nil {
+		incrementActivityMetric(&s.snapshot.Activity.InputBytes, bytes)
+		incrementActivityMetric(&s.snapshot.Activity.InputWrites, 1)
+		now := time.Now().UTC()
+		s.snapshot.Activity.LastInputAt = &now
+	} else {
+		invalidateActivity(&s.snapshot.Activity, true, false)
+	}
+	s.syncActivityToTelemetryLocked()
+	persistErr := s.persistLocked()
+	if persistErr != nil {
+		invalidateActivity(&s.snapshot.Activity, true, false)
+		s.syncActivityToTelemetryLocked()
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = "input-activity-persist-failed"
+		_ = s.persistLocked()
+	}
+	s.mu.Unlock()
+	if persistErr != nil {
+		return errors.Join(ErrUncertain, persistErr, effectErr)
+	}
+	return effectErr
+}
+
+func (s *runState) recordResizeActivity(effectErr error) error {
+	s.mu.Lock()
+	s.snapshot.Activity = normalizedActivity(s.snapshot.Activity, s.descriptor.Spec.Interactive)
+	if effectErr == nil {
+		incrementActivityMetric(&s.snapshot.Activity.ResizeCount, 1)
+		now := time.Now().UTC()
+		s.snapshot.Activity.LastResizeAt = &now
+	} else {
+		invalidateActivity(&s.snapshot.Activity, false, true)
+	}
+	s.syncActivityToTelemetryLocked()
+	persistErr := s.persistLocked()
+	if persistErr != nil {
+		invalidateActivity(&s.snapshot.Activity, false, true)
+		s.syncActivityToTelemetryLocked()
+		s.snapshot.State = model.Uncertain
+		s.snapshot.Reason = "resize-activity-persist-failed"
+		_ = s.persistLocked()
+	}
+	s.mu.Unlock()
+	if persistErr != nil {
+		return errors.Join(ErrUncertain, persistErr, effectErr)
+	}
+	return effectErr
+}
+
+func (s *runState) syncActivityToTelemetryLocked() {
+	if s.snapshot.TelemetrySample == nil {
+		return
+	}
+	sample := cloneTelemetrySample(*s.snapshot.TelemetrySample)
+	sample.Activity = cloneActivity(s.snapshot.Activity)
+	s.snapshot.TelemetrySample = &sample
+}
+
 func (s *runState) finish(exit backend.Exit) bool {
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
@@ -1080,14 +1158,8 @@ func (s *runState) finish(exit backend.Exit) bool {
 	s.mu.Lock()
 	resources := s.snapshot.Resources
 	limitOutcome := s.snapshot.LimitOutcome
-	observed, observeErr := s.process.Observe()
-	observedAt := time.Now().UTC()
-	s.snapshot.LastResourceSampleAt = &observedAt
-	if observeErr == nil {
-		resources = mergeResources(s.snapshot.Resources, observed, s.descriptor.SampleIntervalMs, s.snapshot.EffectiveCapabilities)
-	} else {
-		resources = unavailableCurrent(resources)
-	}
+	s.observeTelemetryLocked(time.Now().UTC())
+	resources = s.snapshot.Resources
 	resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
 	s.snapshot.Resources.SampleIntervalMs = s.descriptor.SampleIntervalMs
 	output := s.captureOutputEvidenceLocked()

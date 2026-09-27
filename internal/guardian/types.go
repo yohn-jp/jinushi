@@ -119,6 +119,8 @@ type Snapshot struct {
 	EffectiveCapabilities       *model.Capabilities       `json:"effectiveCapabilities,omitempty"`
 	Resources                   model.Resources           `json:"resources"`
 	LastResourceSampleAt        *time.Time                `json:"lastResourceSampleAt,omitempty"`
+	TelemetrySample             *model.TelemetrySample    `json:"telemetrySample,omitempty"`
+	Activity                    model.IOActivity          `json:"activity"`
 	LastOutputAt                *time.Time                `json:"lastOutputAt,omitempty"`
 	OutputLastWriteAt           map[string]time.Time      `json:"outputLastWriteAt,omitempty"`
 	Output                      model.Output              `json:"output"`
