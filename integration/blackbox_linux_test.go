@@ -167,9 +167,14 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, stateDir: filepath.Join(t.TempDir(), "state")}
-	h.startSupervisor()
+	tempRoot, err := os.MkdirTemp("", "jinushi-")
+	if err != nil {
+		t.Fatalf("create short supervisor state root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tempRoot) })
+	h := &harness{t: t, stateDir: filepath.Join(tempRoot, "state")}
 	t.Cleanup(h.cleanup)
+	h.startSupervisor()
 	return h
 }
 
