@@ -41,13 +41,16 @@ type Failure struct {
 }
 
 type Response struct {
-	Version              int                       `json:"version"`
-	Run                  *model.Run                `json:"run,omitempty"`
-	Runs                 []model.Run               `json:"runs,omitempty"`
-	NextCursor           string                    `json:"nextCursor"`
-	Events               []model.Event             `json:"events,omitempty"`
-	RetainedFrom         uint64                    `json:"retainedFrom,omitempty"`
-	Gap                  bool                      `json:"gap,omitempty"`
+	Version      int           `json:"version"`
+	Run          *model.Run    `json:"run,omitempty"`
+	Runs         []model.Run   `json:"runs,omitempty"`
+	NextCursor   string        `json:"nextCursor"`
+	Events       []model.Event `json:"events,omitempty"`
+	RetainedFrom uint64        `json:"retainedFrom,omitempty"`
+	Gap          bool          `json:"gap,omitempty"`
+	// WatchWatermark and WatchRetainedFrom are opaque all-Run watch cursors.
+	WatchWatermark       string                    `json:"watchWatermark,omitempty"`
+	WatchRetainedFrom    string                    `json:"watchRetainedFrom,omitempty"`
 	Data                 string                    `json:"data,omitempty"`
 	Capabilities         *model.Capabilities       `json:"capabilities,omitempty"`
 	HostEnvelope         *model.HostEnvelopeStatus `json:"hostEnvelope,omitempty"`

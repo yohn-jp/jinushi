@@ -138,6 +138,137 @@ func TestServiceNotifierWakesDurableEventAndOutputFollows(t *testing.T) {
 	}
 }
 
+func TestServiceWatchFollowReconnectsAcrossRetainedHistoryGap(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "state.db"), store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newService(root, db, nil, defaultConfig())
+	now := time.Now().UTC()
+	run := model.Run{
+		ID: "run-watch-gap", State: model.Running, Generation: 1, CreatedAt: now,
+		Spec: model.RunSpec{Argv: []string{"/bin/true"}, Cwd: root},
+	}
+	run, _, err = db.Create(run, &model.Event{
+		Kind: model.EventRunAccepted, ObservedAt: now,
+		Payload: &model.EventPayload{Run: &model.RunEventPayload{State: model.Accepted}},
+	})
+	if err != nil {
+		_ = s.Close()
+		t.Fatal(err)
+	}
+	initial := s.Handle(context.Background(), protocol.Request{Version: model.ProtocolVersion, Op: "watch", Limit: 1})
+	if initial.Error != nil || len(initial.Events) != 1 || initial.WatchWatermark == "" || initial.WatchWatermark != initial.NextCursor || initial.WatchRetainedFrom != initial.NextCursor {
+		_ = s.Close()
+		t.Fatalf("initial watch watermark response = %+v", initial)
+	}
+	const eventCount = 4097
+	events := make([]model.Event, eventCount)
+	for i := range events {
+		events[i] = model.Event{
+			Kind: model.EventOutputGap, ObservedAt: now.Add(time.Duration(i+1) * time.Millisecond),
+			Payload: &model.EventPayload{Output: &model.OutputEventPayload{Stream: "stdout", ObservedBytes: int64(i + 1)}},
+		}
+	}
+	if _, err := db.UpdateWithEvents(run, events); err != nil {
+		_ = s.Close()
+		t.Fatalf("persist retained-history fixture: %v", err)
+	}
+
+	listener, err := ipc.Listen(root)
+	if err != nil {
+		_ = s.Close()
+		t.Fatal(err)
+	}
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	queries := make(chan protocol.Request, 8)
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- ipc.ServeWithNotifier(serveCtx, listener, func(ctx context.Context, request protocol.Request) protocol.Response {
+			select {
+			case queries <- request:
+			default:
+			}
+			return s.Handle(ctx, request)
+		}, s.notifier)
+	}()
+	t.Cleanup(func() {
+		stopServe()
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Errorf("ServeWithNotifier: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("ServeWithNotifier did not stop")
+		}
+		if err := s.Close(); err != nil && !errors.Is(err, errSupervisorClosed) {
+			t.Errorf("Service.Close: %v", err)
+		}
+	})
+
+	gapCtx, cancelGap := context.WithCancel(context.Background())
+	gapDone := make(chan error, 1)
+	gapFrames := make(chan protocol.Response, 1)
+	go func() {
+		gapDone <- ipc.Follow(gapCtx, root, protocol.Request{Op: "watch", Cursor: initial.NextCursor, Follow: true}, func(response protocol.Response) error {
+			if response.Gap {
+				gapFrames <- response
+				cancelGap()
+			}
+			return nil
+		})
+	}()
+	if request := waitNotifierQuery(t, queries, "watch"); request.Cursor != initial.NextCursor {
+		t.Fatalf("stale watch cursor request = %q, want %q", request.Cursor, initial.NextCursor)
+	}
+	var gap protocol.Response
+	select {
+	case gap = <-gapFrames:
+	case <-time.After(3 * time.Second):
+		t.Fatal("watch follow did not return an explicit retention gap")
+	}
+	if err := <-gapDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("gap Follow exit = %v; want context.Canceled", err)
+	}
+	if !gap.Gap || len(gap.Events) != 1 || gap.NextCursor != gap.WatchRetainedFrom || gap.WatchWatermark == "" || gap.WatchWatermark == gap.NextCursor {
+		t.Fatalf("watch gap page = %+v", gap)
+	}
+
+	resumeCtx, cancelResume := context.WithCancel(context.Background())
+	defer cancelResume()
+	resumeDone := make(chan error, 1)
+	resumeFrames := make(chan protocol.Response, 1)
+	go func() {
+		resumeDone <- ipc.Follow(resumeCtx, root, protocol.Request{Op: "watch", Cursor: gap.NextCursor, Follow: true}, func(response protocol.Response) error {
+			if len(response.Events) > 0 {
+				select {
+				case resumeFrames <- response:
+				default:
+				}
+				cancelResume()
+			}
+			return nil
+		})
+	}()
+	if request := waitNotifierQuery(t, queries, "watch"); request.Cursor != gap.NextCursor {
+		t.Fatalf("reconnected watch cursor = %q, want %q", request.Cursor, gap.NextCursor)
+	}
+	var resumed protocol.Response
+	select {
+	case resumed = <-resumeFrames:
+	case <-time.After(3 * time.Second):
+		t.Fatal("watch follow did not resume after the gap")
+	}
+	if err := <-resumeDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("reconnected Follow exit = %v; want context.Canceled", err)
+	}
+	if resumed.Gap || len(resumed.Events) != 1 || resumed.NextCursor == gap.NextCursor || resumed.WatchWatermark != gap.WatchWatermark || resumed.WatchRetainedFrom != gap.WatchRetainedFrom {
+		t.Fatalf("reconnected watch page = %+v", resumed)
+	}
+}
+
 func waitNotifierQuery(t *testing.T, queries <-chan protocol.Request, op string) protocol.Request {
 	t.Helper()
 	timer := time.NewTimer(2 * time.Second)

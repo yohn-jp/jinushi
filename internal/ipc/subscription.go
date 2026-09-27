@@ -223,6 +223,10 @@ func advanceFollow(request protocol.Request, response protocol.Response, after *
 		*offset += int64(len(data))
 		return len(data) > 0 || response.Gap, nil
 	case "watch":
+		if response.Gap && len(response.Events) == 0 && len(response.Runs) == 0 &&
+			(response.WatchWatermark == "" || response.NextCursor != response.WatchWatermark) {
+			return false, &followFailure{"invalid-watch-cursor", "watch gap without events must advance to its watermark"}
+		}
 		previous := *cursor
 		if response.NextCursor != previous {
 			*cursor = response.NextCursor

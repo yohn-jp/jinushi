@@ -40,6 +40,8 @@ func (s *Service) watch(req protocol.Request) protocol.Response {
 	out := response()
 	out.Gap = page.Gap
 	out.NextCursor = req.Cursor
+	out.WatchWatermark = page.Watermark
+	out.WatchRetainedFrom = page.RetainedFrom
 	for _, entry := range page.Events {
 		candidate := out
 		candidate.Events = append(append([]model.Event(nil), out.Events...), entry.Event)
@@ -55,6 +57,15 @@ func (s *Service) watch(req protocol.Request) protocol.Response {
 			break
 		}
 		out = candidate
+	}
+	if out.Gap && len(out.Events) == 0 {
+		if page.Watermark == "" {
+			return failure("storage-failure", "all-Run watch gap has no current watermark")
+		}
+		// When retention removed every event after the requested cursor, skip
+		// directly to the observed watermark so reconnect does not repeat the
+		// same gap forever.
+		out.NextCursor = page.Watermark
 	}
 	return out
 }

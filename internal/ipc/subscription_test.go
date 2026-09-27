@@ -212,11 +212,11 @@ func TestFollowAllRunWatchCarriesOpaqueCursorAndGap(t *testing.T) {
 		requests <- request
 		switch calls.Add(1) {
 		case 1:
-			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "watermark-a"}
+			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "watermark-a", WatchWatermark: "watermark-a", WatchRetainedFrom: "retained-a"}
 		case 2:
-			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "watermark-b", Gap: true, Events: []model.Event{{Version: 1, RunID: "run_other", Seq: 9, Kind: model.EventRunTerminal}}}
+			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "watermark-b", WatchWatermark: "watermark-b", WatchRetainedFrom: "retained-b", Gap: true, Events: []model.Event{{Version: 1, RunID: "run_other", Seq: 9, Kind: model.EventRunTerminal}}}
 		default:
-			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "watermark-b"}
+			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "watermark-b", WatchWatermark: "watermark-b", WatchRetainedFrom: "retained-b"}
 		}
 	}, notifier)
 
@@ -225,6 +225,9 @@ func TestFollowAllRunWatchCarriesOpaqueCursorAndGap(t *testing.T) {
 	var frames atomic.Int32
 	err := Follow(ctx, stateDir, protocol.Request{Op: "watch", Cursor: "", Follow: true}, func(response protocol.Response) error {
 		if response.Gap {
+			if response.WatchWatermark != "watermark-b" || response.WatchRetainedFrom != "retained-b" {
+				t.Errorf("watch gap watermarks = %q/%q", response.WatchWatermark, response.WatchRetainedFrom)
+			}
 			frames.Add(1)
 			cancel()
 		}
@@ -243,6 +246,91 @@ func TestFollowAllRunWatchCarriesOpaqueCursorAndGap(t *testing.T) {
 	}
 	if frames.Load() != 1 {
 		t.Fatalf("gap frame count = %d, want 1", frames.Load())
+	}
+}
+
+func TestFollowAllRunWatchGapWithoutEventsAdvancesToWatermarkAndReconnects(t *testing.T) {
+	notifier := newTestNotifier()
+	requests := make(chan protocol.Request, 4)
+	var calls atomic.Int32
+	stateDir, _, _ := startNotifiedServer(t, func(_ context.Context, request protocol.Request) protocol.Response {
+		requests <- request
+		switch calls.Add(1) {
+		case 1:
+			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "cursor-a", WatchWatermark: "cursor-a", WatchRetainedFrom: "retained-a"}
+		case 2:
+			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "cursor-b", WatchWatermark: "cursor-b", WatchRetainedFrom: "retained-b", Gap: true}
+		default:
+			return protocol.Response{Version: model.ProtocolVersion, NextCursor: "cursor-c", WatchWatermark: "cursor-c", WatchRetainedFrom: "retained-b", Events: []model.Event{{Version: 1, RunID: "run_after_gap", Seq: 1, Kind: model.EventRunRunning}}}
+		}
+	}, notifier)
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	gapFrame := make(chan protocol.Response, 1)
+	go func() {
+		firstDone <- Follow(firstCtx, stateDir, protocol.Request{Op: "watch", Cursor: "cursor-a", Follow: true}, func(response protocol.Response) error {
+			if response.Gap {
+				gapFrame <- response
+				cancelFirst()
+			}
+			return nil
+		})
+	}()
+	initialRequest := <-requests
+	if initialRequest.Cursor != "cursor-a" {
+		t.Fatalf("initial watch cursor = %q", initialRequest.Cursor)
+	}
+	notifier.notify()
+	gapRequest := <-requests
+	if gapRequest.Cursor != "cursor-a" {
+		t.Fatalf("gap recovery request cursor = %q, want unchanged cursor-a", gapRequest.Cursor)
+	}
+	var gap protocol.Response
+	select {
+	case gap = <-gapFrame:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch follow did not deliver gap-only frame")
+	}
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Follow error = %v; want context.Canceled", err)
+	}
+	if len(gap.Events) != 0 || !gap.Gap || gap.WatchWatermark != "cursor-b" || gap.WatchRetainedFrom != "retained-b" || gap.NextCursor != gap.WatchWatermark {
+		t.Fatalf("gap-only watch frame = %+v", gap)
+	}
+	select {
+	case <-notifier.subscribed:
+	default:
+	}
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	secondDone := make(chan error, 1)
+	resumedFrame := make(chan protocol.Response, 1)
+	go func() {
+		secondDone <- Follow(secondCtx, stateDir, protocol.Request{Op: "watch", Cursor: gap.NextCursor, Follow: true}, func(response protocol.Response) error {
+			if len(response.Events) > 0 {
+				resumedFrame <- response
+				cancelSecond()
+			}
+			return nil
+		})
+	}()
+	resumeRequest := <-requests
+	if resumeRequest.Cursor != "cursor-b" {
+		t.Fatalf("reconnect request cursor = %q, want cursor-b", resumeRequest.Cursor)
+	}
+	var resumed protocol.Response
+	select {
+	case resumed = <-resumedFrame:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch follow did not reconnect after gap")
+	}
+	if err := <-secondDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("reconnected Follow error = %v; want context.Canceled", err)
+	}
+	if resumed.Gap || resumed.NextCursor != "cursor-c" || resumed.WatchWatermark != "cursor-c" || len(resumed.Events) != 1 {
+		t.Fatalf("reconnected watch frame = %+v", resumed)
 	}
 }
 
