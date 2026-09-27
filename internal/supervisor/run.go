@@ -26,16 +26,24 @@ func Run(ctx context.Context, stateDir string) error {
 	if err := os.Chmod(root, 0700); err != nil {
 		return fmt.Errorf("restrict state directory: %w", err)
 	}
-	db, err := store.Open(statePath(root), store.Options{})
+	config, err := loadConfig(root)
 	if err != nil {
 		return err
 	}
-	backend, err := newGuardedExecutor(root)
+	db, err := store.Open(statePath(root), store.Options{
+		EventRetentionCount: config.EventRetentionCount,
+		EventRetentionBytes: config.EventRetentionBytes,
+		OutputRetainedBytes: config.MaxOutputBytes,
+	})
+	if err != nil {
+		return err
+	}
+	backend, err := newGuardedExecutor(root, config)
 	if err != nil {
 		_ = db.Close()
 		return err
 	}
-	s := newService(root, db, backend)
+	s := newService(root, db, backend, config)
 	defer s.Close()
 	if err := s.reconcile(); err != nil {
 		return fmt.Errorf("reconcile Runs: %w", err)

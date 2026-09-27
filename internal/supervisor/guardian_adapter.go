@@ -19,14 +19,15 @@ type guardedExecutor struct {
 	root       string
 	executable string
 	native     backend.Backend
+	config     Config
 }
 
-func newGuardedExecutor(root string) (*guardedExecutor, error) {
+func newGuardedExecutor(root string, config Config) (*guardedExecutor, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
-	return &guardedExecutor{root: root, executable: exe, native: PlatformBackendFactory()()}, nil
+	return &guardedExecutor{root: root, executable: exe, native: PlatformBackendFactory()(), config: config}, nil
 }
 
 func (g *guardedExecutor) Capabilities() model.Capabilities {
@@ -40,7 +41,7 @@ func (g *guardedExecutor) runDir(id string) string { return filepath.Join(g.root
 func (g *guardedExecutor) Start(id string, spec model.RunSpec, stdout, stderr io.Writer) (physical, error) {
 	max := spec.Limits.OutputBytes
 	if max == 0 {
-		max = defaultOutputBytes
+		max = g.config.DefaultOutputBytes
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -147,6 +148,18 @@ func (p *guardianPhysical) syncOutput() error {
 			if err != nil {
 				return err
 			}
+			if chunk.Gap {
+				if chunk.RetainedFrom <= offset {
+					return fmt.Errorf("guardian output gap has no forward watermark")
+				}
+				if recorder, ok := stream.writer.(outputGapRecorder); ok {
+					if err := recorder.RecordGap(chunk.RetainedFrom); err != nil {
+						return err
+					}
+				}
+				p.offsets[stream.name] = chunk.RetainedFrom
+				continue
+			}
 			if len(chunk.Data) > 0 {
 				n, err := stream.writer.Write(chunk.Data)
 				if err != nil {
@@ -157,14 +170,6 @@ func (p *guardianPhysical) syncOutput() error {
 				}
 				p.offsets[stream.name] = offset + int64(n)
 				continue
-			}
-			if chunk.Gap {
-				if recorder, ok := stream.writer.(outputGapRecorder); ok {
-					if err := recorder.RecordGap(chunk.ObservedBytes); err != nil {
-						return err
-					}
-				}
-				p.offsets[stream.name] = chunk.ObservedBytes
 			}
 			break
 		}

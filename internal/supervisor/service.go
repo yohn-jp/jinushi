@@ -19,14 +19,6 @@ import (
 	"github.com/yohn-jp/jinushi/internal/store"
 )
 
-const (
-	defaultOutputBytes = 1 << 20
-	maxOutputBytes     = 64 << 20
-	maxWallTime        = 7 * 24 * time.Hour
-	sampleInterval     = 250 * time.Millisecond
-	terminationGrace   = 2 * time.Second
-)
-
 type exitResult struct {
 	code       *int
 	signal     string
@@ -81,14 +73,15 @@ type Service struct {
 	store     *store.Store
 	backend   executor
 	root      string
+	config    Config
 	mu        sync.RWMutex
 	active    map[string]*active
 	stop      chan struct{}
 	closeOnce sync.Once
 }
 
-func newService(root string, db *store.Store, backend executor) *Service {
-	return &Service{root: root, store: db, backend: backend, active: make(map[string]*active), stop: make(chan struct{})}
+func newService(root string, db *store.Store, backend executor, config Config) *Service {
+	return &Service{root: root, store: db, backend: backend, config: config, active: make(map[string]*active), stop: make(chan struct{})}
 }
 
 func newID() (string, error) {
@@ -105,18 +98,18 @@ func failure(code, message string) protocol.Response {
 
 func response() protocol.Response { return protocol.Response{Version: model.ProtocolVersion} }
 
-func initialResources(c model.Capabilities) model.Resources {
+func initialResources(c model.Capabilities, sampleIntervalMs int64) model.Resources {
 	metric := func(supported bool) model.Metric {
 		if supported {
 			return model.Metric{Status: "unavailable"}
 		}
 		return model.Metric{Status: "unsupported"}
 	}
-	return model.Resources{MemoryBytes: metric(c.MemoryTelemetry), PeakMemoryBytes: metric(c.MemoryTelemetry), CPUTimeNs: metric(c.CPUTelemetry), ProcessCount: metric(c.ProcessTelemetry), PeakProcessCount: metric(c.ProcessTelemetry), SampleIntervalMs: int64(sampleInterval / time.Millisecond)}
+	return model.Resources{MemoryBytes: metric(c.MemoryTelemetry), PeakMemoryBytes: metric(c.MemoryTelemetry), CPUTimeNs: metric(c.CPUTelemetry), ProcessCount: metric(c.ProcessTelemetry), PeakProcessCount: metric(c.ProcessTelemetry), SampleIntervalMs: sampleIntervalMs}
 }
 
-func normalizeResources(r model.Resources, c model.Capabilities) model.Resources {
-	defaults := initialResources(c)
+func normalizeResources(r model.Resources, c model.Capabilities, sampleIntervalMs int64) model.Resources {
+	defaults := initialResources(c, sampleIntervalMs)
 	if r.MemoryBytes.Status == "" {
 		r.MemoryBytes = defaults.MemoryBytes
 	}
@@ -146,7 +139,7 @@ func publicRun(run model.Run) model.Run {
 	return run
 }
 
-func validSpec(spec *model.RunSpec, caps model.Capabilities) *protocol.Failure {
+func validSpec(spec *model.RunSpec, caps model.Capabilities, config Config) *protocol.Failure {
 	if spec == nil || len(spec.Argv) == 0 || spec.Argv[0] == "" || len(spec.Argv) > 256 {
 		return &protocol.Failure{"invalid-request", "argv must contain an executable and at most 256 arguments"}
 	}
@@ -183,13 +176,13 @@ func validSpec(spec *model.RunSpec, caps model.Capabilities) *protocol.Failure {
 	if spec.Lifetime.Mode != "detached" && spec.Lifetime.Mode != "lease-bound" {
 		return &protocol.Failure{"invalid-request", "invalid lifetime mode"}
 	}
-	if spec.Lifetime.Mode == "lease-bound" && (spec.Lifetime.LeaseMs < 1000 || spec.Lifetime.LeaseMs > int64(maxWallTime/time.Millisecond)) {
+	if spec.Lifetime.Mode == "lease-bound" && (spec.Lifetime.LeaseMs < 1000 || spec.Lifetime.LeaseMs > config.MaxWallTimeMs) {
 		return &protocol.Failure{"invalid-request", "invalid lease duration"}
 	}
 	if spec.Limits.MemoryBytes < 0 || spec.Limits.CPUQuotaPercent < 0 || spec.Limits.ProcessCount < 0 || spec.Limits.WallTimeMs < 0 || spec.Limits.OutputBytes < 0 {
 		return &protocol.Failure{"invalid-request", "negative limit"}
 	}
-	if spec.Limits.OutputBytes > maxOutputBytes || spec.Limits.WallTimeMs > int64(maxWallTime/time.Millisecond) {
+	if spec.Limits.OutputBytes > config.MaxOutputBytes || spec.Limits.WallTimeMs > config.MaxWallTimeMs || spec.Limits.MemoryBytes > config.MaxMemoryBytes || spec.Limits.ProcessCount > config.MaxProcessCount {
 		return &protocol.Failure{"invalid-request", "limit exceeds supervisor ceiling"}
 	}
 	if spec.Interactive && !caps.PTY {
@@ -268,7 +261,7 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 }
 
 func (s *Service) create(spec *model.RunSpec) protocol.Response {
-	if f := validSpec(spec, s.backend.Capabilities()); f != nil {
+	if f := validSpec(spec, s.backend.Capabilities(), s.config); f != nil {
 		return protocol.Response{Version: model.ProtocolVersion, Error: f}
 	}
 	if _, err := os.Stat(spec.Cwd); err != nil {
@@ -289,7 +282,7 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 	publicSpec := *spec
 	publicSpec.Environment.Set = nil
 	publicSpec.Environment.Unset = nil
-	run := model.Run{ID: id, Spec: publicSpec, State: model.Accepted, Generation: 1, CreatedAt: now, Resources: initialResources(s.backend.Capabilities())}
+	run := model.Run{ID: id, Spec: publicSpec, State: model.Accepted, Generation: 1, CreatedAt: now, Resources: initialResources(s.backend.Capabilities(), s.config.SampleIntervalMs)}
 	run.Output.HistoryComplete = true
 	if spec.Lifetime.Mode == "lease-bound" {
 		expiry := now.Add(time.Duration(spec.Lifetime.LeaseMs) * time.Millisecond)
@@ -365,7 +358,7 @@ func (s *Service) start(a *active) {
 	}
 	if err := s.transition(a, state, kind, map[string]any{"pid": own.PID}); err != nil {
 		a.mu.Unlock()
-		p.Terminate(terminationGrace)
+		p.Terminate(time.Duration(s.config.TerminationGraceMs) * time.Millisecond)
 		s.markUncertain(a, "storage failure after spawn")
 		return
 	}
@@ -389,7 +382,7 @@ func (s *Service) monitor(a *active) {
 			err    error
 		}{x, e}
 	}()
-	ticker := time.NewTicker(sampleInterval)
+	ticker := time.NewTicker(time.Duration(s.config.SampleIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -401,7 +394,7 @@ func (s *Service) monitor(a *active) {
 				return
 			}
 			s.sample(a)
-			termination, err := a.process.Terminate(terminationGrace)
+			termination, err := a.process.Terminate(time.Duration(s.config.TerminationGraceMs) * time.Millisecond)
 			if err != nil || !termination.complete {
 				s.markUncertain(a, "process tree cleanup unproven")
 				return
@@ -482,8 +475,8 @@ func (s *Service) sample(a *active) {
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
 		return
 	}
-	r = normalizeResources(r, s.backend.Capabilities())
-	r.SampleIntervalMs = int64(sampleInterval / time.Millisecond)
+	r = normalizeResources(r, s.backend.Capabilities(), s.config.SampleIntervalMs)
+	r.SampleIntervalMs = s.config.SampleIntervalMs
 	if r.CPUTimeNs.Status == "measured" && a.run.Resources.CPUTimeNs.Status == "measured" && r.CPUTimeNs.Value > a.run.Resources.CPUTimeNs.Value {
 		now := time.Now().UTC()
 		a.run.LastCPUActivityAt = &now
@@ -583,7 +576,7 @@ func (w *capture) Write(data []byte) (int, error) {
 	defer w.a.mu.Unlock()
 	max := w.a.run.Spec.Limits.OutputBytes
 	if max == 0 {
-		max = defaultOutputBytes
+		max = w.s.config.DefaultOutputBytes
 	}
 	meta, err := w.s.store.AppendOutput(w.a.run.ID, w.stream, data, max)
 	if err != nil {
@@ -953,7 +946,7 @@ func (s *Service) driveTermination(a *active, p physical) {
 	if setter, ok := p.(interface{ SetTerminationReason(string) }); ok {
 		setter.SetTerminationReason(reason)
 	}
-	result, err := p.Terminate(terminationGrace)
+	result, err := p.Terminate(time.Duration(s.config.TerminationGraceMs) * time.Millisecond)
 	if err != nil || !result.complete {
 		s.markUncertain(a, "termination unproven")
 		return
@@ -968,7 +961,7 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	if a == nil {
 		return out
 	}
-	if req.LeaseMs < 1000 || req.LeaseMs > int64(maxWallTime/time.Millisecond) {
+	if req.LeaseMs < 1000 || req.LeaseMs > s.config.MaxWallTimeMs {
 		return failure("invalid-request", "invalid lease duration")
 	}
 	a.mu.Lock()
