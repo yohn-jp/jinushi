@@ -296,6 +296,7 @@ Example supervisor concerns:
 ```text
 max Run memory request
 max Run process count
+max Run Linux task/PID count
 max Run wall time
 max output retention
 max event retention
@@ -305,7 +306,7 @@ termination grace ceiling
 
 This is a safety ceiling, not a workload scheduler.
 
-Linux maps accepted Run limits to cgroup v2 when the relevant controller is delegated. A required hard limit that cannot be enforced is rejected explicitly. The experimental Windows backend may preserve its existing behavior but is not a Wave 2 parity target.
+Linux maps accepted memory, CPU, and task/PID limits to cgroup v2 when the relevant controller is delegated. Linux does not advertise process-count enforcement from `pids.max`, because the controller counts threads as well as process leaders. A required hard limit that cannot be enforced is rejected explicitly. The experimental Windows backend may preserve its existing behavior but is not a Wave 2 parity target.
 
 ## 13. Termination implementation
 

@@ -276,6 +276,15 @@ CPU quota/rate where the OS can enforce it. CPU time telemetry can still be avai
 
 Maximum owned process count.
 
+On Linux, cgroup v2 `pids.max` does not enforce this field: it counts tasks,
+including threads. A Linux process-count limit is rejected unless a backend
+can enforce process identities directly.
+
+### Task/PID count
+
+Maximum owned Linux task count where a delegated cgroup v2 `pids` controller
+can enforce `pids.max`. Process and task observations remain separate.
+
 ### Wall time
 
 Maximum Run lifetime before timeout termination begins.
@@ -424,6 +433,7 @@ Examples:
 - memory enforcement;
 - CPU quota enforcement;
 - process-count enforcement;
+- task/PID-count enforcement on Linux;
 - time-series memory/CPU;
 - restart reconciliation strength;
 - supported signal set.

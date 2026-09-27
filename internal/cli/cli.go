@@ -105,6 +105,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	memory := fs.Int64("memory-bytes", 0, "memory limit")
 	cpu := fs.Int64("cpu-quota-percent", 0, "CPU quota percentage")
 	processes := fs.Int64("process-count", 0, "process-count limit")
+	tasks := fs.Int64("task-count", 0, "Linux task/PID limit (pids.max)")
 	wall := fs.Int64("wall-time-ms", 0, "wall-time limit")
 	output := fs.Int64("output-bytes", 0, "retained output limit")
 	parent := fs.String("parent-run-id", "", "opaque parent Run ID")
@@ -137,7 +138,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintln(stderr, "--environment-mode must be inherit-supervisor or replace")
 		return 2
 	}
-	for _, value := range []*int64{memory, cpu, processes, wall, output} {
+	for _, value := range []*int64{memory, cpu, processes, tasks, wall, output} {
 		if *value < 0 {
 			fmt.Fprintln(stderr, "resource limits must be non-negative")
 			return 2
@@ -172,7 +173,7 @@ func runCommand(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		Interactive: *interactive,
 		Lifetime:    model.Lifetime{Mode: *lifetime, LeaseMs: *leaseMS},
 		Limits: model.Limits{
-			MemoryBytes: *memory, CPUQuotaPercent: *cpu, ProcessCount: *processes,
+			MemoryBytes: *memory, CPUQuotaPercent: *cpu, ProcessCount: *processes, TaskCount: *tasks,
 			WallTimeMs: *wall, OutputBytes: *output,
 		},
 		ParentRunID: *parent,

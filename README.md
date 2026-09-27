@@ -83,7 +83,7 @@ The supervisor reads optional `config.json` from its state directory at startup.
 }
 ```
 
-Other supervisor ceilings are `maxWallTimeMs`, `maxMemoryBytes`, and `maxProcessCount`. Per-Run requests may narrow these limits. The state directory is local private runtime data, and environment values are not returned by normal Run observation.
+Other supervisor ceilings are `maxWallTimeMs`, `maxMemoryBytes`, `maxProcessCount`, and `maxTaskCount`. Per-Run requests may narrow these limits. On Linux, `--task-count` maps to cgroup v2 `pids.max` when delegated; `--process-count` is rejected because that controller counts threads as well as processes. The state directory is local private runtime data, and environment values are not returned by normal Run observation.
 
 Representative public operations:
 
