@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -47,6 +48,9 @@ type reconcileResult struct {
 	state             model.State
 	terminationReason string
 	lease             leaseState
+	resources         model.Resources
+	lastSampleAt      *time.Time
+	lastOutputAt      *time.Time
 }
 
 type leaseState struct {
@@ -160,7 +164,7 @@ func (s *Service) populateReceipt(run model.Run, receipt *model.Receipt) {
 	identity := sha256.Sum256([]byte(strings.Join(run.Spec.Argv, "\x00")))
 	receipt.AcceptedArgvSHA256 = fmt.Sprintf("%x", identity)
 	receipt.Capabilities = s.backend.Capabilities()
-	if !receipt.Output.HistoryComplete {
+	if !receipt.Output.HistoryComplete || run.ResourceGap {
 		receipt.EvidenceIncomplete = true
 	}
 	for _, metric := range []model.Metric{
@@ -259,15 +263,35 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 	case "run":
 		return s.create(req.Spec)
 	case "list":
-		runs, err := s.store.List()
+		limit := req.Limit
+		if limit == 0 {
+			limit = 64
+		}
+		if limit < 1 || limit > 128 || len(req.Cursor) > 128 {
+			return failure("invalid-request", "list limit must be between 1 and 128 and cursor at most 128 bytes")
+		}
+		runs, nextCursor, err := s.store.ListPage(req.Cursor, int(limit))
 		if err != nil {
 			return failure("storage-failure", err.Error())
 		}
-		for i := range runs {
-			runs[i] = publicRun(runs[i])
-		}
 		out := response()
-		out.Runs = runs
+		out.Runs = make([]model.Run, 0, len(runs))
+		for _, run := range runs {
+			out.Runs = append(out.Runs, publicRun(run))
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				return failure("storage-failure", "Run list could not be encoded")
+			}
+			if len(encoded) >= protocol.MaxFrame-4096 {
+				out.Runs = out.Runs[:len(out.Runs)-1]
+				if len(out.Runs) == 0 {
+					return failure("response-too-large", "Run "+run.ID+" is too large for a list page")
+				}
+				nextCursor = out.Runs[len(out.Runs)-1].ID
+				break
+			}
+		}
+		out.NextCursor = nextCursor
 		return out
 	case "inspect":
 		return s.inspect(req.RunID)
@@ -302,6 +326,11 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 	if f := validSpec(spec, s.backend.Capabilities(), s.config); f != nil {
 		return protocol.Response{Version: model.ProtocolVersion, Error: f}
 	}
+	if validator, ok := s.backend.(interface{ ValidateLimits(model.Limits) error }); ok {
+		if err := validator.ValidateLimits(spec.Limits); err != nil {
+			return failure("unsupported-capability", err.Error())
+		}
+	}
 	if _, err := os.Stat(spec.Cwd); err != nil {
 		return failure("cwd-failure", "cwd unavailable")
 	}
@@ -327,6 +356,15 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 		run.LeaseExpiry = &expiry
 		run.LeaseGeneration = 1
 	}
+	// The accepted identity must fit in the same bounded frame that carries the
+	// request. Check the actual public response before making acceptance durable.
+	accepted := response()
+	clean := publicRun(run)
+	accepted.Run = &clean
+	encoded, err := json.Marshal(accepted)
+	if err != nil || len(encoded) >= protocol.MaxFrame-4096 {
+		return failure("response-too-large", "Run metadata exceeds the IPC response limit")
+	}
 	if _, _, err = s.store.Create(run, &model.Event{Kind: "run.accepted", ObservedAt: now}); err != nil {
 		return failure("storage-failure", err.Error())
 	}
@@ -335,10 +373,7 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 	s.active[id] = a
 	s.mu.Unlock()
 	go s.start(a)
-	out := response()
-	clean := publicRun(run)
-	out.Run = &clean
-	return out
+	return accepted
 }
 
 func (s *Service) transition(a *active, state model.State, kind string, body map[string]any) error {
@@ -504,6 +539,7 @@ func (s *Service) sample(a *active) {
 	if err != nil {
 		a.mu.Lock()
 		if a.run.State != model.Terminal && a.run.State != model.Uncertain {
+			now := time.Now().UTC()
 			if a.run.Resources.MemoryBytes.Status != "unsupported" {
 				a.run.Resources.MemoryBytes = model.Metric{Status: "unavailable"}
 			}
@@ -513,7 +549,8 @@ func (s *Service) sample(a *active) {
 			if a.run.Resources.ProcessCount.Status != "unsupported" {
 				a.run.Resources.ProcessCount = model.Metric{Status: "unavailable"}
 			}
-			_, _ = s.store.Update(a.run, &model.Event{Kind: "resource.unavailable", ObservedAt: time.Now().UTC()})
+			a.run.LastResourceSampleAt = &now
+			_, _ = s.store.Update(a.run, &model.Event{Kind: "resource.unavailable", ObservedAt: now})
 		}
 		a.mu.Unlock()
 		return
@@ -525,12 +562,11 @@ func (s *Service) sample(a *active) {
 	}
 	r = normalizeResources(r, s.backend.Capabilities(), s.config.SampleIntervalMs)
 	r.SampleIntervalMs = s.config.SampleIntervalMs
+	now := time.Now().UTC()
 	if r.CPUTimeNs.Status == "measured" && a.run.Resources.CPUTimeNs.Status == "measured" && r.CPUTimeNs.Value > a.run.Resources.CPUTimeNs.Value {
-		now := time.Now().UTC()
 		a.run.LastCPUActivityAt = &now
 	}
 	if r.ProcessCount.Status == "measured" && a.run.Resources.ProcessCount.Status == "measured" && r.ProcessCount.Value != a.run.Resources.ProcessCount.Value {
-		now := time.Now().UTC()
 		a.run.LastProcessChangeAt = &now
 	}
 	if r.PeakMemoryBytes.Status != "measured" && r.MemoryBytes.Status == "measured" {
@@ -546,7 +582,8 @@ func (s *Service) sample(a *active) {
 		r.PeakProcessCount = a.run.Resources.PeakProcessCount
 	}
 	a.run.Resources = r
-	_, _ = s.store.Update(a.run, &model.Event{Kind: "resource.sample", ObservedAt: time.Now().UTC(), Body: map[string]any{"resources": r}})
+	a.run.LastResourceSampleAt = &now
+	_, _ = s.store.Update(a.run, &model.Event{Kind: "resource.sample", ObservedAt: now, Body: map[string]any{"resources": r}})
 }
 
 func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool, cleanup string) {
@@ -630,12 +667,21 @@ type capture struct {
 }
 
 func (w *capture) RecordGap(observed int64) error {
+	return w.RecordGapObserved(observed, time.Time{})
+}
+
+func (w *capture) RecordGapObserved(observed int64, observedAt time.Time) error {
+	basis := "stream-last-write"
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+		basis = "import-time-unavailable"
+	}
 	w.a.mu.Lock()
 	defer w.a.mu.Unlock()
-	if err := w.s.store.RecordOutputGap(w.a.run.ID, w.stream, observed); err != nil {
+	meta, err := w.s.store.RecordOutputGapWithEvent(w.a.run.ID, w.stream, observed, model.Event{Kind: "output.gap", ObservedAt: observedAt, Body: map[string]any{"stream": w.stream, "observedBytes": observed, "timestampBasis": basis}})
+	if err != nil {
 		return err
 	}
-	meta := model.OutputStream{ObservedBytes: observed, RetainedFrom: observed, Truncated: true}
 	if w.stream == "stdout" {
 		w.a.run.Output.Stdout = meta
 	} else if w.stream == "stderr" {
@@ -644,18 +690,29 @@ func (w *capture) RecordGap(observed int64) error {
 		w.a.run.Output.PTY = meta
 	}
 	w.a.run.Output.HistoryComplete = false
-	_, err := w.s.store.Update(w.a.run, &model.Event{Kind: "output.gap", ObservedAt: time.Now().UTC(), Body: map[string]any{"stream": w.stream, "observedBytes": observed}})
-	return err
+	if w.a.run.LastOutputAt == nil || observedAt.After(*w.a.run.LastOutputAt) {
+		w.a.run.LastOutputAt = &observedAt
+	}
+	return nil
 }
 
 func (w *capture) Write(data []byte) (int, error) {
+	return w.WriteObserved(data, time.Time{})
+}
+
+func (w *capture) WriteObserved(data []byte, observedAt time.Time) (int, error) {
+	basis := "stream-last-write"
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+		basis = "import-time-unavailable"
+	}
 	w.a.mu.Lock()
 	defer w.a.mu.Unlock()
 	max := w.a.run.Spec.Limits.OutputBytes
 	if max == 0 {
 		max = w.s.config.DefaultOutputBytes
 	}
-	meta, err := w.s.store.AppendOutput(w.a.run.ID, w.stream, data, max)
+	meta, err := w.s.store.AppendOutputWithEvent(w.a.run.ID, w.stream, data, max, model.Event{Kind: "output.chunk", ObservedAt: observedAt, Body: map[string]any{"stream": w.stream, "bytes": len(data), "timestampBasis": basis}})
 	if err != nil {
 		return 0, err
 	}
@@ -667,11 +724,8 @@ func (w *capture) Write(data []byte) (int, error) {
 		w.a.run.Output.PTY = meta
 	}
 	w.a.run.Output.HistoryComplete = !(w.a.run.Output.Stdout.Truncated || w.a.run.Output.Stderr.Truncated || w.a.run.Output.PTY.Truncated)
-	now := time.Now().UTC()
-	w.a.run.LastOutputAt = &now
-	_, err = w.s.store.Update(w.a.run, &model.Event{Kind: "output.chunk", ObservedAt: now, Body: map[string]any{"stream": w.stream, "bytes": len(data)}})
-	if err != nil {
-		return 0, err
+	if w.a.run.LastOutputAt == nil || observedAt.After(*w.a.run.LastOutputAt) {
+		w.a.run.LastOutputAt = &observedAt
 	}
 	return len(data), nil
 }
@@ -1163,6 +1217,37 @@ func importLeaseState(run *model.Run, lease leaseState) error {
 	return nil
 }
 
+func (s *Service) recoveredResourceEvents(run *model.Run, result reconcileResult) []model.Event {
+	if result.lastSampleAt == nil || result.lastSampleAt.IsZero() {
+		return nil
+	}
+	if run.LastResourceSampleAt != nil && !result.lastSampleAt.After(*run.LastResourceSampleAt) {
+		return nil
+	}
+	from := run.CreatedAt
+	if run.LastResourceSampleAt != nil {
+		from = *run.LastResourceSampleAt
+	}
+	if !result.lastSampleAt.After(from) {
+		return nil
+	}
+	latest := normalizeResources(result.resources, s.backend.Capabilities(), s.config.SampleIntervalMs)
+	latest.SampleIntervalMs = s.config.SampleIntervalMs
+	if latest.CPUTimeNs.Status == "measured" && run.Resources.CPUTimeNs.Status == "measured" && latest.CPUTimeNs.Value > run.Resources.CPUTimeNs.Value {
+		run.LastCPUActivityAt = result.lastSampleAt
+	}
+	if latest.ProcessCount.Status == "measured" && run.Resources.ProcessCount.Status == "measured" && latest.ProcessCount.Value != run.Resources.ProcessCount.Value {
+		run.LastProcessChangeAt = result.lastSampleAt
+	}
+	run.Resources = latest
+	run.LastResourceSampleAt = result.lastSampleAt
+	run.ResourceGap = true
+	return []model.Event{
+		{Kind: "resource.gap", ObservedAt: time.Now().UTC(), Body: map[string]any{"from": from, "to": *result.lastSampleAt, "status": "unavailable", "reason": "supervisor-unavailable", "latestResources": latest}},
+		{Kind: "resource.sample", ObservedAt: *result.lastSampleAt, Body: map[string]any{"resources": latest}},
+	}
+}
+
 func (s *Service) reconcile() error {
 	runs, err := s.store.List()
 	if err != nil {
@@ -1192,8 +1277,15 @@ func (s *Service) reconcile() error {
 			}
 			run = refreshed
 			a.run = refreshed
+			var resourceEvents []model.Event
 			if e == nil {
 				e = importLeaseState(&run, result.lease)
+				if e == nil {
+					resourceEvents = s.recoveredResourceEvents(&run, result)
+					if result.lastOutputAt != nil && (run.LastOutputAt == nil || result.lastOutputAt.After(*run.LastOutputAt)) {
+						run.LastOutputAt = result.lastOutputAt
+					}
+				}
 				a.run = run
 			}
 			if e == nil && result.terminal {
@@ -1224,7 +1316,7 @@ func (s *Service) reconcile() error {
 					run.Receipt = &model.Receipt{Version: 1, RunID: run.ID, Outcome: outcome, ExitCode: result.exit.code, Signal: result.exit.signal, StartedAt: run.StartedAt, FinishedAt: now, Resources: run.Resources, Output: run.Output, Cleanup: "complete"}
 				}
 				s.populateReceipt(run, run.Receipt)
-				events := terminalEvents(now, result.exit.outcome, run.TerminationReason, priorReason)
+				events := append(resourceEvents, terminalEvents(now, result.exit.outcome, run.TerminationReason, priorReason)...)
 				events = append(events, model.Event{Kind: "run.terminal", ObservedAt: now, Body: map[string]any{"outcome": run.Receipt.Outcome}})
 				if _, err := s.store.UpdateWithEvents(run, events); err != nil {
 					return err
@@ -1247,13 +1339,17 @@ func (s *Service) reconcile() error {
 					a.run.State = model.Running
 				}
 				a.run.Generation++
-				if _, err := s.store.Update(a.run, &model.Event{Kind: "run.reconciled", ObservedAt: time.Now().UTC()}); err != nil {
+				events := append(resourceEvents, model.Event{Kind: "run.reconciled", ObservedAt: time.Now().UTC()})
+				if _, err := s.store.UpdateWithEvents(a.run, events); err != nil {
 					return err
 				}
 				s.mu.Lock()
 				s.active[run.ID] = a
 				s.mu.Unlock()
 				go s.monitor(a)
+				if a.terminating {
+					go s.driveTermination(a, a.process)
+				}
 				continue
 			}
 		}

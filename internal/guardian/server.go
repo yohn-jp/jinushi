@@ -816,7 +816,10 @@ func maxMetric(previous, reported, current model.Metric) model.Metric {
 
 func unavailableCurrent(previous model.Resources) model.Resources {
 	out := previous
-	out.MemoryBytes = model.Metric{Status: "unavailable"}
-	out.ProcessCount = model.Metric{Status: "unavailable"}
+	for _, metric := range []*model.Metric{&out.MemoryBytes, &out.CPUTimeNs, &out.ProcessCount} {
+		if metric.Status != "unsupported" {
+			*metric = model.Metric{Status: "unavailable"}
+		}
+	}
 	return out
 }

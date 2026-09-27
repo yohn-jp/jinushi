@@ -289,4 +289,20 @@ func TestResourceObservationTimestampAndIntervalPersist(t *testing.T) {
 	}
 }
 
+func TestUnavailableCurrentPreservesUnsupportedAndDoesNotReuseMeasuredCPU(t *testing.T) {
+	previous := model.Resources{
+		MemoryBytes:     model.Metric{Status: "unsupported"},
+		CPUTimeNs:       model.Metric{Status: "measured", Value: 42},
+		ProcessCount:    model.Metric{Status: "measured", Value: 2},
+		PeakMemoryBytes: model.Metric{Status: "measured", Value: 99},
+	}
+	got := unavailableCurrent(previous)
+	if got.MemoryBytes.Status != "unsupported" || got.CPUTimeNs.Status != "unavailable" || got.ProcessCount.Status != "unavailable" {
+		t.Fatalf("failed current observation status = %+v", got)
+	}
+	if got.PeakMemoryBytes != previous.PeakMemoryBytes {
+		t.Fatalf("historical peak changed: %+v", got.PeakMemoryBytes)
+	}
+}
+
 var _ backend.Process = (*deadlineProcess)(nil)

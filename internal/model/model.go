@@ -85,26 +85,26 @@ type Ownership struct {
 }
 
 type Receipt struct {
-	Version              int          `json:"version"`
-	RunID                string       `json:"runId"`
-	Outcome              string       `json:"outcome"`
-	AcceptedArgvSHA256   string       `json:"acceptedArgvSha256,omitempty"`
-	ExitCode             *int         `json:"exitCode,omitempty"`
-	Signal               string       `json:"signal,omitempty"`
-	StartedAt            *time.Time   `json:"startedAt,omitempty"`
-	FinishedAt           time.Time    `json:"finishedAt"`
-	Resources            Resources    `json:"resources"`
-	Capabilities         Capabilities `json:"capabilities"`
-	Output               Output       `json:"output"`
+	Version            int          `json:"version"`
+	RunID              string       `json:"runId"`
+	Outcome            string       `json:"outcome"`
+	AcceptedArgvSHA256 string       `json:"acceptedArgvSha256,omitempty"`
+	ExitCode           *int         `json:"exitCode,omitempty"`
+	Signal             string       `json:"signal,omitempty"`
+	StartedAt          *time.Time   `json:"startedAt,omitempty"`
+	FinishedAt         time.Time    `json:"finishedAt"`
+	Resources          Resources    `json:"resources"`
+	Capabilities       Capabilities `json:"capabilities"`
+	Output             Output       `json:"output"`
 	// EventFirstSeq and EventLastSeq cover the assigned journal range; EventRetainedFrom is its current retention watermark.
-	EventFirstSeq        uint64       `json:"eventFirstSeq"`
-	EventLastSeq         uint64       `json:"eventLastSeq"`
-	EventRetainedFrom    uint64       `json:"eventRetainedFrom"`
-	EventHistoryComplete bool         `json:"eventHistoryComplete"`
-	EvidenceIncomplete   bool         `json:"evidenceIncomplete"`
-	TerminationRequested bool         `json:"terminationRequested"`
-	Forced               bool         `json:"forced"`
-	Cleanup              string       `json:"cleanup"`
+	EventFirstSeq        uint64 `json:"eventFirstSeq"`
+	EventLastSeq         uint64 `json:"eventLastSeq"`
+	EventRetainedFrom    uint64 `json:"eventRetainedFrom"`
+	EventHistoryComplete bool   `json:"eventHistoryComplete"`
+	EvidenceIncomplete   bool   `json:"evidenceIncomplete"`
+	TerminationRequested bool   `json:"terminationRequested"`
+	Forced               bool   `json:"forced"`
+	Cleanup              string `json:"cleanup"`
 }
 
 type Run struct {
@@ -124,6 +124,8 @@ type Run struct {
 	LastLeaseExpectedGeneration uint64     `json:"lastLeaseExpectedGeneration,omitempty"`
 	LastLeaseMs                 int64      `json:"lastLeaseMs,omitempty"`
 	LastOutputAt                *time.Time `json:"lastOutputAt,omitempty"`
+	LastResourceSampleAt        *time.Time `json:"lastResourceSampleAt,omitempty"`
+	ResourceGap                 bool       `json:"resourceGap,omitempty"`
 	LastCPUActivityAt           *time.Time `json:"lastCpuActivityAt,omitempty"`
 	LastProcessChangeAt         *time.Time `json:"lastProcessChangeAt,omitempty"`
 	TerminationReason           string     `json:"terminationReason,omitempty"`

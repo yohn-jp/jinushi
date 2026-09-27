@@ -629,6 +629,10 @@ func attachLoop(ctx context.Context, stateDir, runID, attachID string, human boo
 			if human {
 				renderResponse(stderr, inspection, true)
 			}
+			if inspection.Run.State == model.Uncertain {
+				fmt.Fprintln(stderr, "attach: Run physical state is uncertain")
+				return 1
+			}
 			return 0
 		}
 		timer := time.NewTimer(100 * time.Millisecond)

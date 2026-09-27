@@ -36,6 +36,13 @@ type Backend struct{}
 
 func New() backend.Backend { return &Backend{} }
 
+func (*Backend) ValidateLimits(limits model.Limits) error {
+	if limits.CPUQuotaPercent > (int64(^uint64(0)>>1) / 1000) {
+		return errors.New("CPU quota exceeds Linux cgroup v2 range")
+	}
+	return nil
+}
+
 func (*Backend) Capabilities() model.Capabilities {
 	location, ok := probeCgroup()
 	capabilities := model.Capabilities{

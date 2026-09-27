@@ -217,6 +217,26 @@ func TestAttachLoopStreamsPTYBytesWithoutControlJSON(t *testing.T) {
 	}
 }
 
+func TestAttachLoopReturnsFailureForUncertainRun(t *testing.T) {
+	stateDir := t.TempDir()
+	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+		switch request.Op {
+		case "output":
+			return protocol.Response{Version: model.ProtocolVersion}
+		case "inspect":
+			return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Uncertain}}
+		default:
+			return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "unexpected-op", Message: request.Op}}
+		}
+	})
+	var stdout, stderr bytes.Buffer
+	initial := &model.Run{ID: "run_uncertain", Spec: model.RunSpec{Interactive: true}}
+	code := attachLoop(context.Background(), stateDir, initial.ID, "attach_test", false, strings.NewReader(""), &stdout, &stderr, initial, false)
+	if code != 1 || !strings.Contains(stderr.String(), "uncertain") {
+		t.Fatalf("attachLoop exit=%d stderr=%q", code, stderr.String())
+	}
+}
+
 func TestDetachUsesSupervisorAttachmentID(t *testing.T) {
 	stateDir := t.TempDir()
 	requestReceived := make(chan protocol.Request, 1)

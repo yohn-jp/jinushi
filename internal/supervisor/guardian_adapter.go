@@ -42,6 +42,13 @@ func (g *guardedExecutor) Capabilities() model.Capabilities {
 	return c
 }
 
+func (g *guardedExecutor) ValidateLimits(limits model.Limits) error {
+	if validator, ok := g.native.(interface{ ValidateLimits(model.Limits) error }); ok {
+		return validator.ValidateLimits(limits)
+	}
+	return nil
+}
+
 func (g *guardedExecutor) runDir(id string) string { return filepath.Join(g.root, "runs", id) }
 
 func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stderr io.Writer) (physical, error) {
@@ -94,9 +101,27 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 	if err := validateOutputCursor(run.Output, snap.Output, run.Spec.Interactive); err != nil {
 		return reconcileResult{}, err
 	}
+	if snap.State == model.Uncertain && snap.Live && snap.Termination.Requested && snap.TerminationReason != "" && snap.Ownership != nil {
+		osEvidence, osErr := g.native.Reconcile(*snap.Ownership)
+		if osErr != nil || !osEvidence.OwnershipProven {
+			return reconcileResult{}, errors.New("OS ownership is not proven for termination retry")
+		}
+		grace := time.Duration(g.config.TerminationGraceMs) * time.Millisecond
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), grace+15*time.Second)
+		defer retryCancel()
+		termination, retryErr := h.Terminate(retryCtx, grace, snap.TerminationReason)
+		if retryErr != nil || !termination.TreeEmpty {
+			return reconcileResult{}, errors.New("guardian termination retry did not prove cleanup")
+		}
+		evidence, waitErr := h.Wait(retryCtx)
+		if waitErr != nil {
+			return reconcileResult{}, errors.New("guardian termination retry lacks terminal receipt")
+		}
+		snap = evidence.Snapshot
+	}
 	if snap.State == model.Terminal && snap.Receipt != nil && snap.Receipt.Cleanup == "complete" {
 		p := newReconciledGuardianPhysical(h, run, stdout, stderr)
-		if err := p.syncOutput(); err != nil {
+		if err := p.syncOutput(0); err != nil {
 			return reconcileResult{}, err
 		}
 		receipt := *snap.Receipt
@@ -104,7 +129,7 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 		if snap.LimitOutcome != "" {
 			outcome = snap.LimitOutcome
 		}
-		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap)}, nil
+		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
 	}
 	if snap.State != model.Running && snap.State != model.Terminating {
 		return reconcileResult{}, errors.New("guardian has no provable live Run state")
@@ -117,15 +142,26 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 		return reconcileResult{}, errors.New("guardian is not live")
 	}
 	osEvidence, err := g.native.Reconcile(*snap.Ownership)
+	if err == nil && osEvidence.OwnershipProven && osEvidence.State == model.Terminal {
+		// The tree can become empty between the guardian snapshot and native
+		// observation. Give the live guardian a bounded chance to commit its
+		// physical receipt before classifying the Run uncertain.
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer waitCancel()
+		if _, waitErr := h.Wait(waitCtx); waitErr != nil {
+			return reconcileResult{}, errors.New("owned tree is empty but guardian receipt is unavailable")
+		}
+		return g.Reconcile(run, stdout, stderr)
+	}
 	if err != nil || !osEvidence.OwnershipProven || (osEvidence.State != model.Running && osEvidence.State != model.Terminating) {
 		return reconcileResult{}, errors.New("OS ownership not proven")
 	}
 	p := newReconciledGuardianPhysical(h, run, stdout, stderr)
 	p.ownership = *snap.Ownership
-	if err := p.syncOutput(); err != nil {
+	if err := p.syncOutput(16); err != nil {
 		return reconcileResult{}, err
 	}
-	return reconcileResult{live: true, process: p, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap)}, nil
+	return reconcileResult{live: true, process: p, ownership: snap.Ownership, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
 }
 
 func newReconciledGuardianPhysical(h *guardian.Handle, run model.Run, stdout, stderr io.Writer) *guardianPhysical {
@@ -176,7 +212,10 @@ func newGuardianPhysical(h *guardian.Handle, interactive bool, stdout, stderr io
 
 func (p *guardianPhysical) Ownership() model.Ownership { return p.ownership }
 
-func (p *guardianPhysical) syncOutput() error {
+// syncOutput reads one chunk per stream in each pass. Live observation uses a
+// finite budget so a continuous producer cannot starve another stream or
+// prevent the caller from observing the Run. Terminal reads drain the spool.
+func (p *guardianPhysical) syncOutput(maxChunks int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	streams := []struct {
@@ -189,30 +228,52 @@ func (p *guardianPhysical) syncOutput() error {
 			writer io.Writer
 		}{{"pty", p.stdout}}
 	}
-	for _, stream := range streams {
-		if stream.writer == nil {
-			continue
-		}
-		for {
+	chunks := 0
+	for {
+		progress := false
+		for _, stream := range streams {
+			if stream.writer == nil {
+				continue
+			}
+			if maxChunks > 0 && chunks >= maxChunks {
+				return nil
+			}
 			offset := p.offsets[stream.name]
 			chunk, err := p.h.ReadOutput(stream.name, offset, 64<<10)
 			if err != nil {
 				return err
 			}
+			var observedAt time.Time
+			if chunk.LastWriteAt != nil {
+				observedAt = *chunk.LastWriteAt
+			}
 			if chunk.Gap {
 				if chunk.RetainedFrom <= offset {
 					return fmt.Errorf("guardian output gap has no forward watermark")
 				}
-				if recorder, ok := stream.writer.(outputGapRecorder); ok {
+				if recorder, ok := stream.writer.(interface{ RecordGapObserved(int64, time.Time) error }); ok {
+					if err := recorder.RecordGapObserved(chunk.RetainedFrom, observedAt); err != nil {
+						return err
+					}
+				} else if recorder, ok := stream.writer.(outputGapRecorder); ok {
 					if err := recorder.RecordGap(chunk.RetainedFrom); err != nil {
 						return err
 					}
 				}
 				p.offsets[stream.name] = chunk.RetainedFrom
+				progress = true
+				chunks++
 				continue
 			}
 			if len(chunk.Data) > 0 {
-				n, err := stream.writer.Write(chunk.Data)
+				var n int
+				if writer, ok := stream.writer.(interface {
+					WriteObserved([]byte, time.Time) (int, error)
+				}); ok {
+					n, err = writer.WriteObserved(chunk.Data, observedAt)
+				} else {
+					n, err = stream.writer.Write(chunk.Data)
+				}
 				if err != nil {
 					return err
 				}
@@ -220,8 +281,12 @@ func (p *guardianPhysical) syncOutput() error {
 					return io.ErrShortWrite
 				}
 				p.offsets[stream.name] = offset + int64(n)
+				progress = true
+				chunks++
 				continue
 			}
+		}
+		if !progress {
 			break
 		}
 	}
@@ -233,7 +298,7 @@ func (p *guardianPhysical) Wait() (exitResult, error) {
 	if err != nil {
 		return exitResult{}, err
 	}
-	if err := p.syncOutput(); err != nil {
+	if err := p.syncOutput(0); err != nil {
 		return exitResult{}, err
 	}
 	p.mu.Lock()
@@ -253,7 +318,7 @@ func (p *guardianPhysical) Observe() (model.Resources, error) {
 	if err != nil {
 		return model.Resources{}, err
 	}
-	if err := p.syncOutput(); err != nil {
+	if err := p.syncOutput(16); err != nil {
 		return model.Resources{}, err
 	}
 	return snap.Resources, nil
