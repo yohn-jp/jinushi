@@ -32,6 +32,7 @@ type exitResult struct {
 	terminationRequested bool
 	forced               bool
 	receipt              *model.Receipt
+	telemetry            *model.TelemetrySample
 }
 
 type terminationResult struct {
@@ -53,6 +54,7 @@ type reconcileResult struct {
 	lease             leaseState
 	resources         model.Resources
 	lastSampleAt      *time.Time
+	telemetry         *model.TelemetrySample
 	lastOutputAt      *time.Time
 }
 
@@ -364,6 +366,8 @@ func (s *Service) Handle(ctx context.Context, req protocol.Request) protocol.Res
 		return s.await(ctx, req.RunID)
 	case "events":
 		return s.events(req)
+	case "telemetry":
+		return s.queryTelemetry(req)
 	case "watch":
 		return s.watch(req)
 	case "output":
@@ -555,7 +559,7 @@ func (s *Service) start(a *active) {
 			a.mu.Lock()
 			a.run.EffectiveCapabilities = cleanTerminal.effective
 			a.mu.Unlock()
-			s.finish(a, receipt.Outcome, exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: receipt.Outcome, finishedAt: receipt.FinishedAt, terminationRequested: receipt.TerminationRequested, forced: receipt.Forced, receipt: &receipt}, receipt.Forced, receipt.Cleanup)
+			s.finish(a, receipt.Outcome, exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: receipt.Outcome, finishedAt: receipt.FinishedAt, terminationRequested: receipt.TerminationRequested, forced: receipt.Forced, receipt: &receipt, telemetry: cleanTerminal.telemetry}, receipt.Forced, receipt.Cleanup)
 			return
 		}
 		if p != nil {
@@ -666,8 +670,17 @@ func (s *Service) sample(a *active) {
 		return
 	}
 	p := a.process
+	runID := a.run.ID
 	a.mu.Unlock()
-	r, err := p.Observe()
+	var sample model.TelemetrySample
+	var err error
+	if source, ok := p.(telemetryObserver); ok {
+		sample, err = source.ObserveTelemetry()
+	} else {
+		var resources model.Resources
+		resources, err = p.Observe()
+		sample = telemetrySampleFromResources(runID, resources, s.backend.Capabilities(), time.Now().UTC())
+	}
 	if err != nil {
 		a.mu.Lock()
 		if a.run.State != model.Terminal && a.run.State != model.Uncertain {
@@ -684,48 +697,40 @@ func (s *Service) sample(a *active) {
 			if a.run.Resources.TaskCount.Status != "unsupported" {
 				a.run.Resources.TaskCount = model.Metric{Status: "unavailable"}
 			}
-			a.run.LastResourceSampleAt = &now
-			resources := a.run.Resources
-			_ = s.persistRunEvent(a.run, &model.Event{Kind: model.EventResourceUnavailable, ObservedAt: now, Payload: &model.EventPayload{Resource: &model.ResourceEventPayload{Resources: resources}}})
+			_ = s.recordTelemetryGap(&a.run, now, "sample-observation-unavailable", true)
+			_, _ = s.store.Update(a.run, nil)
 		}
 		a.mu.Unlock()
 		return
+	}
+	if sample.ObservedAt.IsZero() {
+		sample.ObservedAt = time.Now().UTC()
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
 		return
 	}
-	r = normalizeResources(r, s.backend.Capabilities(), s.config.SampleIntervalMs)
-	r.SampleIntervalMs = s.config.SampleIntervalMs
-	now := time.Now().UTC()
-	if r.CPUTimeNs.Status == "measured" && a.run.Resources.CPUTimeNs.Status == "measured" && r.CPUTimeNs.Value > a.run.Resources.CPUTimeNs.Value {
-		a.run.LastCPUActivityAt = &now
+	if a.run.LastResourceSampleAt != nil && !sample.ObservedAt.After(*a.run.LastResourceSampleAt) {
+		return
 	}
-	if r.ProcessCount.Status == "measured" && a.run.Resources.ProcessCount.Status == "measured" && r.ProcessCount.Value != a.run.Resources.ProcessCount.Value {
-		a.run.LastProcessChangeAt = &now
+	var previousSampleAt *time.Time
+	if a.run.LastResourceSampleAt != nil {
+		at := *a.run.LastResourceSampleAt
+		previousSampleAt = &at
 	}
-	if r.PeakMemoryBytes.Status != "measured" && r.MemoryBytes.Status == "measured" {
-		r.PeakMemoryBytes = r.MemoryBytes
+	appended, appendErr := s.appendTelemetrySample(&a.run, sample)
+	applyTelemetrySummary(&a.run, sample, s.backend.Capabilities(), s.config.SampleIntervalMs)
+	if appendErr != nil {
+		a.run.ResourceGap = true
+		a.run.LastResourceSampleAt = previousSampleAt
+	} else if !appended {
+		return
 	}
-	if a.run.Resources.PeakMemoryBytes.Status == "measured" && r.PeakMemoryBytes.Value < a.run.Resources.PeakMemoryBytes.Value {
-		r.PeakMemoryBytes = a.run.Resources.PeakMemoryBytes
+	if _, err := s.store.Update(a.run, nil); err != nil {
+		a.run.ResourceGap = true
+		_, _ = s.store.Update(a.run, nil)
 	}
-	if r.PeakProcessCount.Status != "measured" && r.ProcessCount.Status == "measured" {
-		r.PeakProcessCount = r.ProcessCount
-	}
-	if a.run.Resources.PeakProcessCount.Status == "measured" && r.PeakProcessCount.Value < a.run.Resources.PeakProcessCount.Value {
-		r.PeakProcessCount = a.run.Resources.PeakProcessCount
-	}
-	if r.PeakTaskCount.Status != "measured" && r.TaskCount.Status == "measured" {
-		r.PeakTaskCount = r.TaskCount
-	}
-	if a.run.Resources.PeakTaskCount.Status == "measured" && r.PeakTaskCount.Value < a.run.Resources.PeakTaskCount.Value {
-		r.PeakTaskCount = a.run.Resources.PeakTaskCount
-	}
-	a.run.Resources = r
-	a.run.LastResourceSampleAt = &now
-	_ = s.persistRunEvent(a.run, &model.Event{Kind: model.EventResourceSample, ObservedAt: now, Payload: &model.EventPayload{Resource: &model.ResourceEventPayload{Resources: r}}})
 }
 
 func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool, cleanup string) {
@@ -765,6 +770,27 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 		a.run.StartedAt = copy.StartedAt
 	} else {
 		a.run.Receipt = &model.Receipt{Version: model.ProtocolVersion, RunID: a.run.ID, Outcome: outcome, ExitCode: exit.code, Signal: exit.signal, StartedAt: a.run.StartedAt, FinishedAt: now, Resources: a.run.Resources, Output: a.run.Output, TerminationRequested: a.run.TerminationReason != "" || exit.terminationRequested, Forced: forced, Cleanup: cleanup}
+	}
+	finalTelemetry := exit.telemetry
+	if finalTelemetry == nil && a.process != nil {
+		if source, ok := a.process.(finalTelemetrySource); ok {
+			finalTelemetry = source.FinalTelemetry()
+		}
+	}
+	if finalTelemetry != nil {
+		previousSampleAt := a.run.LastResourceSampleAt
+		appended, appendErr := s.appendTelemetrySample(&a.run, *finalTelemetry)
+		if appendErr != nil {
+			a.run.LastResourceSampleAt = previousSampleAt
+			a.run.ResourceGap = true
+			applyTelemetrySummary(&a.run, *finalTelemetry, s.backend.Capabilities(), s.config.SampleIntervalMs)
+			a.run.LastResourceSampleAt = previousSampleAt
+		} else if appended {
+			applyTelemetrySummary(&a.run, *finalTelemetry, s.backend.Capabilities(), s.config.SampleIntervalMs)
+		}
+		if a.run.Receipt != nil {
+			a.run.Receipt.Resources = a.run.Resources
+		}
 	}
 	s.populateReceipt(a.run, a.run.Receipt)
 	events := terminalEvents(now, exit.outcome, a.run.TerminationReason, priorReason)
@@ -1416,34 +1442,39 @@ func importLeaseState(run *model.Run, lease leaseState) error {
 }
 
 func (s *Service) recoveredResourceEvents(run *model.Run, result reconcileResult) []model.Event {
-	if result.lastSampleAt == nil || result.lastSampleAt.IsZero() {
+	sample := result.telemetry
+	if sample == nil && result.lastSampleAt != nil && !result.lastSampleAt.IsZero() {
+		fallback := telemetrySampleFromResources(run.ID, result.resources, s.backend.Capabilities(), *result.lastSampleAt)
+		sample = &fallback
+	}
+	if sample == nil || sample.ObservedAt.IsZero() || run.LastResourceSampleAt != nil && !sample.ObservedAt.After(*run.LastResourceSampleAt) {
 		return nil
 	}
-	if run.LastResourceSampleAt != nil && !result.lastSampleAt.After(*run.LastResourceSampleAt) {
-		return nil
+	from, gapNeeded := telemetryGapNeeded(run.LastResourceSampleAt, run.CreatedAt, sample.ObservedAt, s.config.SampleIntervalMs)
+	var events []model.Event
+	if gapNeeded {
+		_ = s.recordTelemetryGap(run, sample.ObservedAt, "supervisor-unavailable", false)
+		latest := normalizeResources(sample.Resources, s.backend.Capabilities(), s.config.SampleIntervalMs)
+		latest.SampleIntervalMs = s.config.SampleIntervalMs
+		to := sample.ObservedAt
+		events = append(events, model.Event{
+			Kind: model.EventResourceGap, ObservedAt: time.Now().UTC(),
+			Payload: &model.EventPayload{ResourceGap: &model.ResourceGapEventPayload{
+				From: &from, To: &to, Status: "unavailable", Reason: "supervisor-unavailable", LatestResources: &latest,
+			}},
+		})
 	}
-	from := run.CreatedAt
-	if run.LastResourceSampleAt != nil {
-		from = *run.LastResourceSampleAt
+	previousSampleAt := run.LastResourceSampleAt
+	appended, appendErr := s.appendTelemetrySample(run, *sample)
+	if appendErr != nil {
+		run.ResourceGap = true
+		run.LastResourceSampleAt = previousSampleAt
+		applyTelemetrySummary(run, *sample, s.backend.Capabilities(), s.config.SampleIntervalMs)
+		run.LastResourceSampleAt = previousSampleAt
+	} else if appended {
+		applyTelemetrySummary(run, *sample, s.backend.Capabilities(), s.config.SampleIntervalMs)
 	}
-	if !result.lastSampleAt.After(from) {
-		return nil
-	}
-	latest := normalizeResources(result.resources, s.backend.Capabilities(), s.config.SampleIntervalMs)
-	latest.SampleIntervalMs = s.config.SampleIntervalMs
-	if latest.CPUTimeNs.Status == "measured" && run.Resources.CPUTimeNs.Status == "measured" && latest.CPUTimeNs.Value > run.Resources.CPUTimeNs.Value {
-		run.LastCPUActivityAt = result.lastSampleAt
-	}
-	if latest.ProcessCount.Status == "measured" && run.Resources.ProcessCount.Status == "measured" && latest.ProcessCount.Value != run.Resources.ProcessCount.Value {
-		run.LastProcessChangeAt = result.lastSampleAt
-	}
-	run.Resources = latest
-	run.LastResourceSampleAt = result.lastSampleAt
-	run.ResourceGap = true
-	return []model.Event{
-		{Kind: model.EventResourceGap, ObservedAt: time.Now().UTC(), Payload: &model.EventPayload{ResourceGap: &model.ResourceGapEventPayload{From: &from, To: result.lastSampleAt, Status: "unavailable", Reason: "supervisor-unavailable", LatestResources: &latest}}},
-		{Kind: model.EventResourceSample, ObservedAt: *result.lastSampleAt, Payload: &model.EventPayload{Resource: &model.ResourceEventPayload{Resources: latest}}},
-	}
+	return events
 }
 
 func (s *Service) reconcile() error {

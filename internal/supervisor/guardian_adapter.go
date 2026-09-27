@@ -25,6 +25,7 @@ type guardedExecutor struct {
 type cleanStartTerminal struct {
 	receipt   model.Receipt
 	effective *model.Capabilities
+	telemetry *model.TelemetrySample
 }
 
 func (e *cleanStartTerminal) Error() string {
@@ -96,7 +97,7 @@ func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stder
 		if err := p.syncOutput(0); err != nil {
 			return p, fmt.Errorf("import fast-terminal output: %w", err)
 		}
-		return nil, &cleanStartTerminal{receipt: *snap.Receipt, effective: snap.EffectiveCapabilities}
+		return nil, &cleanStartTerminal{receipt: *snap.Receipt, effective: snap.EffectiveCapabilities, telemetry: cloneSnapshotTelemetry(snap)}
 	}
 	if err != nil {
 		return p, err
@@ -152,7 +153,7 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 		if snap.LimitOutcome != "" {
 			outcome = snap.LimitOutcome
 		}
-		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
+		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, telemetry: cloneSnapshotTelemetry(snap), lastOutputAt: snap.LastOutputAt}, nil
 	}
 	if snap.State != model.Running && snap.State != model.Terminating {
 		return reconcileResult{}, errors.New("guardian has no provable live Run state")
@@ -185,7 +186,7 @@ func (g *guardedExecutor) Reconcile(run model.Run, stdout, stderr io.Writer) (re
 	if err := p.syncOutput(16); err != nil {
 		return reconcileResult{}, err
 	}
-	return reconcileResult{live: true, process: p, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, lastOutputAt: snap.LastOutputAt}, nil
+	return reconcileResult{live: true, process: p, ownership: snap.Ownership, effective: snap.EffectiveCapabilities, state: snap.State, terminationReason: snap.TerminationReason, lease: leaseFromSnapshot(snap), resources: snap.Resources, lastSampleAt: snap.LastResourceSampleAt, telemetry: cloneSnapshotTelemetry(snap), lastOutputAt: snap.LastOutputAt}, nil
 }
 
 func newReconciledGuardianPhysical(h *guardian.Handle, run model.Run, stdout, stderr io.Writer) *guardianPhysical {
@@ -386,6 +387,14 @@ func cloneTelemetryForSupervisor(sample model.TelemetrySample) model.TelemetrySa
 		sample.Activity.LastResizeAt = &at
 	}
 	return sample
+}
+
+func cloneSnapshotTelemetry(snapshot guardian.Snapshot) *model.TelemetrySample {
+	if snapshot.TelemetrySample == nil {
+		return nil
+	}
+	sample := cloneTelemetryForSupervisor(*snapshot.TelemetrySample)
+	return &sample
 }
 
 func (p *guardianPhysical) RenewLease(expectedGeneration uint64, leaseMs int64) (leaseState, error) {
