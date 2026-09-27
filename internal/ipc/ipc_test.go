@@ -8,6 +8,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -113,6 +115,126 @@ func TestClientDisconnectCancelsRequestContextOnly(t *testing.T) {
 		t.Fatal("client disconnect did not cancel the request context")
 	}
 	// No Run control API is invoked by this transport-level cancellation.
+}
+
+func TestFollowEventsDrainsTerminalRaceAndAdvancesCursor(t *testing.T) {
+	stateDir := t.TempDir()
+	listener, err := Listen(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := make(chan protocol.Request, 4)
+	var calls atomic.Int32
+	go func() {
+		_ = Serve(ctx, listener, func(_ context.Context, request protocol.Request) protocol.Response {
+			requests <- request
+			call := calls.Add(1)
+			terminal := &model.Run{ID: "run_test", State: model.Terminal}
+			switch call {
+			case 1:
+				// Run became terminal after Events read; the terminal event is late.
+				return protocol.Response{Version: model.ProtocolVersion, Run: terminal}
+			case 2:
+				return protocol.Response{Version: model.ProtocolVersion, Run: terminal, Events: []model.Event{{Version: 1, RunID: "run_test", Seq: 1, Kind: "run.terminal"}}}
+			default:
+				return protocol.Response{Version: model.ProtocolVersion, Run: terminal}
+			}
+		})
+	}()
+
+	var responses []protocol.Response
+	err = FollowEvents(context.Background(), stateDir, protocol.Request{Op: "events", RunID: "run_test", Follow: true}, func(response protocol.Response) error {
+		responses = append(responses, response)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 3 || len(responses) != 3 {
+		t.Fatalf("follow made %d handler calls and received %d frames; want 3", calls.Load(), len(responses))
+	}
+	wantAfter := []uint64{0, 0, 1}
+	for i, want := range wantAfter {
+		request := <-requests
+		if request.Follow || request.After != want || request.Limit != 1 {
+			t.Fatalf("handler request %d = %#v; want Follow=false After=%d Limit=1", i, request, want)
+		}
+	}
+	if len(responses[1].Events) != 1 || responses[1].Events[0].Kind != "run.terminal" {
+		t.Fatalf("late terminal event was not delivered: %#v", responses)
+	}
+}
+
+func TestFollowDisconnectCancelsOnlySubscription(t *testing.T) {
+	stateDir := t.TempDir()
+	listener, err := Listen(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	defer stopServe()
+	blocked := make(chan struct{})
+	var calls atomic.Int32
+	go func() {
+		_ = Serve(serveCtx, listener, func(ctx context.Context, request protocol.Request) protocol.Response {
+			if calls.Add(1) == 1 {
+				go func() {
+					<-ctx.Done()
+					close(blocked)
+				}()
+				return protocol.Response{Version: model.ProtocolVersion, Events: []model.Event{{Version: 1, RunID: request.RunID, Seq: 1, Kind: "run.started"}}}
+			}
+			return protocol.Response{Version: model.ProtocolVersion}
+		})
+	}()
+
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	err = FollowEvents(clientCtx, stateDir, protocol.Request{Op: "events", RunID: "run_test", Follow: true}, func(protocol.Response) error {
+		cancelClient()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("FollowEvents error = %v; want context.Canceled", err)
+	}
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client disconnect did not cancel the subscription handler")
+	}
+	if calls.Load() < 2 {
+		t.Fatal("follow handler did not poll after its first event")
+	}
+}
+
+func TestFollowFrameLimitReturnsTypedError(t *testing.T) {
+	stateDir := t.TempDir()
+	listener, err := Listen(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = Serve(ctx, listener, func(_ context.Context, request protocol.Request) protocol.Response {
+			return protocol.Response{Version: model.ProtocolVersion, Events: []model.Event{{
+				Version: 1, RunID: request.RunID, Seq: 1, Kind: "telemetry.sample",
+				Body: map[string]any{"payload": strings.Repeat("x", protocol.MaxFrame*2)},
+			}}}
+		})
+	}()
+	var response protocol.Response
+	err = FollowEvents(context.Background(), stateDir, protocol.Request{Op: "events", RunID: "run_test", Follow: true}, func(frame protocol.Response) error {
+		response = frame
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Error == nil || response.Error.Code != "invalid-response" {
+		t.Fatalf("oversized response did not produce a typed error: %#v", response)
+	}
 }
 
 func TestListenRejectsNonSocketPath(t *testing.T) {

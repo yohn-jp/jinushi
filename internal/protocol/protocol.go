@@ -9,6 +9,7 @@ type Request struct {
 	Op              string         `json:"op"`
 	RunID           string         `json:"runId,omitempty"`
 	AttachID        string         `json:"attachId,omitempty"`
+	Follow          bool           `json:"follow,omitempty"`
 	Spec            *model.RunSpec `json:"spec,omitempty"`
 	After           uint64         `json:"after,omitempty"`
 	Offset          int64          `json:"offset,omitempty"`

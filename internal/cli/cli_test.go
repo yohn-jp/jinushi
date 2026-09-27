@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -162,6 +163,79 @@ func TestDetachUsesSupervisorAttachmentID(t *testing.T) {
 	request := <-requestReceived
 	if request.Op != "detach" || request.RunID != "run_test" || request.AttachID != "attach_test" {
 		t.Fatalf("unexpected detach request: %#v", request)
+	}
+}
+
+func TestEventsFollowEmitsNDJSONGapsAndDrainsLateTerminalEvent(t *testing.T) {
+	stateDir := t.TempDir()
+	var calls int
+	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+		calls++
+		if request.Op != "events" || request.Follow || request.Limit != 1 {
+			return protocol.Response{Version: model.ProtocolVersion, Error: &protocol.Failure{Code: "bad-follow-request", Message: "follow must be a one-event page"}}
+		}
+		running := &model.Run{ID: request.RunID, State: model.Running}
+		terminal := &model.Run{ID: request.RunID, State: model.Terminal}
+		switch calls {
+		case 1:
+			return protocol.Response{Version: model.ProtocolVersion, Run: running, Gap: true, RetainedFrom: 3, Events: []model.Event{{Version: 1, RunID: request.RunID, Seq: 3, Kind: "run.started"}}}
+		case 2:
+			return protocol.Response{Version: model.ProtocolVersion, Run: running, Events: []model.Event{{Version: 1, RunID: request.RunID, Seq: 5, Kind: "resource.sample"}}}
+		case 3:
+			return protocol.Response{Version: model.ProtocolVersion, Run: terminal}
+		case 4:
+			return protocol.Response{Version: model.ProtocolVersion, Run: terminal, Events: []model.Event{{Version: 1, RunID: request.RunID, Seq: 6, Kind: "run.terminal"}}}
+		default:
+			return protocol.Response{Version: model.ProtocolVersion, Run: terminal}
+		}
+	})
+	var stdout, stderr bytes.Buffer
+	code := Main(context.Background(), []string{"events", "--state-dir", stateDir, "--follow", "run_test"}, &stdout, &stderr, nil)
+	if code != 0 {
+		t.Fatalf("events --follow exit = %d; stderr=%s; output=%s", code, stderr.String(), stdout.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("got %d NDJSON lines, want 6: %s", len(lines), stdout.String())
+	}
+	var records []map[string]any
+	for _, line := range lines {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("invalid NDJSON record %q: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	if records[0]["type"] != "gap" || records[0]["reason"] != "journal" || records[0]["retainedFrom"] != float64(3) {
+		t.Fatalf("missing retained-history watermark: %#v", records[0])
+	}
+	if records[1]["type"] != "event" || records[2]["type"] != "gap" || records[2]["reason"] != "sequence-hole" {
+		t.Fatalf("unexpected records around sequence hole: %#v", records[:4])
+	}
+	terminalEvent := records[4]["event"].(map[string]any)
+	if records[4]["type"] != "event" || terminalEvent["kind"] != "run.terminal" {
+		t.Fatalf("late terminal event was not emitted before completion: %#v", records[4])
+	}
+	if records[5]["type"] != "terminal" || calls != 5 {
+		t.Fatalf("terminal marker/call count = %v/%d, want terminal/5", records[5]["type"], calls)
+	}
+}
+
+func TestCloseInputUsesRunIdentity(t *testing.T) {
+	stateDir := t.TempDir()
+	requestReceived := make(chan protocol.Request, 1)
+	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+		requestReceived <- request
+		return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Running}}
+	})
+	var stdout, stderr bytes.Buffer
+	code := Main(context.Background(), []string{"close-input", "--state-dir", stateDir, "run_test"}, &stdout, &stderr, nil)
+	if code != 0 {
+		t.Fatalf("close-input exit = %d; stderr=%s", code, stderr.String())
+	}
+	request := <-requestReceived
+	if request.Op != "close-input" || request.RunID != "run_test" {
+		t.Fatalf("unexpected close-input request: %#v", request)
 	}
 }
 

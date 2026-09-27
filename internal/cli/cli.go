@@ -65,6 +65,8 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, runSuper
 		return idCommand(ctx, "await", args[1:], stdout, stderr)
 	case "events":
 		return eventsCommand(ctx, args[1:], stdout, stderr)
+	case "close-input":
+		return closeInputCommand(ctx, args[1:], stdout, stderr)
 	case "output":
 		return outputCommand(ctx, args[1:], stdout, stderr)
 	case "attach":
@@ -236,13 +238,166 @@ func awaitAccepted(ctx context.Context, stateDir, runID string, human bool, stdo
 func eventsCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs, stateDir, human := commonFlags("events", args, stderr)
 	after := fs.Uint64("after", 0, "return events with sequence greater than this value")
+	follow := fs.Bool("follow", false, "subscribe until the Run reaches terminal")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if len(fs.Args()) != 1 {
 		return usageError(stderr, "events requires one Run ID")
 	}
+	if *follow {
+		if *human {
+			return usageError(stderr, "--human cannot be combined with --follow; follow always emits NDJSON")
+		}
+		return followEventsCommand(ctx, *stateDir, fs.Arg(0), *after, stdout, stderr)
+	}
 	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "events", RunID: fs.Arg(0), After: *after}, *human, stdout, stderr, false)
+	return code
+}
+
+type eventRecord struct {
+	Type  string      `json:"type"`
+	Event model.Event `json:"event"`
+}
+
+type gapRecord struct {
+	Type         string `json:"type"`
+	RunID        string `json:"runId"`
+	After        uint64 `json:"after"`
+	RetainedFrom uint64 `json:"retainedFrom"`
+	Reason       string `json:"reason,omitempty"`
+}
+
+type terminalRecord struct {
+	Type  string      `json:"type"`
+	RunID string      `json:"runId"`
+	State model.State `json:"state"`
+}
+
+type errorRecord struct {
+	Type  string           `json:"type"`
+	Error protocol.Failure `json:"error"`
+}
+
+var errStopFollow = errors.New("stop event follow after remote error")
+
+func followEventsCommand(ctx context.Context, stateDir, runID string, after uint64, stdout, stderr io.Writer) int {
+	var terminalState model.State
+	var retentionGapSeen bool
+	var retentionGapWatermark uint64
+	var remoteFailure bool
+	var writeErr error
+	followErr := ipc.FollowEvents(ctx, stateDir, protocol.Request{Op: "events", RunID: runID, After: after, Follow: true}, func(response protocol.Response) error {
+		if response.Error != nil {
+			remoteFailure = true
+			if err := writeNDJSON(stdout, errorRecord{Type: "error", Error: *response.Error}); err != nil {
+				writeErr = err
+				return err
+			}
+			return errStopFollow
+		}
+		if response.Gap && (!retentionGapSeen || response.RetainedFrom != retentionGapWatermark) {
+			if err := writeNDJSON(stdout, gapRecord{Type: "gap", RunID: runID, After: after, RetainedFrom: response.RetainedFrom, Reason: "journal"}); err != nil {
+				writeErr = err
+				return err
+			}
+			retentionGapSeen = true
+			retentionGapWatermark = response.RetainedFrom
+		}
+		for _, event := range response.Events {
+			if event.RunID != runID {
+				remoteFailure = true
+				failure := protocol.Failure{Code: "invalid-event-stream", Message: "event Run ID did not match the subscription"}
+				if err := writeNDJSON(stdout, errorRecord{Type: "error", Error: failure}); err != nil {
+					writeErr = err
+					return err
+				}
+				return errStopFollow
+			}
+			if event.Seq <= after {
+				remoteFailure = true
+				failure := protocol.Failure{Code: "invalid-event-stream", Message: "event sequence did not advance"}
+				if err := writeNDJSON(stdout, errorRecord{Type: "error", Error: failure}); err != nil {
+					writeErr = err
+					return err
+				}
+				return errStopFollow
+			}
+			expected := after
+			if response.Gap && response.RetainedFrom > expected+1 {
+				expected = response.RetainedFrom - 1
+			}
+			if expected != ^uint64(0) && event.Seq > expected+1 {
+				if err := writeNDJSON(stdout, gapRecord{Type: "gap", RunID: runID, After: after, RetainedFrom: event.Seq, Reason: "sequence-hole"}); err != nil {
+					writeErr = err
+					return err
+				}
+			}
+			if err := writeNDJSON(stdout, eventRecord{Type: "event", Event: event}); err != nil {
+				writeErr = err
+				return err
+			}
+			after = event.Seq
+		}
+		if response.Run != nil && response.Run.State == model.Terminal {
+			if response.Run.ID != runID {
+				remoteFailure = true
+				failure := protocol.Failure{Code: "invalid-event-stream", Message: "Run snapshot ID did not match the subscription"}
+				if err := writeNDJSON(stdout, errorRecord{Type: "error", Error: failure}); err != nil {
+					writeErr = err
+					return err
+				}
+				return errStopFollow
+			}
+			terminalState = response.Run.State
+		}
+		return nil
+	})
+	if writeErr != nil {
+		fmt.Fprintf(stderr, "write event stream: %v\n", writeErr)
+		return 1
+	}
+	if remoteFailure {
+		return 1
+	}
+	if ctx.Err() != nil {
+		return 0
+	}
+	if followErr != nil {
+		return writeFollowError(stdout, stderr, protocol.Failure{Code: "event-follow-failed", Message: followErr.Error()})
+	}
+	if terminalState == "" {
+		return writeFollowError(stdout, stderr, protocol.Failure{Code: "subscription-closed", Message: "event subscription ended before terminal state was observed"})
+	}
+	if err := writeNDJSON(stdout, terminalRecord{Type: "terminal", RunID: runID, State: terminalState}); err != nil {
+		fmt.Fprintf(stderr, "write event stream: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func writeFollowError(stdout, stderr io.Writer, failure protocol.Failure) int {
+	if err := writeNDJSON(stdout, errorRecord{Type: "error", Error: failure}); err != nil {
+		fmt.Fprintf(stderr, "write event stream: %v\n", err)
+	}
+	return 1
+}
+
+func writeNDJSON(w io.Writer, value any) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(value)
+}
+
+func closeInputCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs, stateDir, human := commonFlags("close-input", args, stderr)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if len(fs.Args()) != 1 {
+		return usageError(stderr, "close-input requires one Run ID")
+	}
+	_, code := requestAndRender(ctx, *stateDir, protocol.Request{Op: "close-input", RunID: fs.Arg(0)}, *human, stdout, stderr, false)
 	return code
 }
 
@@ -744,7 +899,7 @@ Usage:
   jinushi list
   jinushi inspect <run-id>
   jinushi await <run-id>
-  jinushi events [--after SEQ] <run-id>
+  jinushi events [--after SEQ] [--follow] <run-id>
   jinushi output [--stream stdout|stderr|pty] [--offset N] [--limit N] <run-id>
   jinushi attach [--rows N --cols N] <run-id>
   jinushi signal <run-id> <signal>
@@ -753,6 +908,7 @@ Usage:
   jinushi status
   jinushi lease renew --generation N --lease-ms N <run-id>
   jinushi input <run-id> <text>
+  jinushi close-input <run-id>
   jinushi resize --rows N --cols N <run-id>
 
 Responses are JSON by default. Use --human for concise status output. The
