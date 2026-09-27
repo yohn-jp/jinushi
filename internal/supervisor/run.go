@@ -52,5 +52,5 @@ func Run(ctx context.Context, stateDir string) error {
 		return fmt.Errorf("listen local IPC: %w", err)
 	}
 	defer listener.Close()
-	return ipc.Serve(ctx, listener, s.Handle)
+	return ipc.ServeWithNotifier(ctx, listener, s.Handle, s.notifier)
 }
