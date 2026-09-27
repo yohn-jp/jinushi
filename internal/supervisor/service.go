@@ -141,68 +141,68 @@ func publicRun(run model.Run) model.Run {
 
 func validSpec(spec *model.RunSpec, caps model.Capabilities, config Config) *protocol.Failure {
 	if spec == nil || len(spec.Argv) == 0 || spec.Argv[0] == "" || len(spec.Argv) > 256 {
-		return &protocol.Failure{"invalid-request", "argv must contain an executable and at most 256 arguments"}
+		return &protocol.Failure{Code: "invalid-request", Message: "argv must contain an executable and at most 256 arguments"}
 	}
 	for _, arg := range spec.Argv {
 		if len(arg) > 32768 || strings.ContainsRune(arg, 0) {
-			return &protocol.Failure{"invalid-request", "invalid argv element"}
+			return &protocol.Failure{Code: "invalid-request", Message: "invalid argv element"}
 		}
 	}
 	if !filepath.IsAbs(spec.Cwd) {
-		return &protocol.Failure{"invalid-request", "cwd must be absolute"}
+		return &protocol.Failure{Code: "invalid-request", Message: "cwd must be absolute"}
 	}
 	if len(spec.Cwd) > 4096 {
-		return &protocol.Failure{"invalid-request", "cwd too long"}
+		return &protocol.Failure{Code: "invalid-request", Message: "cwd too long"}
 	}
 	if spec.Environment.Mode != "" && spec.Environment.Mode != "inherit-supervisor" && spec.Environment.Mode != "replace" {
-		return &protocol.Failure{"invalid-request", "invalid environment mode"}
+		return &protocol.Failure{Code: "invalid-request", Message: "invalid environment mode"}
 	}
 	if len(spec.Environment.Set) > 128 || len(spec.Environment.Unset) > 128 {
-		return &protocol.Failure{"invalid-request", "environment too large"}
+		return &protocol.Failure{Code: "invalid-request", Message: "environment too large"}
 	}
 	for k, v := range spec.Environment.Set {
 		if k == "" || strings.ContainsAny(k, "=\x00") || len(k) > 256 || len(v) > 32768 || strings.ContainsRune(v, 0) {
-			return &protocol.Failure{"invalid-request", "invalid environment entry"}
+			return &protocol.Failure{Code: "invalid-request", Message: "invalid environment entry"}
 		}
 	}
 	for _, k := range spec.Environment.Unset {
 		if k == "" || strings.ContainsAny(k, "=\x00") || len(k) > 256 {
-			return &protocol.Failure{"invalid-request", "invalid environment key"}
+			return &protocol.Failure{Code: "invalid-request", Message: "invalid environment key"}
 		}
 	}
 	if spec.Lifetime.Mode == "" {
 		spec.Lifetime.Mode = "detached"
 	}
 	if spec.Lifetime.Mode != "detached" && spec.Lifetime.Mode != "lease-bound" {
-		return &protocol.Failure{"invalid-request", "invalid lifetime mode"}
+		return &protocol.Failure{Code: "invalid-request", Message: "invalid lifetime mode"}
 	}
 	if spec.Lifetime.Mode == "lease-bound" && (spec.Lifetime.LeaseMs < 1000 || spec.Lifetime.LeaseMs > config.MaxWallTimeMs) {
-		return &protocol.Failure{"invalid-request", "invalid lease duration"}
+		return &protocol.Failure{Code: "invalid-request", Message: "invalid lease duration"}
 	}
 	if spec.Limits.MemoryBytes < 0 || spec.Limits.CPUQuotaPercent < 0 || spec.Limits.ProcessCount < 0 || spec.Limits.WallTimeMs < 0 || spec.Limits.OutputBytes < 0 {
-		return &protocol.Failure{"invalid-request", "negative limit"}
+		return &protocol.Failure{Code: "invalid-request", Message: "negative limit"}
 	}
 	if spec.Limits.OutputBytes > config.MaxOutputBytes || spec.Limits.WallTimeMs > config.MaxWallTimeMs || spec.Limits.MemoryBytes > config.MaxMemoryBytes || spec.Limits.ProcessCount > config.MaxProcessCount {
-		return &protocol.Failure{"invalid-request", "limit exceeds supervisor ceiling"}
+		return &protocol.Failure{Code: "invalid-request", Message: "limit exceeds supervisor ceiling"}
 	}
 	if spec.Interactive && !caps.PTY {
-		return &protocol.Failure{"unsupported-capability", "PTY unavailable"}
+		return &protocol.Failure{Code: "unsupported-capability", Message: "PTY unavailable"}
 	}
 	if spec.Limits.MemoryBytes > 0 && !caps.MemoryEnforcement {
-		return &protocol.Failure{"unsupported-capability", "memory enforcement unavailable"}
+		return &protocol.Failure{Code: "unsupported-capability", Message: "memory enforcement unavailable"}
 	}
 	if spec.Limits.CPUQuotaPercent > 0 && !caps.CPUQuotaEnforcement {
-		return &protocol.Failure{"unsupported-capability", "CPU quota enforcement unavailable"}
+		return &protocol.Failure{Code: "unsupported-capability", Message: "CPU quota enforcement unavailable"}
 	}
 	if spec.Limits.ProcessCount > 0 && !caps.ProcessCountEnforcement {
-		return &protocol.Failure{"unsupported-capability", "process-count enforcement unavailable"}
+		return &protocol.Failure{Code: "unsupported-capability", Message: "process-count enforcement unavailable"}
 	}
 	if len(spec.Correlation) > 16 {
-		return &protocol.Failure{"invalid-request", "too many correlation labels"}
+		return &protocol.Failure{Code: "invalid-request", Message: "too many correlation labels"}
 	}
 	for k, v := range spec.Correlation {
 		if len(k) == 0 || len(k) > 64 || len(v) > 256 {
-			return &protocol.Failure{"invalid-request", "invalid correlation label"}
+			return &protocol.Failure{Code: "invalid-request", Message: "invalid correlation label"}
 		}
 	}
 	return nil
