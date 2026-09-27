@@ -274,6 +274,12 @@ type terminalRecord struct {
 	State model.State `json:"state"`
 }
 
+type uncertainRecord struct {
+	Type  string      `json:"type"`
+	RunID string      `json:"runId"`
+	State model.State `json:"state"`
+}
+
 type errorRecord struct {
 	Type  string           `json:"type"`
 	Error protocol.Failure `json:"error"`
@@ -282,7 +288,7 @@ type errorRecord struct {
 var errStopFollow = errors.New("stop event follow after remote error")
 
 func followEventsCommand(ctx context.Context, stateDir, runID string, after uint64, stdout, stderr io.Writer) int {
-	var terminalState model.State
+	var finalState model.State
 	var retentionGapSeen bool
 	var retentionGapWatermark uint64
 	var remoteFailure bool
@@ -339,7 +345,7 @@ func followEventsCommand(ctx context.Context, stateDir, runID string, after uint
 			}
 			after = event.Seq
 		}
-		if response.Run != nil && response.Run.State == model.Terminal {
+		if response.Run != nil && (response.Run.State == model.Terminal || response.Run.State == model.Uncertain) {
 			if response.Run.ID != runID {
 				remoteFailure = true
 				failure := protocol.Failure{Code: "invalid-event-stream", Message: "Run snapshot ID did not match the subscription"}
@@ -349,7 +355,7 @@ func followEventsCommand(ctx context.Context, stateDir, runID string, after uint
 				}
 				return errStopFollow
 			}
-			terminalState = response.Run.State
+			finalState = response.Run.State
 		}
 		return nil
 	})
@@ -366,10 +372,17 @@ func followEventsCommand(ctx context.Context, stateDir, runID string, after uint
 	if followErr != nil {
 		return writeFollowError(stdout, stderr, protocol.Failure{Code: "event-follow-failed", Message: followErr.Error()})
 	}
-	if terminalState == "" {
+	if finalState == "" {
 		return writeFollowError(stdout, stderr, protocol.Failure{Code: "subscription-closed", Message: "event subscription ended before terminal state was observed"})
 	}
-	if err := writeNDJSON(stdout, terminalRecord{Type: "terminal", RunID: runID, State: terminalState}); err != nil {
+	if finalState == model.Uncertain {
+		if err := writeNDJSON(stdout, uncertainRecord{Type: "uncertain", RunID: runID, State: finalState}); err != nil {
+			fmt.Fprintf(stderr, "write event stream: %v\n", err)
+			return 1
+		}
+		return 1
+	}
+	if err := writeNDJSON(stdout, terminalRecord{Type: "terminal", RunID: runID, State: finalState}); err != nil {
 		fmt.Fprintf(stderr, "write event stream: %v\n", err)
 		return 1
 	}

@@ -215,12 +215,12 @@ func serveEventFollow(ctx context.Context, conn net.Conn, request protocol.Reque
 	request.Follow = false
 	request.Limit = 1 // A single bounded event fits comfortably in one protocol frame.
 	after := request.After
-	terminalSeen := false
+	finalSeen := false
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		wasTerminal := terminalSeen
+		wasFinal := finalSeen
 		request.After = after
 		response := callHandler(ctx, request, handler)
 		if response.Error != nil {
@@ -241,21 +241,21 @@ func serveEventFollow(ctx context.Context, conn net.Conn, request protocol.Reque
 		if response.Gap && len(response.Events) == 0 && response.RetainedFrom > 0 && after < response.RetainedFrom-1 {
 			after = response.RetainedFrom - 1
 		}
-		if response.Run != nil && response.Run.State == model.Terminal {
-			terminalSeen = true
+		if response.Run != nil && isFinalRunState(response.Run.State) {
+			finalSeen = true
 		}
 
-		if len(response.Events) > 0 || response.Gap || terminalSeen {
+		if len(response.Events) > 0 || response.Gap || finalSeen {
 			if !writeFollowFrame(conn, response) {
 				return
 			}
 		}
-		// Always make at least one additional store query after observing
-		// terminal. Continue paging if that query still returned events.
-		if wasTerminal && len(response.Events) == 0 {
+		// Always make at least one additional store query after observing a
+		// final state. Continue paging if that query still returned events.
+		if wasFinal && len(response.Events) == 0 {
 			return
 		}
-		if !terminalSeen && len(response.Events) == 0 {
+		if !finalSeen && len(response.Events) == 0 {
 			timer := time.NewTimer(100 * time.Millisecond)
 			select {
 			case <-ctx.Done():
@@ -265,6 +265,10 @@ func serveEventFollow(ctx context.Context, conn net.Conn, request protocol.Reque
 			}
 		}
 	}
+}
+
+func isFinalRunState(state model.State) bool {
+	return state == model.Terminal || state == model.Uncertain
 }
 
 func writeFollowFrame(conn net.Conn, response protocol.Response) bool {

@@ -221,6 +221,34 @@ func TestEventsFollowEmitsNDJSONGapsAndDrainsLateTerminalEvent(t *testing.T) {
 	}
 }
 
+func TestEventsFollowEmitsUncertainFinalRecordAndFails(t *testing.T) {
+	stateDir := t.TempDir()
+	var calls int
+	serveCLI(t, stateDir, func(_ context.Context, request protocol.Request) protocol.Response {
+		calls++
+		return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Uncertain}}
+	})
+	var stdout, stderr bytes.Buffer
+	code := Main(context.Background(), []string{"events", "--state-dir", stateDir, "--follow", "run_uncertain"}, &stdout, &stderr, nil)
+	if code != 1 {
+		t.Fatalf("events --follow exit = %d; want 1 for uncertain Run; stderr=%s", code, stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("got %d NDJSON records, want one uncertain final record: %s", len(lines), stdout.String())
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("invalid NDJSON record %q: %v", lines[0], err)
+	}
+	if record["type"] != "uncertain" || record["state"] != string(model.Uncertain) || record["runId"] != "run_uncertain" {
+		t.Fatalf("uncertain final record = %#v", record)
+	}
+	if calls != 2 {
+		t.Fatalf("event handler calls = %d, want initial uncertain snapshot plus one final query", calls)
+	}
+}
+
 func TestCloseInputUsesRunIdentity(t *testing.T) {
 	stateDir := t.TempDir()
 	requestReceived := make(chan protocol.Request, 1)

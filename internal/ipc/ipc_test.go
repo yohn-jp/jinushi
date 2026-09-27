@@ -167,6 +167,40 @@ func TestFollowEventsDrainsTerminalRaceAndAdvancesCursor(t *testing.T) {
 	}
 }
 
+func TestFollowEventsStopsAfterUncertainRunSnapshot(t *testing.T) {
+	stateDir := t.TempDir()
+	listener, err := Listen(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32
+	go func() {
+		_ = Serve(ctx, listener, func(_ context.Context, request protocol.Request) protocol.Response {
+			calls.Add(1)
+			return protocol.Response{Version: model.ProtocolVersion, Run: &model.Run{ID: request.RunID, State: model.Uncertain}}
+		})
+	}()
+
+	var responses []protocol.Response
+	err = FollowEvents(context.Background(), stateDir, protocol.Request{Op: "events", RunID: "run_test", Follow: true}, func(response protocol.Response) error {
+		responses = append(responses, response)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 || len(responses) != 2 {
+		t.Fatalf("follow made %d handler calls and received %d frames; want the initial uncertain snapshot plus one final query", calls.Load(), len(responses))
+	}
+	for i, response := range responses {
+		if response.Run == nil || response.Run.State != model.Uncertain {
+			t.Fatalf("frame %d did not preserve uncertain Run state: %#v", i, response)
+		}
+	}
+}
+
 func TestFollowDisconnectCancelsOnlySubscription(t *testing.T) {
 	stateDir := t.TempDir()
 	listener, err := Listen(stateDir)
