@@ -1,0 +1,106 @@
+{
+  "$schema": "./runtime-profiles.schema.json",
+  "version": 1,
+  "kind": "yohn-agent-runtime-profiles",
+  "authority": {
+    "workflow": {
+      "canonical": "docs/agent-change-workflow.md",
+      "projected": ".github/agent-governance/change-workflow.md"
+    },
+    "promptGuide": {
+      "canonical": "docs/agent-runtime-profiles.md",
+      "projected": ".github/agent-governance/runtime-profiles.md"
+    }
+  },
+  "profiles": [
+    {
+      "id": "sol-luna-orchestrated",
+      "runtime": "GPT-5.6 Sol + GPT-5.6 Luna",
+      "role": "orchestrator-with-workers",
+      "implementationAuthority": "workers-for-leaves; orchestrator-for-integration-only",
+      "delegation": "Sol owns decomposition, dependency analysis, integration and reporting; Luna owns scoped leaf implementation and exploration.",
+      "parallelism": "Parallelize only dependency-independent leaves with non-conflicting expected write-sets.",
+      "topLevelSession": "single",
+      "contextStrategy": "Keep orchestration state, dependency DAG, worker ownership, integration hotspots, validation evidence and blockers; do not rediscover stable facts.",
+      "requiredPromptClauses": [
+        "Sol is the orchestrator; leaf implementation is delegated to Luna.",
+        "State exact repository, Issue/Epic, expected base, branch/worktree topology and lifecycle end condition.",
+        "State dependency edges and integration hotspots before parallel execution.",
+        "Do not split the requested orchestration into separate top-level sessions without a topology reason.",
+        "Require concrete changed-file, validation, PR-state and blocker evidence from each worker."
+      ],
+      "prohibitions": [
+        "direct implementation on the protected default branch",
+        "ordinary leaf implementation by Sol when a Luna worker owns that leaf",
+        "parallel edits to the same canonical authority without explicit integration ownership",
+        "speculative Issue creation or scope expansion"
+      ]
+    },
+    {
+      "id": "luna-worker",
+      "runtime": "GPT-5.6 Luna",
+      "role": "scoped-worker",
+      "implementationAuthority": "one bounded leaf",
+      "delegation": "No orchestration by default.",
+      "parallelism": "External orchestrator decides parallel placement; the worker stays inside its assigned authority.",
+      "topLevelSession": "scoped",
+      "contextStrategy": "Keep only task identity, worktree/branch/base, implementation envelope, changed files, validation evidence and blockers.",
+      "requiredPromptClauses": [
+        "State exact Issue/task identity, acceptance criteria, base, branch and worktree.",
+        "State the narrow implementation envelope and explicit exclusions.",
+        "State required validation and requested lifecycle end condition.",
+        "Return concise changed-file, validation, PR-state and deviation evidence."
+      ],
+      "prohibitions": [
+        "orchestration takeover",
+        "unrequested architecture redesign",
+        "unrelated Issue creation",
+        "scope expansion beyond the assigned leaf"
+      ]
+    },
+    {
+      "id": "claude-code-autonomous",
+      "runtime": "Claude Code",
+      "role": "autonomous-primary-with-optional-subagents",
+      "implementationAuthority": "primary session; isolated subagents where supported",
+      "delegation": "Use available subagents for independent exploration or isolated implementation tracks; the primary session owns reconciliation and integration.",
+      "parallelism": "Use subagents only when dependencies and write-sets permit; write-capable parallel workers require governed isolation.",
+      "topLevelSession": "single-when-requested",
+      "contextStrategy": "Primary session retains task authority, live-state reconciliation, integration decisions, validation and lifecycle state.",
+      "requiredPromptClauses": [
+        "State exact repository, Issue/Epic, base, worktree topology and lifecycle end condition.",
+        "Keep a requested autonomous session as one top-level session and delegate internally.",
+        "Do not let subagents independently redefine accepted architecture or shared canonical contracts.",
+        "Reconcile all returned work against the current base before completion."
+      ],
+      "prohibitions": [
+        "splitting one requested autonomous session into unrelated top-level prompts",
+        "shared-worktree concurrent writes",
+        "subagent scope expansion",
+        "completion claims before primary-session reconciliation"
+      ]
+    },
+    {
+      "id": "codex-scoped",
+      "runtime": "Codex",
+      "role": "scoped-implementation-session",
+      "implementationAuthority": "one bounded leaf by default",
+      "delegation": "Use parallel/subagent facilities only when the active runtime actually exposes them and the workflow permits them.",
+      "parallelism": "Do not assume orchestration capabilities from the runtime name; parallelize only with explicit available facilities and safe dependency/write-set boundaries.",
+      "topLevelSession": "scoped",
+      "contextStrategy": "Keep task identity, governed worktree/branch/base, changed files, validation and lifecycle evidence.",
+      "requiredPromptClauses": [
+        "State exact Issue/task, base, branch/worktree and implementation envelope.",
+        "Use the current governed worktree when already correct; do not create redundant ownership.",
+        "State required validation and lifecycle end condition.",
+        "Return concrete diff, validation and lifecycle evidence."
+      ],
+      "prohibitions": [
+        "assumed runtime capabilities",
+        "redundant worktree creation",
+        "direct default-branch implementation",
+        "scope expansion beyond the accepted task"
+      ]
+    }
+  ]
+}

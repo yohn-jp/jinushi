@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yohn-jp/.github/blob/main/.github/agents/runtime-profiles.schema.json",
+  "title": "yohn-jp agent runtime profiles",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "kind", "authority", "profiles"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "kind": { "const": "yohn-agent-runtime-profiles" },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflow", "promptGuide"],
+      "properties": {
+        "workflow": { "$ref": "#/$defs/authorityReference" },
+        "promptGuide": { "$ref": "#/$defs/authorityReference" }
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/profile" }
+    }
+  },
+  "$defs": {
+    "authorityReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical", "projected"],
+      "properties": {
+        "canonical": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path resolved against the canonical provider repository (yohn-jp/.github)."
+        },
+        "projected": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path resolved against a consumer repository after sync-agents.yml projection."
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "runtime",
+        "role",
+        "implementationAuthority",
+        "delegation",
+        "parallelism",
+        "topLevelSession",
+        "contextStrategy",
+        "requiredPromptClauses",
+        "prohibitions"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "runtime": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "implementationAuthority": { "type": "string", "minLength": 1 },
+        "delegation": { "type": "string", "minLength": 1 },
+        "parallelism": { "type": "string", "minLength": 1 },
+        "topLevelSession": { "type": "string", "minLength": 1 },
+        "contextStrategy": { "type": "string", "minLength": 1 },
+        "requiredPromptClauses": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "prohibitions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
