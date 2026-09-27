@@ -362,7 +362,9 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 	clean := publicRun(run)
 	accepted.Run = &clean
 	encoded, err := json.Marshal(accepted)
-	if err != nil || len(encoded) >= protocol.MaxFrame-4096 {
+	// Reserve room for a maximum-sized journal event plus later lifecycle
+	// metadata, so inspect, await, and event reads stay representable.
+	if err != nil || len(encoded) >= protocol.MaxFrame-(300<<10) {
 		return failure("response-too-large", "Run metadata exceeds the IPC response limit")
 	}
 	if _, _, err = s.store.Create(run, &model.Event{Kind: "run.accepted", ObservedAt: now}); err != nil {
@@ -779,9 +781,8 @@ func (s *Service) events(req protocol.Request) protocol.Response {
 	out.RetainedFrom = from
 	out.Gap = gap
 	if run, err := s.store.Get(req.RunID); err == nil {
-		// Event consumers need the current lifecycle state. Keeping this
-		// projection small leaves room for an individually bounded event.
-		out.Run = &model.Run{ID: run.ID, State: run.State, Generation: run.Generation}
+		clean := publicRun(run)
+		out.Run = &clean
 	}
 	base, err := json.Marshal(out)
 	if err != nil {
