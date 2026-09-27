@@ -451,9 +451,13 @@ func TestPTYAttachReconnectResizeAndInput(t *testing.T) {
 		t.Skipf("Linux backend explicitly reports PTY unsupported; capability response: %+v", caps)
 	}
 	started := h.run("--interactive", "--", "/bin/sh", "-c", `printf READY; IFS= read -r line; stty size; printf 'GOT:%s\n' "$line"`)
+	h.waitUntil("interactive Run to enter running state", 10*time.Second, func() bool { return h.inspect(started.ID).State == "running" })
 
 	first := startAttach(t, h, started.ID)
-	waitEventCount(t, h, started.ID, "pty.attached", 1, 8*time.Second)
+	if err := waitEventCount(h, started.ID, "pty.attached", 1, 8*time.Second); err != nil {
+		first.stop()
+		t.Fatalf("first attachment was not accepted: %v; stdout=%q stderr=%q", err, first.stdout.String(), first.stderr.String())
+	}
 	if _, err := first.input.Write([]byte{0x1d}); err != nil {
 		t.Fatalf("send Ctrl+] to detach: %v", err)
 	}
@@ -461,13 +465,18 @@ func TestPTYAttachReconnectResizeAndInput(t *testing.T) {
 	if err := first.wait(8 * time.Second); err != nil {
 		t.Fatalf("first attach did not detach cleanly: %v stderr=%q", err, first.stderr.String())
 	}
-	waitEventCount(t, h, started.ID, "pty.detached", 1, 8*time.Second)
+	if err := waitEventCount(h, started.ID, "pty.detached", 1, 8*time.Second); err != nil {
+		t.Fatalf("first attachment did not record detach: %v; stdout=%q stderr=%q", err, first.stdout.String(), first.stderr.String())
+	}
 	if inspected := h.inspect(started.ID); inspected.State != "running" {
 		t.Fatalf("PTY detach changed Run lifetime: state=%s", inspected.State)
 	}
 
 	reconnected := startAttach(t, h, started.ID)
-	waitEventCount(t, h, started.ID, "pty.attached", 2, 8*time.Second)
+	if err := waitEventCount(h, started.ID, "pty.attached", 2, 8*time.Second); err != nil {
+		reconnected.stop()
+		t.Fatalf("reconnected attachment was not accepted: %v; stdout=%q stderr=%q", err, reconnected.stdout.String(), reconnected.stderr.String())
+	}
 	code, _, resized := h.invoke(5*time.Second, "resize", "--state-dir", h.stateDir, "--rows", "40", "--cols", "100", started.ID)
 	if code != 0 || resized.Error != nil {
 		t.Fatalf("resize PTY: exit=%d response=%+v", code, resized)
@@ -512,13 +521,18 @@ func startAttach(t *testing.T, h *harness, id string) *attachClient {
 		t.Fatalf("start real attach client: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = client.input.Close()
-		if !client.waited && cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		}
+		client.stop()
 	})
 	return client
+}
+
+func (client *attachClient) stop() {
+	_ = client.input.Close()
+	if !client.waited && client.cmd.Process != nil {
+		_ = client.cmd.Process.Kill()
+		_ = client.cmd.Wait()
+		client.waited = true
+	}
 }
 
 func (client *attachClient) wait(timeout time.Duration) error {
@@ -701,8 +715,7 @@ func waitProcessGone(t *testing.T, pid int, timeout time.Duration) {
 	t.Fatalf("descendant PID %d remained executable after Jinushi reported terminal cleanup", pid)
 }
 
-func waitEventCount(t *testing.T, h *harness, id, kind string, count int, timeout time.Duration) {
-	t.Helper()
+func waitEventCount(h *harness, id, kind string, count int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		_, _, result := h.invoke(5*time.Second, "events", "--state-dir", h.stateDir, id)
@@ -714,10 +727,10 @@ func waitEventCount(t *testing.T, h *harness, id, kind string, count int, timeou
 				}
 			}
 			if found >= count {
-				return
+				return nil
 			}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %d event(s) of kind %s", count, kind)
+	return fmt.Errorf("timed out waiting for %d event(s) of kind %s", count, kind)
 }
