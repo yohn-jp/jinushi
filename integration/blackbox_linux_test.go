@@ -604,7 +604,7 @@ func TestGrandchildCancellationProvesTreeGone(t *testing.T) {
 	}
 	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, "--request-id", "grandchild-cancel", "--expected-generation", strconv.FormatUint(h.inspect(started.ID).Generation, 10), started.ID)
 	if code != 0 || canceled.Error != nil {
-		t.Fatalf("cancel Run: exit=%d response=%+v", code, canceled)
+		t.Fatalf("cancel Run: exit=%d response=%+v error=%+v", code, canceled, canceled.Error)
 	}
 	_, finished := h.await(started.ID, 15*time.Second)
 	if finished.Receipt.Outcome != "cancelled" || finished.Receipt.Cleanup != "complete" || !finished.Receipt.TerminationRequested {
@@ -1159,7 +1159,12 @@ func TestSupervisorRestartPreservesPhysicalTelemetryAndOutputTime(t *testing.T) 
 		t.Fatalf("resource.gap had no matching separately persisted telemetry sample: gap=%+v telemetry=%+v", gapBody, telemetry)
 	}
 	encodedLatest, _ := json.Marshal(gapBody.LatestResources)
-	encodedSampled, _ := json.Marshal(matchingSample.Resources)
+	var sampledResources resources
+	encodedSampledModel, _ := json.Marshal(matchingSample.Resources)
+	if err := json.Unmarshal(encodedSampledModel, &sampledResources); err != nil {
+		t.Fatalf("project telemetry resources into integration schema: %v", err)
+	}
+	encodedSampled, _ := json.Marshal(sampledResources)
 	if !matchingSample.ObservedAt.Equal(gapBody.To) || !bytes.Equal(encodedLatest, encodedSampled) {
 		t.Fatalf("separate telemetry query did not carry the latest gap snapshot at its physical timestamp: sample=%+v gap=%+v", matchingSample, gapBody)
 	}
