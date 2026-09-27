@@ -170,19 +170,26 @@ func (s *Store) Create(run model.Run, event *model.Event) (model.Run, *model.Eve
 		if runs.Get([]byte(run.ID)) != nil {
 			return ErrRunExists
 		}
-		encoded, err := json.Marshal(run)
-		if err != nil {
-			return fmt.Errorf("encode Run: %w", err)
-		}
-		if err := runs.Put([]byte(run.ID), encoded); err != nil {
-			return fmt.Errorf("persist Run: %w", err)
-		}
 		if event != nil {
 			copy, err := s.appendEventTx(tx, run.ID, *event, run.State != model.Terminal)
 			if err != nil {
 				return err
 			}
 			appended = &copy
+		}
+		if run.State == model.Terminal {
+			meta, err := readEventMetaTx(tx, run.ID)
+			if err != nil {
+				return err
+			}
+			stampReceiptEventRange(run.Receipt, meta)
+		}
+		encoded, err := json.Marshal(run)
+		if err != nil {
+			return fmt.Errorf("encode Run: %w", err)
+		}
+		if err := runs.Put([]byte(run.ID), encoded); err != nil {
+			return fmt.Errorf("persist Run: %w", err)
 		}
 		return nil
 	})
@@ -259,16 +266,23 @@ func (s *Store) Update(run model.Run, event *model.Event) (*model.Event, error) 
 		if previous.Receipt != nil && !reflect.DeepEqual(previous.Receipt, run.Receipt) {
 			return fmt.Errorf("%w: terminal receipt is immutable", ErrInvalidRun)
 		}
-		encoded, err := json.Marshal(run)
-		if err != nil {
-			return fmt.Errorf("encode Run: %w", err)
-		}
 		if event != nil {
 			copy, err := s.appendEventTx(tx, run.ID, *event, run.State != model.Terminal)
 			if err != nil {
 				return err
 			}
 			appended = &copy
+		}
+		if run.State == model.Terminal {
+			meta, err := readEventMetaTx(tx, run.ID)
+			if err != nil {
+				return err
+			}
+			stampReceiptEventRange(run.Receipt, meta)
+		}
+		encoded, err := json.Marshal(run)
+		if err != nil {
+			return fmt.Errorf("encode Run: %w", err)
 		}
 		if err := runs.Put([]byte(run.ID), encoded); err != nil {
 			return fmt.Errorf("persist Run: %w", err)
@@ -279,6 +293,54 @@ func (s *Store) Update(run model.Run, event *model.Event) (*model.Event, error) 
 		return nil, err
 	}
 	return appended, nil
+}
+
+func readEventMetaTx(tx *bolt.Tx, runID string) (eventMeta, error) {
+	meta := eventMeta{RetainedFrom: 1}
+	root := tx.Bucket([]byte(eventsBucketName))
+	journal := root.Bucket([]byte(runID))
+	if journal == nil {
+		return meta, nil
+	}
+	raw := journal.Get([]byte(eventMetaKey))
+	if raw != nil {
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return eventMeta{}, fmt.Errorf("decode event metadata: %w", err)
+		}
+	}
+	if meta.RetainedFrom == 0 {
+		if meta.Count == 0 {
+			meta.RetainedFrom = meta.LastSeq + 1
+		} else {
+			key, _ := journal.Cursor().Seek([]byte{eventEntryKey})
+			if key == nil || key[0] != eventEntryKey || len(key) != 9 {
+				return eventMeta{}, fmt.Errorf("event metadata has retained entries but no first sequence")
+			}
+			meta.RetainedFrom = binary.BigEndian.Uint64(key[1:])
+		}
+	}
+	return meta, nil
+}
+
+func stampReceiptEventRange(receipt *model.Receipt, meta eventMeta) {
+	if receipt == nil {
+		return
+	}
+	firstSeq := uint64(0)
+	if meta.LastSeq > 0 {
+		firstSeq = 1
+	}
+	if meta.RetainedFrom == 0 {
+		meta.RetainedFrom = 1
+	}
+	complete := meta.RetainedFrom == 1 && meta.Count == meta.LastSeq
+	receipt.EventFirstSeq = firstSeq
+	receipt.EventLastSeq = meta.LastSeq
+	receipt.EventRetainedFrom = meta.RetainedFrom
+	receipt.EventHistoryComplete = complete
+	if !complete {
+		receipt.EvidenceIncomplete = true
+	}
 }
 
 // AppendEvent appends one event and assigns its monotonic per-Run sequence.

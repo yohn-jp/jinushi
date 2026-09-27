@@ -85,18 +85,26 @@ type Ownership struct {
 }
 
 type Receipt struct {
-	Version              int        `json:"version"`
-	RunID                string     `json:"runId"`
-	Outcome              string     `json:"outcome"`
-	ExitCode             *int       `json:"exitCode,omitempty"`
-	Signal               string     `json:"signal,omitempty"`
-	StartedAt            *time.Time `json:"startedAt,omitempty"`
-	FinishedAt           time.Time  `json:"finishedAt"`
-	Resources            Resources  `json:"resources"`
-	Output               Output     `json:"output"`
-	TerminationRequested bool       `json:"terminationRequested"`
-	Forced               bool       `json:"forced"`
-	Cleanup              string     `json:"cleanup"`
+	Version              int          `json:"version"`
+	RunID                string       `json:"runId"`
+	Outcome              string       `json:"outcome"`
+	AcceptedArgvSHA256   string       `json:"acceptedArgvSha256,omitempty"`
+	ExitCode             *int         `json:"exitCode,omitempty"`
+	Signal               string       `json:"signal,omitempty"`
+	StartedAt            *time.Time   `json:"startedAt,omitempty"`
+	FinishedAt           time.Time    `json:"finishedAt"`
+	Resources            Resources    `json:"resources"`
+	Capabilities         Capabilities `json:"capabilities"`
+	Output               Output       `json:"output"`
+	// EventFirstSeq and EventLastSeq cover the assigned journal range; EventRetainedFrom is its current retention watermark.
+	EventFirstSeq        uint64       `json:"eventFirstSeq"`
+	EventLastSeq         uint64       `json:"eventLastSeq"`
+	EventRetainedFrom    uint64       `json:"eventRetainedFrom"`
+	EventHistoryComplete bool         `json:"eventHistoryComplete"`
+	EvidenceIncomplete   bool         `json:"evidenceIncomplete"`
+	TerminationRequested bool         `json:"terminationRequested"`
+	Forced               bool         `json:"forced"`
+	Cleanup              string       `json:"cleanup"`
 }
 
 type Run struct {

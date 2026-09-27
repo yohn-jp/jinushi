@@ -100,6 +100,10 @@ func TestLifecycleUpdateAndEventCommitTogether(t *testing.T) {
 	if current.State != model.Terminal || current.Receipt == nil || current.Receipt.Outcome != "exited" {
 		t.Fatalf("reopened terminal Run = %#v", current)
 	}
+	if current.Receipt.EventFirstSeq != 1 || current.Receipt.EventLastSeq != 3 ||
+		current.Receipt.EventRetainedFrom != 1 || !current.Receipt.EventHistoryComplete || current.Receipt.EvidenceIncomplete {
+		t.Fatalf("reopened receipt event range = %#v", current.Receipt)
+	}
 	events, retainedFrom, gap, err = s.Events(run.ID, 0, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -232,6 +236,14 @@ func TestLifecycleEventsSurviveTelemetryCompactionUntilTerminal(t *testing.T) {
 	}
 	if _, err := s.Update(run, &model.Event{Kind: "run.terminal"}); err != nil {
 		t.Fatal(err)
+	}
+	current, err := s.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Receipt == nil || current.Receipt.EventFirstSeq != 1 || current.Receipt.EventLastSeq != 23 ||
+		current.Receipt.EventRetainedFrom != 2 || current.Receipt.EventHistoryComplete || !current.Receipt.EvidenceIncomplete {
+		t.Fatalf("receipt did not stamp compacted event history: %#v", current.Receipt)
 	}
 	events, _, _, err = s.Events(run.ID, 0, 16)
 	if err != nil {
