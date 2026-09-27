@@ -21,11 +21,13 @@ import (
 )
 
 type exitResult struct {
-	code       *int
-	signal     string
-	outcome    string
-	startedAt  time.Time
-	finishedAt time.Time
+	code                 *int
+	signal               string
+	outcome              string
+	startedAt            time.Time
+	finishedAt           time.Time
+	terminationRequested bool
+	forced               bool
 }
 
 type terminationResult struct {
@@ -447,7 +449,7 @@ func (s *Service) monitor(a *active) {
 			if outcome == "lease-expired" {
 				outcome = "cancelled"
 			}
-			s.finish(a, outcome, w.result, forced, "complete")
+			s.finish(a, outcome, w.result, forced || w.result.forced, "complete")
 			return
 		case <-ticker.C:
 			s.sample(a)
@@ -543,7 +545,7 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 		a.run.StartedAt = &started
 	}
 	a.run.FinishedAt = &now
-	a.run.Receipt = &model.Receipt{Version: model.ProtocolVersion, RunID: a.run.ID, Outcome: outcome, ExitCode: exit.code, Signal: exit.signal, StartedAt: a.run.StartedAt, FinishedAt: now, Resources: a.run.Resources, Output: a.run.Output, TerminationRequested: a.run.TerminationReason != "", Forced: forced, Cleanup: cleanup}
+	a.run.Receipt = &model.Receipt{Version: model.ProtocolVersion, RunID: a.run.ID, Outcome: outcome, ExitCode: exit.code, Signal: exit.signal, StartedAt: a.run.StartedAt, FinishedAt: now, Resources: a.run.Resources, Output: a.run.Output, TerminationRequested: a.run.TerminationReason != "" || exit.terminationRequested, Forced: forced, Cleanup: cleanup}
 	s.populateReceipt(a.run, a.run.Receipt)
 	if err := s.transition(a, model.Terminal, "run.terminal", map[string]any{"outcome": outcome}); err != nil {
 		a.run.State = model.Uncertain

@@ -196,7 +196,7 @@ func (p *guardianPhysical) Wait() (exitResult, error) {
 	if evidence.Snapshot.LimitOutcome != "" {
 		outcome = evidence.Snapshot.LimitOutcome
 	}
-	return exitResult{code: evidence.Exit.ExitCode, signal: evidence.Exit.Signal, outcome: outcome, startedAt: evidence.Exit.StartedAt, finishedAt: evidence.Exit.FinishedAt}, nil
+	return exitResult{code: evidence.Exit.ExitCode, signal: evidence.Exit.Signal, outcome: outcome, startedAt: evidence.Exit.StartedAt, finishedAt: evidence.Exit.FinishedAt, terminationRequested: evidence.Receipt.TerminationRequested, forced: evidence.Receipt.Forced}, nil
 }
 
 func (p *guardianPhysical) Observe() (model.Resources, error) {
