@@ -251,15 +251,22 @@ func TestTelemetryQueryCursorAndGapCompactionAreExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Samples) != 2 || first.NextCursor == "" {
+	if len(first.Samples) != 2 || first.NextCursor == "" || first.Watermark != first.NextCursor {
 		t.Fatalf("first page = %#v", first)
 	}
 	second, err := db.QueryTelemetry(model.TelemetryQuery{RunID: run.ID, Limit: 2, Cursor: first.NextCursor})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(second.Samples) != 2 || second.Samples[0].Sequence != 3 || second.Samples[1].Sequence != 4 || second.NextCursor != "" {
+	if len(second.Samples) != 2 || second.Samples[0].Sequence != 3 || second.Samples[1].Sequence != 4 || second.NextCursor != "" || second.Watermark == "" || second.Watermark == first.Watermark {
 		t.Fatalf("second page = %#v", second)
+	}
+	empty, err := db.QueryTelemetry(model.TelemetryQuery{RunID: run.ID, Limit: 2, Cursor: second.Watermark})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.Samples) != 0 || empty.NextCursor != "" || empty.Watermark != second.Watermark {
+		t.Fatalf("empty follow page did not preserve its watermark: %#v", empty)
 	}
 	for i := 0; i < 3; i++ {
 		from := base.Add(time.Duration(i) * 10 * time.Second)
@@ -274,6 +281,13 @@ func TestTelemetryQueryCursorAndGapCompactionAreExplicit(t *testing.T) {
 	}
 	if len(withGaps.Gaps) != 2 || withGaps.HistoryComplete {
 		t.Fatalf("gap history = %#v", withGaps)
+	}
+	gapOnly, err := db.QueryTelemetry(model.TelemetryQuery{RunID: run.ID, Limit: 2, Cursor: second.Watermark})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gapOnly.Samples) != 0 || len(gapOnly.Aggregates) != 0 || len(gapOnly.Gaps) != 2 || gapOnly.Watermark != second.Watermark {
+		t.Fatalf("gap-only page cursor/watermark = %#v", gapOnly)
 	}
 	compacted := false
 	for _, gap := range withGaps.Gaps {
@@ -306,7 +320,7 @@ func TestTelemetryCursorReportsStaleAfterCompaction(t *testing.T) {
 		}
 	}
 	page, err := db.QueryTelemetry(model.TelemetryQuery{RunID: run.ID, Limit: 1})
-	if err != nil || page.NextCursor == "" {
+	if err != nil || page.NextCursor == "" || page.Watermark != page.NextCursor {
 		t.Fatalf("initial page = %#v, err=%v", page, err)
 	}
 	if _, err := db.AppendTelemetry(run.ID, testTelemetrySample(base.Add(3*time.Second), 3, 3)); err != nil {

@@ -437,7 +437,11 @@ type TelemetryResponse struct {
 	RetainedFrom    *time.Time           `json:"retainedFrom,omitempty"`
 	Resolution      TelemetryResolution  `json:"resolution,omitempty"`
 	HistoryComplete bool                 `json:"historyComplete"`
-	NextCursor      string               `json:"nextCursor,omitempty"`
+	// Watermark is the opaque cursor after the last point delivered by this
+	// snapshot. NextCursor remains the continuation cursor when more points
+	// are available beyond the current page.
+	Watermark  string `json:"watermark,omitempty"`
+	NextCursor string `json:"nextCursor,omitempty"`
 }
 
 type OutputStream struct {

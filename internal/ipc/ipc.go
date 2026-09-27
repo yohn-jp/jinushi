@@ -159,7 +159,7 @@ func serveConnection(parent context.Context, conn net.Conn, handler Handler, not
 
 	if request.Follow {
 		if !followOperation(request.Op) {
-			writeFailure(conn, "invalid-request", "follow is supported only for events, output, or watch")
+			writeFailure(conn, "invalid-request", "follow is supported only for events, output, watch, or telemetry")
 		} else {
 			serveFollow(requestCtx, conn, request, handler, notifier)
 		}

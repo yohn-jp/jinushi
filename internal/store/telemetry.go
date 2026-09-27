@@ -1334,10 +1334,15 @@ func (s *Store) QueryTelemetry(query model.TelemetryQuery) (model.TelemetryRespo
 			}
 		}
 		sort.Slice(entries, func(i, j int) bool { return entries[i].sequence < entries[j].sequence })
+		lastDelivered := cursor.LastSequence
 		if len(entries) > limit {
-			response.NextCursor = encodeTelemetryCursor(entries[limit-1].sequence, meta.CompactionGeneration)
+			lastDelivered = entries[limit-1].sequence
+			response.NextCursor = encodeTelemetryCursor(lastDelivered, meta.CompactionGeneration)
 			entries = entries[:limit]
+		} else if len(entries) > 0 {
+			lastDelivered = entries[len(entries)-1].sequence
 		}
+		response.Watermark = encodeTelemetryCursor(lastDelivered, meta.CompactionGeneration)
 		for _, entry := range entries {
 			if entry.sample != nil {
 				response.Samples = append(response.Samples, *entry.sample)

@@ -12,6 +12,12 @@ func (s *Service) notifyRunChange(runID string) {
 	}
 }
 
+func (s *Service) notifyTelemetryChange(runID string) {
+	if s.notifier != nil {
+		s.notifier.notifyTelemetry(runID)
+	}
+}
+
 func (s *Service) persistRunEvent(run model.Run, event *model.Event) error {
 	if _, err := s.store.Update(run, event); err != nil {
 		return err

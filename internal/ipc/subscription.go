@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	followPollInterval   = 100 * time.Millisecond
-	followWriteTimeout   = 30 * time.Second
-	maxFollowOutputBytes = 64 << 10
-	maxFollowPageItems   = 1
+	followPollInterval       = 100 * time.Millisecond
+	followWriteTimeout       = 30 * time.Second
+	maxFollowOutputBytes     = 64 << 10
+	maxFollowPageItems       = 1
+	maxFollowTelemetryPoints = 16
 )
 
 // Notifier subscribes to changes relevant to one follow request. Subscribe
@@ -36,15 +37,20 @@ type Subscription interface {
 	Close()
 }
 
-// Follow opens a framed subscription connection for events, output, or watch.
-// Each bounded response is passed to onResponse in order. Closing the client
-// cancels only this subscription request, never its Run.
+// Follow opens a framed subscription connection for events, output, watch, or
+// telemetry. Each bounded response is passed to onResponse in order. Closing
+// the client cancels only this subscription request, never its Run.
 func Follow(ctx context.Context, stateDir string, request protocol.Request, onResponse func(protocol.Response) error) error {
 	if !request.Follow || !followOperation(request.Op) {
-		return errors.New("follow requires Op=events, output, or watch and Follow=true")
+		return errors.New("follow requires Op=events, output, watch, or telemetry and Follow=true")
 	}
 	if onResponse == nil {
 		return errors.New("nil follow response handler")
+	}
+	if request.Op == "telemetry" {
+		if _, err := telemetryFollowRunID(request); err != nil {
+			return err
+		}
 	}
 	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
 	conn, err := Dial(dialCtx, stateDir)
@@ -94,7 +100,7 @@ func FollowEvents(ctx context.Context, stateDir string, request protocol.Request
 
 func followOperation(op string) bool {
 	switch op {
-	case "events", "output", "watch":
+	case "events", "output", "watch", "telemetry":
 		return true
 	default:
 		return false
@@ -102,6 +108,12 @@ func followOperation(op string) bool {
 }
 
 func serveFollow(ctx context.Context, conn net.Conn, request protocol.Request, handler Handler, notifier Notifier) {
+	if request.Op == "telemetry" {
+		if _, err := telemetryFollowRunID(request); err != nil {
+			writeFailure(conn, "invalid-request", "telemetry follow requires a consistent Run ID and query")
+			return
+		}
+	}
 	subscription, err := subscribe(ctx, request, notifier)
 	if err != nil {
 		writeFollowFrame(conn, errorResponse("subscription-unavailable", "subscription could not be established"))
@@ -114,6 +126,16 @@ func serveFollow(ctx context.Context, conn net.Conn, request protocol.Request, h
 	after := request.After
 	offset := request.Offset
 	cursor := request.Cursor
+	var seenTelemetryGaps map[string]struct{}
+	if request.Op == "telemetry" {
+		query := *request.TelemetryQuery
+		query.RunID, _ = telemetryFollowRunID(request)
+		if query.Limit <= 0 || query.Limit > maxFollowTelemetryPoints {
+			query.Limit = maxFollowTelemetryPoints
+		}
+		request.TelemetryQuery = &query
+		cursor = query.Cursor
+	}
 	finalSeen := false
 	for {
 		if ctx.Err() != nil {
@@ -123,10 +145,21 @@ func serveFollow(ctx context.Context, conn net.Conn, request protocol.Request, h
 		request.After = after
 		request.Offset = offset
 		request.Cursor = cursor
+		if request.Op == "telemetry" {
+			query := *request.TelemetryQuery
+			query.Cursor = cursor
+			request.TelemetryQuery = &query
+		}
 		response := callHandler(ctx, request, handler)
 		if response.Error != nil {
 			writeFollowFrame(conn, response)
 			return
+		}
+		if request.Op == "telemetry" {
+			if err := filterRepeatedTelemetryGaps(&response, &seenTelemetryGaps); err != nil {
+				writeFailure(conn, "invalid-telemetry-stream", "telemetry response could not be validated")
+				return
+			}
 		}
 
 		progress, err := advanceFollow(request, response, &after, &offset, &cursor)
@@ -137,7 +170,8 @@ func serveFollow(ctx context.Context, conn net.Conn, request protocol.Request, h
 		if response.Run != nil && isFinalRunState(response.Run.State) {
 			finalSeen = true
 		}
-		if progress || finalSeen {
+		terminalDrainComplete := request.Op == "telemetry" && wasFinal && !progress
+		if progress || finalSeen && !terminalDrainComplete {
 			if !writeFollowFrame(conn, response) {
 				return
 			}
@@ -169,6 +203,8 @@ func boundedFollowLimit(request protocol.Request) int64 {
 			return maxFollowOutputBytes
 		}
 		return request.Limit
+	case "telemetry":
+		return maxFollowTelemetryPoints
 	default:
 		return maxFollowPageItems
 	}
@@ -237,9 +273,91 @@ func advanceFollow(request protocol.Request, response protocol.Response, after *
 			return false, &followFailure{"invalid-watch-cursor", "watch page did not advance its cursor"}
 		}
 		return payload || response.Gap || advanced, nil
+	case "telemetry":
+		return advanceTelemetryFollow(request, response, cursor)
 	default:
 		return false, &followFailure{"invalid-request", "unsupported follow operation"}
 	}
+}
+
+func telemetryFollowRunID(request protocol.Request) (string, error) {
+	if request.TelemetryQuery == nil {
+		return "", errors.New("telemetry follow requires a TelemetryQuery")
+	}
+	queryRunID := request.TelemetryQuery.RunID
+	if request.RunID != "" && queryRunID != "" && request.RunID != queryRunID {
+		return "", errors.New("telemetry follow Run ID is inconsistent")
+	}
+	if request.RunID != "" {
+		return request.RunID, nil
+	}
+	if queryRunID == "" {
+		return "", errors.New("telemetry follow requires a Run ID")
+	}
+	return queryRunID, nil
+}
+
+func advanceTelemetryFollow(request protocol.Request, response protocol.Response, cursor *string) (bool, *followFailure) {
+	runID, err := telemetryFollowRunID(request)
+	if err != nil || response.Telemetry == nil || response.Telemetry.RunID != runID || response.Run == nil || response.Run.ID != runID {
+		return false, &followFailure{"invalid-telemetry-stream", "telemetry response did not match the subscription Run"}
+	}
+	page := response.Telemetry
+	hasPoints := len(page.Samples) > 0 || len(page.Aggregates) > 0
+	if page.NextCursor != "" {
+		if page.NextCursor == *cursor || page.Watermark == "" || page.Watermark != page.NextCursor || !hasPoints {
+			return false, &followFailure{"invalid-telemetry-cursor", "telemetry page cursor did not match its delivered watermark"}
+		}
+		*cursor = page.NextCursor
+		return true, nil
+	}
+	if hasPoints {
+		if page.Watermark == "" || page.Watermark == *cursor {
+			return false, &followFailure{"invalid-telemetry-cursor", "telemetry points did not advance their watermark"}
+		}
+		*cursor = page.Watermark
+		return true, nil
+	}
+	if page.Watermark != "" && page.Watermark != *cursor {
+		*cursor = page.Watermark
+		return true, nil
+	}
+	return len(page.Gaps) > 0, nil
+}
+
+// QueryTelemetry repeats retained gaps on every cursor page. During one live
+// subscription, emit only gaps that appeared since the previous snapshot;
+// keep only the current retained set so this state remains bounded by store
+// retention even if the subscription runs indefinitely.
+func filterRepeatedTelemetryGaps(response *protocol.Response, previous *map[string]struct{}) error {
+	if response.Telemetry == nil {
+		return nil
+	}
+	page := *response.Telemetry
+	current := make(map[string]struct{}, len(page.Gaps))
+	newGaps := make([]model.TelemetryGap, 0, len(page.Gaps))
+	for _, gap := range page.Gaps {
+		encoded, err := json.Marshal(gap)
+		if err != nil {
+			return err
+		}
+		key := string(encoded)
+		if _, exists := current[key]; exists {
+			continue
+		}
+		current[key] = struct{}{}
+		if *previous == nil {
+			newGaps = append(newGaps, gap)
+			continue
+		}
+		if _, exists := (*previous)[key]; !exists {
+			newGaps = append(newGaps, gap)
+		}
+	}
+	page.Gaps = newGaps
+	response.Telemetry = &page
+	*previous = current
+	return nil
 }
 
 func isFinalRunState(state model.State) bool {

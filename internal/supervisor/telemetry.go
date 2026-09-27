@@ -89,8 +89,17 @@ func (s *Service) queryTelemetry(req protocol.Request) protocol.Response {
 				return failure("storage-failure", "telemetry query failed")
 			}
 		}
+		run, err := s.store.Get(query.RunID)
+		if err != nil {
+			if errors.Is(err, store.ErrRunNotFound) {
+				return s.missingRunFailure(query.RunID, "Run or telemetry history not found")
+			}
+			return failure("storage-failure", "Run metadata could not be read")
+		}
 		out := response()
 		out.Telemetry = &telemetry
+		clean := publicRun(run)
+		out.Run = &clean
 		encoded, err := json.Marshal(out)
 		if err != nil {
 			return failure("storage-failure", "telemetry response could not be encoded")
@@ -121,6 +130,7 @@ func (s *Service) appendTelemetrySample(run *model.Run, sample model.TelemetrySa
 		run.ResourceGap = true
 		return false, err
 	}
+	s.notifyTelemetryChange(run.ID)
 	at := sample.ObservedAt
 	run.LastResourceSampleAt = &at
 	return true, nil
@@ -142,7 +152,11 @@ func (s *Service) recordTelemetryGap(run *model.Run, to time.Time, reason string
 		gap.DroppedPoints = 1
 	}
 	run.ResourceGap = true
-	return s.store.AppendTelemetryGap(run.ID, gap)
+	if err := s.store.AppendTelemetryGap(run.ID, gap); err != nil {
+		return err
+	}
+	s.notifyTelemetryChange(run.ID)
+	return nil
 }
 
 func telemetryGapNeeded(last *time.Time, createdAt, observedAt time.Time, intervalMs int64) (time.Time, bool) {

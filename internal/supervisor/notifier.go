@@ -24,6 +24,7 @@ type runtimeNotifier struct {
 type runtimeSubscription struct {
 	owner *runtimeNotifier
 	id    uint64
+	op    string
 	runID string
 	all   bool
 	wake  chan struct{}
@@ -42,8 +43,18 @@ func (n *runtimeNotifier) Subscribe(ctx context.Context, request protocol.Reques
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	valid := request.Op == "watch" && request.RunID == "" ||
-		(request.Op == "events" || request.Op == "output") && request.RunID != ""
+	runID := request.RunID
+	if request.Op == "telemetry" && request.TelemetryQuery != nil {
+		if runID != "" && request.TelemetryQuery.RunID != "" && runID != request.TelemetryQuery.RunID {
+			return nil, errors.New("invalid observation subscription")
+		}
+		if runID == "" {
+			runID = request.TelemetryQuery.RunID
+		}
+	}
+	valid := request.Op == "watch" && runID == "" ||
+		(request.Op == "events" || request.Op == "output") && runID != "" ||
+		request.Op == "telemetry" && request.TelemetryQuery != nil && runID != ""
 	if !valid {
 		return nil, errors.New("invalid observation subscription")
 	}
@@ -56,7 +67,7 @@ func (n *runtimeNotifier) Subscribe(ctx context.Context, request protocol.Reques
 		return nil, errors.New("observation subscription limit reached")
 	}
 	n.next++
-	sub := &runtimeSubscription{owner: n, id: n.next, runID: request.RunID, all: request.Op == "watch", wake: make(chan struct{}, 1), done: make(chan struct{})}
+	sub := &runtimeSubscription{owner: n, id: n.next, op: request.Op, runID: runID, all: request.Op == "watch", wake: make(chan struct{}, 1), done: make(chan struct{})}
 	n.waiters[sub.id] = sub
 	return sub, nil
 }
@@ -69,6 +80,25 @@ func (n *runtimeNotifier) notify(runID string) {
 	}
 	for _, sub := range n.waiters {
 		if !sub.all && sub.runID != runID {
+			continue
+		}
+		select {
+		case sub.wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// notifyTelemetry wakes only telemetry followers for the Run. High-rate
+// samples must not wake lifecycle, output, or all-Run watch subscriptions.
+func (n *runtimeNotifier) notifyTelemetry(runID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return
+	}
+	for _, sub := range n.waiters {
+		if sub.op != "telemetry" || sub.runID != runID {
 			continue
 		}
 		select {

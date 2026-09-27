@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yohn-jp/jinushi/internal/ipc"
+	"github.com/yohn-jp/jinushi/internal/model"
 	"github.com/yohn-jp/jinushi/internal/protocol"
 )
 
@@ -65,5 +67,58 @@ func TestRuntimeNotifierCloseReleasesWaiters(t *testing.T) {
 	sub.Close()
 	if _, err := n.Subscribe(context.Background(), protocol.Request{Op: "watch"}); !errors.Is(err, errNotifierClosed) {
 		t.Fatalf("subscription after close = %v", err)
+	}
+}
+
+func TestRuntimeNotifierRoutesTelemetryOnlyToMatchingTelemetryFollow(t *testing.T) {
+	n := newRuntimeNotifier()
+	telemetry, err := n.Subscribe(context.Background(), protocol.Request{
+		Op: "telemetry", RunID: "run_1", TelemetryQuery: &model.TelemetryQuery{RunID: "run_1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer telemetry.Close()
+	events, err := n.Subscribe(context.Background(), protocol.Request{Op: "events", RunID: "run_1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+	other, err := n.Subscribe(context.Background(), protocol.Request{
+		Op: "telemetry", RunID: "run_2", TelemetryQuery: &model.TelemetryQuery{RunID: "run_2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	watch, err := n.Subscribe(context.Background(), protocol.Request{Op: "watch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watch.Close()
+
+	n.notifyTelemetry("run_1")
+	ready, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := telemetry.Wait(ready); err != nil {
+		t.Fatalf("matching telemetry follow missed wake: %v", err)
+	}
+	for _, check := range []struct {
+		sub  ipc.Subscription
+		name string
+	}{{events, "lifecycle"}, {other, "another Run"}, {watch, "all-Run watch"}} {
+		short, stop := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		err := check.sub.Wait(short)
+		stop()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("telemetry sample woke %s follow: %v", check.name, err)
+		}
+	}
+	n.notify("run_1")
+	if err := telemetry.Wait(ready); err != nil {
+		t.Fatalf("lifecycle change did not wake telemetry follow for terminal detection: %v", err)
+	}
+	if err := watch.Wait(ready); err != nil {
+		t.Fatalf("lifecycle change did not wake all-Run watch: %v", err)
 	}
 }
