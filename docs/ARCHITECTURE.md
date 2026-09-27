@@ -298,13 +298,11 @@ Output retention is evidence transport, not semantic logging. Jinushi does not p
 
 Resource telemetry is a first-class execution surface, not an optional diagnostic.
 
-At minimum, where supported, Jinushi records time-series observations for:
+At minimum, where supported, Jinushi records time-series resource observations for:
 
-- wall-clock elapsed time;
 - distinct process count and, separately on Linux, kernel task/PID count;
 - current and peak memory/RSS;
 - CPU consumption/delta;
-- output bytes;
 - process-tree membership changes;
 - physical activity timestamps.
 
@@ -312,6 +310,11 @@ Linux process evidence may include PID plus start identity, parent and
 membership observations, safe `comm`, and per-process CPU/RSS metrics. Linux
 cgroup I/O counters and CPU/memory/I/O PSI are reported only where the selected
 backend and kernel expose them.
+
+Wall-clock elapsed time is derived from Run timestamps. Output byte totals and
+retained ranges come from output metadata/events. These Run-level facts are
+available alongside high-rate telemetry; they are not fields sampled into each
+resource telemetry point.
 
 Additional platform metrics may be exposed when their meaning is stable.
 
@@ -601,10 +604,14 @@ Each Run is bounded internally, but a resident runtime must also bound the numbe
 Jinushi therefore owns retention/GC policy for terminal physical evidence, including:
 
 - terminal retention age/count;
-- global state byte ceilings;
+- a logical byte ceiling for terminal Run evidence and retained tombstones;
 - output/event/telemetry eviction;
 - preservation of a minimal receipt/tombstone where configured;
 - store compaction when deletion does not reclaim physical storage automatically.
+
+Live/non-terminal Run records and independently bounded idempotency, control,
+and watch indexes are outside the terminal evidence byte ceiling. Store status
+reports logical evidence use separately from physical database/page use.
 
 GC never changes a live Run and never turns missing historical evidence into a complete history claim.
 

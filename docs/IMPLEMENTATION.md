@@ -218,7 +218,7 @@ The data model must preserve:
 - terminal receipt;
 - reconciliation status.
 
-The current implementation uses bbolt as the embedded transactional store for Run state, lifecycle/control events, and imported output metadata. A durable per-Run guardian owns the OS backend, maintains a bounded output ring and physical snapshots, and lets the supervisor reconcile after restart.
+The current implementation uses bbolt as the embedded transactional store for Run state, lifecycle/control events, separately bounded telemetry, output metadata, retention records, and indexes. A durable per-Run guardian owns the OS backend, maintains a bounded output ring and physical snapshots, and lets the supervisor reconcile after restart.
 
 The architecture requires crash-consistent transactional state; bbolt is the current implementation authority. Changing the store is not a Wave 2 objective unless a concrete contract defect requires it.
 
@@ -256,9 +256,10 @@ Requirements:
 - compaction without pretending history is complete;
 - critical lifecycle events preserved at least through terminal receipt construction.
 
-The Wave 2 design stores high-rate telemetry separately with its own bounded
-compaction policy. The current supervisor still writes `resource.sample` events
-to this journal; that #6 migration remains incomplete as recorded in §24.
+High-rate telemetry is stored separately with its own bounded raw/aggregate/gap
+retention and query cursor. The lifecycle/control journal retains typed events,
+including explicit resource-gap/unavailable evidence, without consuming its
+capacity for every high-rate sample.
 
 ## 10. Output spool
 
@@ -567,18 +568,19 @@ These belong to higher layers or require a separate architecture decision.
 
 ## 24. Current implementation baseline
 
-At the documentation review HEAD `0d154cac`, the initial architecture has been implemented beyond the original package sketch. The current runtime topology is:
+At the documentation review HEAD `651e818`, the initial architecture has been implemented beyond the original package sketch. The current runtime topology is:
 
 ```text
 CLI / local client
       |
       v
 Supervisor
-  |-- bbolt Run/event/output metadata
+  |-- bbolt Run/event/output/telemetry/retention metadata
   |-- local IPC
   |-- reconciliation
   |-- host-envelope admission/status
-  |-- bounded event/output subscriptions
+  |-- bounded event/output subscriptions and all-Run watch
+  |-- terminal retention and online compaction
   |
   +-- per-Run Guardian
         |-- durable descriptor/status
@@ -593,18 +595,18 @@ Supervisor
               +-- PTY
 ```
 
-Wave 2 evolves this implementation rather than recreating the original package proposal. The initial audit findings were recorded against `main@06d34423b1a466c828ad69eab5794248555527ea`; they are historical baseline findings, not a list of current open defects. Track status at this review HEAD is:
+Wave 2 evolves this implementation rather than recreating the original package proposal. The initial audit findings were recorded against `main@06d34423b1a466c828ad69eab5794248555527ea`; they are historical baseline findings, not a list of current open defects. Code-track status at this review HEAD is:
 
 | Issue / track | Status | Current implementation and remaining acceptance work |
 | --- | --- | --- |
-| #4 / A — canonical contract | Complete | Typed/versioned event vocabulary, process/task distinction, frozen per-Run effective capabilities, aggregate stdout/stderr/PTY retention, fast-terminal receipt preservation, deadline ownership, and Linux state/shutdown hardening are in the shared/runtime code. |
-| #5 / B — idempotent control | Complete | Run submissions bind caller identity to accepted-spec digest; control mutations use request identity and current generation where retry duplication matters. |
-| #6 / C — physical evidence | Partial | Linux Guardian/model and bounded store primitives carry process identity/evidence and time-series telemetry. The supervisor still writes high-rate `resource.sample` events into the lifecycle journal, and no end-to-end supervisor protocol query/client telemetry acceptance path is complete. |
-| #7 / D — host safety envelope | Complete | Linux workload envelope configuration, admission checks, capability/status projection, and active-Run/memory/task ceilings are implemented. Actual cgroup delegation and kernel pressure availability remain host-dependent. |
-| #8 / E — subscriptions and input writer | Partial | Bounded event/output follow and all-Run watch, reconnectable cursors, and writer leases are implemented. The CLI attach path still polls output/terminal state and subscription acceptance is not complete. |
-| #9 / F — operational lifetime controls | Pending | The runtime contract in [WAVE2.md](WAVE2.md) remains the requirement. The issue is still open; no end-to-end completion is claimed for terminal GC/status usage, capability-gated pause/resume and mutable controls, or Guardian-loss recovery. |
+| #4 / A — canonical contract | Implemented | Typed/versioned event vocabulary, process/task distinction, frozen per-Run effective capabilities, aggregate stdout/stderr/PTY retention, fast-terminal receipt preservation, deadline ownership, and Linux state/shutdown hardening are in the shared/runtime code. |
+| #5 / B — idempotent control | Implemented | Run submissions bind caller identity to accepted-spec digest; retry-sensitive control mutations use request identity and current generation. |
+| #6 / C — physical evidence | Partial | Bounded process identity/evidence and raw/aggregate/gap telemetry are persisted separately from lifecycle/control events and exposed through the local protocol query. Telemetry window subscriptions remain unimplemented at this review HEAD. Linux I/O/PSI values remain capability/status-dependent. |
+| #7 / D — host safety envelope | Implemented | Linux workload envelope configuration, admission checks, capability/status projection, and active-Run/memory/task ceilings are implemented. Actual cgroup delegation and kernel pressure availability remain host-dependent. |
+| #8 / E — subscriptions and input writer | Partial | Bounded event/output follow and all-Run watch use reconnectable cursors; interactive attach and mutations use single-writer leases while allowing multiple observers. Telemetry window follow remains unimplemented at this review HEAD. |
+| #9 / F — operational lifetime controls | Implemented | Automatic terminal collection, tombstones, status usage, online compaction, capability-gated pause/resume and mutable controls, and Guardian-loss recovery are wired through the supervisor. Unsupported or unsafe environment capabilities remain explicit. |
 
-Windows remains experimental and frozen; shared type changes are compile maintenance only. No manual real-machine certification was performed for this documentation pass. Automated tests do not establish cgroup delegation, PSI visibility, or other kernel-specific capability on a deployment host; those must remain unsupported/blocked unless actual runtime discovery and the target environment prove them.
+The Epic #3 Canonical Audit remains a separate final verification step; this status table does not mark that audit complete. Windows remains experimental and frozen; shared type changes are compile maintenance only. No manual real-machine certification was performed for this documentation pass. Automated tests do not establish cgroup delegation, PSI visibility, or other kernel-specific capability on a deployment host; those must remain unsupported/blocked unless actual runtime discovery and the target environment prove them.
 
 ## 25. Wave 2 implementation programme
 

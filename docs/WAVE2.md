@@ -151,17 +151,18 @@ Completion gate: long-running use has bounded historical state and an explicit r
 
 ## Current implementation status
 
-This status snapshot was reviewed against `main@0d154cac`:
+This status snapshot was reviewed against `main@651e818`:
 
 | Track / issue | Status | Notes |
 | --- | --- | --- |
-| A / #4 — canonical contract | Complete | Shared event, process/task, capability, receipt, retention, deadline, and Linux safety contracts are implemented. |
-| B / #5 — idempotent control | Complete | Run submission and retry-sensitive control identities are implemented. |
-| C / #6 — physical evidence | Partial | Linux process evidence and bounded Guardian/store telemetry pieces exist. The supervisor still writes high-rate `resource.sample` events into the lifecycle journal; supervisor-to-client telemetry query and acceptance coverage remain incomplete. |
-| D / #7 — host envelope | Complete | Host workload limits, admission, capability reporting, and status projection are implemented. Host-specific cgroup and kernel proofs remain environment-dependent. |
-| E / #8 — observation and writer ownership | Partial | Event/output subscriptions, all-Run watch, reconnectable cursors, and writer leases exist. Interactive CLI attach still polls for output/terminal state, so the track acceptance gate remains open. |
-| F / #9 — operational lifetime | Pending | Terminal GC/status integration, capability-gated pause/resume and mutable controls, and Guardian-loss recovery remain governed by this track's requirements and the runtime/architecture contracts. |
+| A / #4 — canonical contract | Implemented | Shared event, process/task, capability, receipt, retention, deadline, and Linux safety contracts are implemented. |
+| B / #5 — idempotent control | Implemented | Run submission and retry-sensitive control identities are implemented. |
+| C / #6 — physical evidence | Partial | Per-process Linux evidence and bounded raw/aggregate/gap telemetry are persisted separately from lifecycle events and exposed through the local protocol query. Telemetry window subscriptions remain unimplemented at this review HEAD. Kernel I/O/PSI availability remains capability-dependent. |
+| D / #7 — host envelope | Implemented | Host workload limits, admission, capability reporting, and host status projection are implemented. Host-specific cgroup and kernel proofs remain environment-dependent. |
+| E / #8 — observation and writer ownership | Partial | Event, output, PTY, and bounded all-Run watch follow use reconnectable cursors; interactive input and resize use single-writer leases. Telemetry window subscriptions remain unimplemented at this review HEAD. |
+| F / #9 — operational lifetime | Implemented | Automatic terminal GC/tombstones, status usage, bbolt online compaction, capability-gated pause/resume and mutable controls, and fail-closed Guardian-loss recovery are wired through the Supervisor. |
 
+These code-track statuses do not complete Epic #3's separate Canonical Audit.
 No manual real-machine certification is claimed. Code-level tests do not prove
 cgroup delegation, PSI availability, or other kernel-specific guarantees; report
 those as unsupported or blocked unless the target environment proves them.

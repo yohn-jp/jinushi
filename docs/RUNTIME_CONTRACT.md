@@ -280,15 +280,20 @@ resize activity, and bounded process lifecycle changes where the selected
 backend can observe them. Every metric preserves measured, unavailable, or
 unsupported status.
 
-Initial Run-level metrics:
+The Run observation and terminal receipt project measured resource values and
+their evidence status. The telemetry sample itself contains time-series
+resource, I/O, PSI, activity, and process evidence; wall time is derived from
+Run start/finish timestamps, and output byte totals are carried by output
+metadata and output events rather than sampled as resource counters.
+
+Initial time-series metrics include:
 
 - current memory;
 - peak memory;
 - CPU time/delta;
 - process count and, separately, Linux task/PID count;
-- output byte counts;
 - process membership change;
-- wall time.
+- I/O counters, PSI, and physical input/resize activity where available.
 
 The telemetry lane is bounded independently from the lifecycle/control journal.
 Raw samples may be compacted into coarser aggregates; responses report the
@@ -458,6 +463,11 @@ Illustrative shape:
     "pty": {"observedBytes": 0, "retainedBytes": 0, "retainedFrom": 0, "truncated": false},
     "historyComplete": false
   },
+  "eventFirstSeq": 1,
+  "eventLastSeq": 24,
+  "eventRetainedFrom": 2,
+  "eventHistoryComplete": false,
+  "evidenceIncomplete": true,
   "termination": {
     "requested": false,
     "forced": false
@@ -530,6 +540,10 @@ jinushi output
 jinushi attach
 jinushi signal
 jinushi cancel
+jinushi pause
+jinushi resume
+jinushi memory-high
+jinushi cpu-quota
 jinushi capabilities
 jinushi status
 jinushi lease renew
@@ -540,9 +554,10 @@ jinushi resize
 ```
 
 `watch` has a bounded all-Run page/follow surface with a reconnectable opaque
-cursor. Event and output follow operations report retained-history gaps. The
-interactive `attach` CLI currently retains a bounded polling path for terminal
-observation; subscription support is still being completed.
+cursor. Event and output follow, including PTY attach output, use runtime
+subscriptions and report retained-history gaps. The `telemetry` operation is
+available through the local protocol for bounded telemetry queries; there is
+not a dedicated telemetry CLI command.
 
 The resident service is started with `jinushi supervisor`; its lifecycle remains independent of client command lifetimes.
 
@@ -558,13 +573,25 @@ Initial configuration concerns:
 - telemetry sampling bounds;
 - termination grace defaults;
 - backend capability policy;
-- maximum runtime-wide safety ceilings.
+- maximum runtime-wide safety ceilings;
+- terminal evidence age/count/logical-byte policy, tombstone bounds, and
+  compaction thresholds.
 
 The supervisor's Linux host envelope may set aggregate workload ceilings for
 memory bytes, task/PID count, and maximum active Runs. A zero value disables
 that individual optional host ceiling. Host-envelope status reports measured,
 unavailable, and unsupported values distinctly; it does not make scheduling
 recommendations.
+
+Terminal retention defaults to 30 days, 10,000 detailed terminal Runs, and
+512 MiB of logical terminal evidence. Preserved tombstones default to a 100,000
+count and 30-day age limit. `maxStateBytes` covers logical terminal Run evidence
+and tombstones; live/non-terminal Runs and independently bounded indexes are
+excluded. `status` separately reports logical store use, database file/page
+usage, retention checkpoints, budget state, and compaction status. Collection
+runs at startup and periodically; only terminal Runs with a complete receipt
+are eligible. When details are collected, `inspect` and `await` can return a
+compact terminal tombstone that explicitly marks evidence incomplete.
 
 Per-Run requests can narrow allowed limits but must not exceed supervisor-wide maxima.
 
@@ -638,7 +665,13 @@ Event payloads use bounded typed/versioned shapes. Free-form nested arbitrary JS
 
 ### 23.6 Telemetry stream
 
-High-rate resource telemetry is exposed separately from the lifecycle/control journal.
+High-rate resource telemetry is exposed separately from the lifecycle/control
+journal. The local protocol `telemetry` operation accepts a bounded
+`TelemetryQuery` (`runId`, optional time bounds, `resolution`, `limit`, and
+cursor) and returns raw samples, aggregates, gaps, retained-range metadata, and
+history completeness. Resolution is `raw`, `10s`, or `adaptive`; telemetry
+cursors are independent of event sequence numbers and may become stale after
+compaction.
 
 Telemetry queries/subscriptions expose:
 
@@ -655,7 +688,7 @@ Downsampling/compaction must not erase the fact that a gap or lower-resolution i
 
 ### 23.7 Host safety status
 
-`status` becomes a bounded physical-runtime status surface.
+`status` is a bounded physical-runtime status surface.
 
 It may report:
 
@@ -669,9 +702,13 @@ It may report:
 
 Status does not expose task scheduling recommendations.
 
+The current response includes the host envelope and `RuntimeStatus` store and
+retention projections, including logical/physical byte use, evictions,
+tombstones, budget state, and compaction outcome.
+
 ### 23.8 All-Run watch
 
-A local watch/subscription surface may multiplex physical events for multiple/all Runs.
+A local watch/subscription surface multiplexes physical events for multiple/all Runs.
 
 It must provide reconnectable cursor/watermark semantics so a consumer can detect missed history. It does not replace per-Run sequence ordering; cross-Run ordering is observation order only unless a dedicated global sequence is explicitly provided.
 
@@ -693,6 +730,12 @@ No GC operation may mutate or delete a live, starting, terminating, or reconcili
 
 Historical absence caused by GC is never reported as complete evidence.
 
+The resident Supervisor runs collection at startup and on the configured
+retention interval. The default policy bounds terminal age/count/logical bytes
+and retained tombstones. `inspect` and `await` preserve queryable terminal
+identity/outcome after detailed evidence collection when tombstones are enabled;
+the compact receipt and tombstone summary mark the removed evidence incomplete.
+
 ### 23.11 Pause/resume and mutable physical controls
 
 Where Linux capabilities permit, Jinushi may expose physical `pause`/`resume` and bounded mutable resource controls.
@@ -700,6 +743,11 @@ Where Linux capabilities permit, Jinushi may expose physical `pause`/`resume` an
 Pause/resume maps to owned execution suspension such as cgroup freeze/thaw and is recorded as physical control evidence.
 
 Mutable resource controls are accepted only when the backend can enforce their declared semantics. Jinushi never chooses new limits or priorities by itself.
+
+The current Linux control surface includes capability-gated pause/resume,
+`memory.high`, and CPU quota changes. These operations use request identity and
+Run generation, and persist typed control evidence; unsupported controls fail
+explicitly.
 
 ### 23.12 Guardian-loss recovery
 

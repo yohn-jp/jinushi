@@ -83,11 +83,22 @@ The supervisor reads optional `config.json` from its state directory at startup.
   "eventRetentionBytes": 16777216,
   "hostMemoryBytes": 0,
   "hostTaskCount": 0,
-  "maxActiveRuns": 0
+  "maxActiveRuns": 0,
+  "retentionIntervalMs": 60000,
+  "retention": {
+    "maxAgeMs": 2592000000,
+    "maxTerminalRuns": 10000,
+    "maxStateBytes": 536870912,
+    "preserveTombstones": true,
+    "maxTombstones": 100000,
+    "maxTombstoneAgeMs": 2592000000,
+    "compactMinFreeBytes": 67108864,
+    "compactMinFreeRatio": 0.25
+  }
 }
 ```
 
-The three optional host envelope settings default to zero, which disables that ceiling. `status` reports host envelope capability and current aggregate workload evidence. Other per-Run supervisor ceilings are `maxWallTimeMs`, `maxMemoryBytes`, `maxProcessCount`, and `maxTaskCount`; Run requests may narrow them. On Linux, `--task-count` maps to cgroup v2 `pids.max` when delegated; `--process-count` is rejected because that controller counts threads as well as processes. The state directory is local private runtime data, and environment values are not returned by normal Run observation.
+The three optional host envelope settings default to zero, which disables that ceiling. `status` reports host envelope capability and current aggregate workload evidence along with store usage, retention counters, and bbolt compaction state. The `retention` policy applies age/count/logical-byte limits to terminal Run evidence and retained tombstones; `maxStateBytes` is not a physical database-file limit. The database and its logical contents are both reported by `status`. Other per-Run supervisor ceilings are `maxWallTimeMs`, `maxMemoryBytes`, `maxProcessCount`, and `maxTaskCount`; Run requests may narrow them. On Linux, `--task-count` maps to cgroup v2 `pids.max` when delegated; `--process-count` is rejected because that controller counts threads as well as processes. The state directory is local private runtime data, and environment values are not returned by normal Run observation.
 
 The per-Run output-retention limit is one aggregate byte ceiling shared by stdout, stderr, and PTY output. Retained offsets and gaps show when old bytes were compacted.
 
@@ -103,7 +114,11 @@ jinushi output <run-id>
 jinushi watch [--cursor CURSOR] [--follow]
 jinushi attach <run-id>
 jinushi signal --request-id ID --expected-generation N <run-id> <signal>
-jinushi cancel <run-id>
+jinushi cancel --request-id ID --expected-generation N <run-id>
+jinushi pause --request-id ID --expected-generation N <run-id>
+jinushi resume --request-id ID --expected-generation N <run-id>
+jinushi memory-high --bytes N --request-id ID --expected-generation N <run-id>
+jinushi cpu-quota --percent N --request-id ID --expected-generation N <run-id>
 jinushi lease renew --generation N --lease-ms N <run-id>
 jinushi input --request-id ID --expected-generation N <run-id> <text>
 jinushi close-input --request-id ID --expected-generation N <run-id>
@@ -112,7 +127,7 @@ jinushi capabilities
 jinushi status
 ```
 
-Run submission and non-idempotent physical mutations use caller-provided retry identities/current generation. `watch` provides bounded all-Run event pages and reconnectable cursors; event/output follow modes subscribe to runtime notifications.
+Run submission and non-idempotent physical mutations use caller-provided retry identities/current generation. `watch` provides bounded all-Run event pages and reconnectable cursors; event/output/PTY attach follow modes use runtime notifications. Pause, resume, and mutable resource controls are accepted only when the Run's effective backend capabilities permit them.
 
 ## What Jinushi observes
 
@@ -131,7 +146,9 @@ Jinushi records physical execution facts, including:
 - explicit signals, cancellation, forced termination, and cleanup outcome;
 - a terminal receipt describing the final physical execution outcome.
 
-Resource telemetry is time-series evidence, not only a final peak. Linux Guardian sampling now carries bounded process evidence, but high-rate samples still enter the lifecycle event journal in the current supervisor path, and the supervisor-to-client telemetry query and long-run acceptance path are still being completed. A recorded sample does not imply complete history: unsupported metrics, unavailable intervals, aggregation resolution, and gaps remain explicit.
+Resource telemetry is time-series evidence, not only a final peak. High-rate samples are stored separately from the lifecycle/control journal. The local protocol's `telemetry` operation returns bounded raw samples and coarser aggregates with process identity/evidence, I/O/PSI values where supported, resolution, retained ranges, and gaps. There is no dedicated telemetry CLI command. Output byte totals and elapsed wall time are available through Run/output events and the terminal receipt rather than the high-rate telemetry sample itself.
+
+Terminal retention runs automatically on supervisor startup and at `retentionIntervalMs`. It only collects terminal Runs with a complete receipt. When configured to preserve tombstones, later `inspect` and `await` calls return the compact terminal outcome and an explicit incomplete-evidence marker after detailed evidence has been removed.
 
 ## AI-native without agent semantics
 
