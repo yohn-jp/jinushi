@@ -80,6 +80,14 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, runSuper
 		return attachCommand(ctx, args[1:], stdout, stderr)
 	case "signal":
 		return signalCommand(ctx, args[1:], stdout, stderr)
+	case "pause":
+		return physicalControlCommand(ctx, "pause", args[1:], stdout, stderr)
+	case "resume":
+		return physicalControlCommand(ctx, "resume", args[1:], stdout, stderr)
+	case "memory-high":
+		return physicalControlCommand(ctx, "memory-high", args[1:], stdout, stderr)
+	case "cpu-quota":
+		return physicalControlCommand(ctx, "cpu-quota", args[1:], stdout, stderr)
 	case "cancel":
 		return controlIDCommand(ctx, "cancel", args[1:], stdout, stderr)
 	case "capabilities":
@@ -1531,6 +1539,10 @@ Usage:
   jinushi output [--stream stdout|stderr|pty] [--offset N] [--limit N] [--follow] <run-id>
   jinushi attach [--rows N --cols N] <run-id>
   jinushi signal <run-id> <signal>
+  jinushi pause --request-id ID --expected-generation N <run-id>
+  jinushi resume --request-id ID --expected-generation N <run-id>
+  jinushi memory-high --bytes N --request-id ID --expected-generation N <run-id>
+  jinushi cpu-quota --percent N --request-id ID --expected-generation N <run-id>
   jinushi cancel <run-id>
   jinushi capabilities
   jinushi status
