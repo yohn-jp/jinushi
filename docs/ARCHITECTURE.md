@@ -301,12 +301,17 @@ Resource telemetry is a first-class execution surface, not an optional diagnosti
 At minimum, where supported, Jinushi records time-series observations for:
 
 - wall-clock elapsed time;
-- process count;
+- distinct process count and, separately on Linux, kernel task/PID count;
 - current and peak memory/RSS;
 - CPU consumption/delta;
 - output bytes;
 - process-tree membership changes;
 - physical activity timestamps.
+
+Linux process evidence may include PID plus start identity, parent and
+membership observations, safe `comm`, and per-process CPU/RSS metrics. Linux
+cgroup I/O counters and CPU/memory/I/O PSI are reported only where the selected
+backend and kernel expose them.
 
 Additional platform metrics may be exposed when their meaning is stable.
 
@@ -338,9 +343,13 @@ Initial budget classes:
 
 - memory;
 - CPU quota/rate where supported;
-- process count;
+- process count where distinct process identities can be enforced;
+- Linux task/PID count where the delegated `pids` controller is available;
 - wall-clock timeout;
 - retained/output byte bounds.
+
+Linux cgroup v2 `pids.max` counts tasks, including threads. It cannot be
+presented as process-count enforcement.
 
 Budget policy is caller-selected. Enforcement is Jinushi-owned once the Run is accepted.
 
@@ -361,21 +370,24 @@ Representative event families:
 
 - `run.accepted`;
 - `run.starting`;
-- `run.started`;
-- `process.observed`;
+- `run.running` / `run.owned`;
 - `process.exited`;
-- `io.stdout`;
-- `io.stderr`;
+- `output.chunk` / `output.gap`;
 - `pty.attached` / `pty.detached`;
-- `resource.sample`;
+- `resource.gap` / `resource.unavailable`;
 - `limit.reached`;
-- `signal.sent`;
-- `termination.requested`;
+- `signal.requested` / `signal.delivered`;
+- `termination.requested` / `cancel.requested`;
+- `control.changed` / `control.recovered`;
 - `run.reconciling`;
+- `run.reconciled`;
 - `run.terminal`;
 - `run.uncertain`.
 
-Each event has a monotonic per-Run sequence number. Wall-clock timestamps are observations, never ordering authority by themselves.
+Each event has a schema version, bounded typed payload, and monotonic per-Run
+sequence number. Wall-clock timestamps are observations, never ordering
+authority by themselves. High-rate resource samples use the separate bounded
+telemetry lane, not the lifecycle/control journal.
 
 The event journal is bounded. If history is compacted, the API exposes the retained sequence watermark so consumers can detect the gap.
 
@@ -389,7 +401,9 @@ Every terminal Run has one final immutable execution receipt containing enough p
 - whether termination was requested/forced/limit-triggered;
 - aggregate resource usage;
 - process-tree cleanup result;
-- stdout/stderr observed and retained byte counts;
+- effective backend and capability evidence used by the Run;
+- stdout/stderr/PTY observed and retained byte counts;
+- separate process and task/PID resource counts;
 - event range;
 - platform/backend capability summary;
 - whether any evidence is incomplete.

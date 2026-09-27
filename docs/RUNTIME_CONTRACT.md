@@ -24,7 +24,7 @@ Illustrative machine shape:
   },
   "limits": {
     "memoryBytes": 8589934592,
-    "processCount": 64,
+    "taskCount": 256,
     "wallTimeMs": 14400000
   },
   "parentRunId": null,
@@ -140,7 +140,8 @@ Exit code zero is only a physical process fact. It does not mean semantic task s
 
 `inspect(runId)` returns one bounded current physical snapshot.
 
-Illustrative result:
+Illustrative result (metric status is `measured`, `unavailable`, or
+`unsupported`; unavailable values are never encoded as zero):
 
 ```json
 {
@@ -148,8 +149,19 @@ Illustrative result:
   "state": "running",
   "generation": 4,
   "startedAt": "2026-09-27T03:00:00Z",
-  "processes": {
-    "observed": 7
+  "effectiveCapabilities": {
+    "backend": "linux-cgroup-v2",
+    "pty": true,
+    "memoryEnforcement": true,
+    "cpuQuotaEnforcement": true,
+    "processCountEnforcement": false,
+    "taskCountEnforcement": true,
+    "memoryTelemetry": true,
+    "cpuTelemetry": true,
+    "processTelemetry": true,
+    "taskTelemetry": true,
+    "restartReconciliation": "strong",
+    "signals": ["TERM", "KILL"]
   },
   "activity": {
     "lastOutputAt": "2026-09-27T03:04:11Z",
@@ -157,28 +169,33 @@ Illustrative result:
     "lastProcessChangeAt": "2026-09-27T03:03:59Z"
   },
   "resources": {
-    "memoryBytes": 612368384,
-    "peakMemoryBytes": 1308622848,
-    "cpuTimeNs": 81930112000,
-    "supported": ["memory", "cpu", "process-count"]
+    "memoryBytes": {"status": "measured", "value": 612368384},
+    "peakMemoryBytes": {"status": "measured", "value": 1308622848},
+    "cpuTimeNs": {"status": "measured", "value": 81930112000},
+    "processCount": {"status": "measured", "value": 7},
+    "taskCount": {"status": "measured", "value": 19},
+    "sampleIntervalMs": 250
   }
 }
 ```
 
-Unsupported or unavailable observations are explicit. They are not represented as zero.
+Process count means distinct process identities. Linux task count includes threads
+and is the count relevant to cgroup v2 `pids.max`. `effectiveCapabilities` records
+the backend and evidence/enforcement surfaces selected for this Run; it is not a
+fresh host capability probe.
 
 ## 6. Event stream
 
 Each Run owns an ordered event stream.
 
-Each event contains at least:
+Each event contains:
 
 - protocol/event schema version;
 - Run ID;
 - monotonically increasing sequence;
 - event kind;
 - observed timestamp;
-- bounded event body.
+- a bounded typed payload for its event kind.
 
 Illustrative event:
 
@@ -187,16 +204,22 @@ Illustrative event:
   "version": 1,
   "runId": "run_01...",
   "seq": 42,
-  "kind": "resource.sample",
+  "kind": "run.running",
   "observedAt": "2026-09-27T03:04:12Z",
-  "resource": {
-    "memoryBytes": 612368384,
-    "processCount": 7
+  "payload": {
+    "run": {
+      "state": "running",
+      "generation": 4
+    }
   }
 }
 ```
 
-Sequence, not wall-clock time, is the per-Run ordering authority.
+`version` identifies the typed event schema. The payload is a discriminated
+union: exactly one kind-specific branch is populated. Sequence, not wall-clock
+time, is the per-Run ordering authority. High-rate resource samples use the
+separate telemetry lane below and do not consume lifecycle/control journal
+capacity.
 
 Consumers can request events after a sequence. If requested history has already been compacted, Jinushi returns an explicit retained-from watermark/gap rather than pretending continuity.
 
@@ -204,14 +227,15 @@ Consumers can request events after a sequence. If requested history has already 
 
 Output is both streamable and boundedly retained.
 
-For stdout/stderr Jinushi records:
+For stdout, stderr, and PTY output Jinushi records:
 
 - total observed bytes;
 - retained bytes;
 - truncation/compaction state;
 - sequence/window information needed to detect lost historical output.
 
-A slow reader must not force Jinushi to retain unbounded memory.
+A Run's output streams share one aggregate retention ceiling. A slow reader must
+not force Jinushi to retain unbounded memory.
 
 The implementation may spool to disk and stream from the spool. Retention policy is explicit and bounded.
 
@@ -246,17 +270,30 @@ Sampling may combine periodic sampling and OS-native event notification. The con
 - gaps/unavailable periods;
 - aggregation used in the final receipt.
 
-Initial metrics:
+Linux telemetry distinguishes process leaders from kernel tasks and may include
+per-process evidence identified by PID plus process start identity. Process
+records may include parent/membership observations, safe `comm`, and CPU/RSS
+metrics; raw argv and environment values are excluded by default.
+
+The telemetry schema also allows I/O counters, PSI pressure, physical input and
+resize activity, and bounded process lifecycle changes where the selected
+backend can observe them. Every metric preserves measured, unavailable, or
+unsupported status.
+
+Initial Run-level metrics:
 
 - current memory;
 - peak memory;
 - CPU time/delta;
-- process count;
+- process count and, separately, Linux task/PID count;
 - output byte counts;
 - process membership change;
 - wall time.
 
-Where meaningful and stable, platform backends may add I/O and other resource metrics behind capability discovery.
+The telemetry lane is bounded independently from the lifecycle/control journal.
+Raw samples may be compacted into coarser aggregates; responses report the
+resolution, retained range, and any gaps so a missing sample is never mistaken
+for a measured zero or complete history.
 
 ## 10. Resource limits
 
@@ -401,15 +438,25 @@ Illustrative shape:
   "signal": null,
   "startedAt": "2026-09-27T03:00:00Z",
   "finishedAt": "2026-09-27T03:10:13Z",
-  "resource": {
-    "peakMemoryBytes": 1308622848,
-    "cpuTimeNs": 81930112000,
-    "peakProcessCount": 12
+  "resources": {
+    "peakMemoryBytes": {"status": "measured", "value": 1308622848},
+    "cpuTimeNs": {"status": "measured", "value": 81930112000},
+    "peakProcessCount": {"status": "measured", "value": 12},
+    "peakTaskCount": {"status": "measured", "value": 37}
+  },
+  "effectiveCapabilities": {
+    "backend": "linux-cgroup-v2",
+    "taskCountEnforcement": true,
+    "memoryTelemetry": true,
+    "cpuTelemetry": true,
+    "processTelemetry": true,
+    "taskTelemetry": true
   },
   "output": {
-    "stdoutObservedBytes": 188416,
-    "stderrObservedBytes": 2048,
-    "historyComplete": true
+    "stdout": {"observedBytes": 188416, "retainedBytes": 65536, "retainedFrom": 122880, "truncated": true},
+    "stderr": {"observedBytes": 2048, "retainedBytes": 2048, "retainedFrom": 0, "truncated": false},
+    "pty": {"observedBytes": 0, "retainedBytes": 0, "retainedFrom": 0, "truncated": false},
+    "historyComplete": false
   },
   "termination": {
     "requested": false,
@@ -421,7 +468,10 @@ Illustrative shape:
 }
 ```
 
-The final schema must carry explicit incompleteness/unsupported states where applicable.
+Resource fields carry explicit measured/unavailable/unsupported status. The
+receipt's `effectiveCapabilities` is authoritative; `capabilities` remains a
+deprecated Protocol v1 compatibility projection of the same frozen value.
+Evidence incompleteness and output/event retention watermarks remain explicit.
 
 ## 19. Capability discovery
 
@@ -437,6 +487,9 @@ Examples:
 - time-series memory/CPU;
 - restart reconciliation strength;
 - supported signal set.
+
+Host capability discovery does not replace the effective capability snapshot
+persisted for an accepted Run and copied into its terminal receipt.
 
 A client can therefore choose whether an unavailable capability is acceptable. Jinushi never silently weakens an accepted requirement.
 
@@ -473,14 +526,25 @@ jinushi list
 jinushi inspect
 jinushi await
 jinushi events
+jinushi output
 jinushi attach
 jinushi signal
 jinushi cancel
 jinushi capabilities
 jinushi status
+jinushi lease renew
+jinushi watch
+jinushi input
+jinushi close-input
+jinushi resize
 ```
 
-A resident supervisor command/service entry point is also required, but its exact lifecycle UX is implementation detail until the first executable milestone.
+`watch` has a bounded all-Run page/follow surface with a reconnectable opaque
+cursor. Event and output follow operations report retained-history gaps. The
+interactive `attach` CLI currently retains a bounded polling path for terminal
+observation; subscription support is still being completed.
+
+The resident service is started with `jinushi supervisor`; its lifecycle remains independent of client command lifetimes.
 
 ## 22. Configuration
 
@@ -496,6 +560,12 @@ Initial configuration concerns:
 - backend capability policy;
 - maximum runtime-wide safety ceilings.
 
+The supervisor's Linux host envelope may set aggregate workload ceilings for
+memory bytes, task/PID count, and maximum active Runs. A zero value disables
+that individual optional host ceiling. Host-envelope status reports measured,
+unavailable, and unsupported values distinctly; it does not make scheduling
+recommendations.
+
 Per-Run requests can narrow allowed limits but must not exceed supervisor-wide maxima.
 
 Configuration contains no repository, Issue, PR, model, or agent policy.
@@ -503,7 +573,7 @@ Configuration contains no repository, Issue, PR, model, or agent policy.
 
 ## 23. Wave 2 contract extensions
 
-The following contracts are authoritative for Wave 2. They extend Protocol v1 semantics; exact wire field names may be finalized during implementation, but their meaning must remain stable.
+The following contracts are authoritative for Wave 2. They extend Protocol v1 semantics. Where the current implementation has finalized wire fields, the field names below and in the shared model are the compatibility surface; the meanings remain normative.
 
 ### 23.1 Idempotent Run submission
 

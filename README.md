@@ -61,14 +61,15 @@ go build -o jinushi ./cmd/jinushi
 Submit a command from another terminal. The JSON response contains the stable `runId`; use it for observation and control:
 
 ```sh
-./jinushi run --state-dir ./jinushi-state -- /bin/sh -c 'printf hello'
+./jinushi run --state-dir ./jinushi-state --submission-id run-unique-1 -- /bin/sh -c 'printf hello'
 ./jinushi await --state-dir ./jinushi-state <run-id>
 ./jinushi output --state-dir ./jinushi-state <run-id>
 ./jinushi events --state-dir ./jinushi-state <run-id>
 ./jinushi capabilities --state-dir ./jinushi-state
+./jinushi status --state-dir ./jinushi-state
 ```
 
-On Windows, supply a Windows executable instead of `/bin/sh`. `run --wait` waits for the physical terminal receipt. Closing a client does not cancel a detached Run. Hard resource limits are accepted only when `capabilities` reports native enforcement on that host.
+Use a fresh caller-generated `--submission-id` for each new Run and reuse that same ID when retrying an ambiguous submission. `run --wait` waits for the physical terminal receipt. Closing a client does not cancel a detached Run. Hard resource limits are accepted only when `capabilities` reports native enforcement on that host. Linux is the Wave 2 authority; the existing Windows backend is experimental and frozen, with no Wave 2 parity or certification claim.
 
 The supervisor reads optional `config.json` from its state directory at startup. Omitted fields use built-in defaults; invalid or unknown fields prevent startup. For example:
 
@@ -79,26 +80,39 @@ The supervisor reads optional `config.json` from its state directory at startup.
   "defaultOutputBytes": 1048576,
   "maxOutputBytes": 67108864,
   "eventRetentionCount": 4096,
-  "eventRetentionBytes": 16777216
+  "eventRetentionBytes": 16777216,
+  "hostMemoryBytes": 0,
+  "hostTaskCount": 0,
+  "maxActiveRuns": 0
 }
 ```
 
-Other supervisor ceilings are `maxWallTimeMs`, `maxMemoryBytes`, `maxProcessCount`, and `maxTaskCount`. Per-Run requests may narrow these limits. On Linux, `--task-count` maps to cgroup v2 `pids.max` when delegated; `--process-count` is rejected because that controller counts threads as well as processes. The state directory is local private runtime data, and environment values are not returned by normal Run observation.
+The three optional host envelope settings default to zero, which disables that ceiling. `status` reports host envelope capability and current aggregate workload evidence. Other per-Run supervisor ceilings are `maxWallTimeMs`, `maxMemoryBytes`, `maxProcessCount`, and `maxTaskCount`; Run requests may narrow them. On Linux, `--task-count` maps to cgroup v2 `pids.max` when delegated; `--process-count` is rejected because that controller counts threads as well as processes. The state directory is local private runtime data, and environment values are not returned by normal Run observation.
+
+The per-Run output-retention limit is one aggregate byte ceiling shared by stdout, stderr, and PTY output. Retained offsets and gaps show when old bytes were compacted.
 
 Representative public operations:
 
 ```text
-jinushi run -- <executable> <args...>
+jinushi run --submission-id ID -- <executable> <args...>
 jinushi list
 jinushi inspect <run-id>
 jinushi await <run-id>
 jinushi events <run-id>
+jinushi output <run-id>
+jinushi watch [--cursor CURSOR] [--follow]
 jinushi attach <run-id>
-jinushi signal <run-id> <signal>
+jinushi signal --request-id ID --expected-generation N <run-id> <signal>
 jinushi cancel <run-id>
+jinushi lease renew --generation N --lease-ms N <run-id>
+jinushi input --request-id ID --expected-generation N <run-id> <text>
+jinushi close-input --request-id ID --expected-generation N <run-id>
+jinushi resize --rows N --cols N --request-id ID --expected-generation N <run-id>
+jinushi capabilities
+jinushi status
 ```
 
-Exact syntax is implementation work. The architecture requires equivalent machine-readable operations and stable Run identities.
+Run submission and non-idempotent physical mutations use caller-provided retry identities/current generation. `watch` provides bounded all-Run event pages and reconnectable cursors; event/output follow modes subscribe to runtime notifications.
 
 ## What Jinushi observes
 
@@ -109,13 +123,15 @@ Jinushi records physical execution facts, including:
 - child/descendant process membership;
 - exit code and signal;
 - stdout/stderr/PTY activity and retained-byte bounds;
-- wall time, CPU consumption, memory use, process count, and I/O observations where the OS exposes them;
+- wall time, CPU consumption, memory use, process count, and Linux task/PID count as separate metrics;
+- process-level CPU/RSS and membership evidence where the backend exposes it, without raw argv or environment;
+- I/O and PSI pressure observations where the kernel exposes them;
 - last physical activity evidence;
 - applied resource limits and limit-triggered termination;
 - explicit signals, cancellation, forced termination, and cleanup outcome;
 - a terminal receipt describing the final physical execution outcome.
 
-Resource telemetry is time-series evidence, not only a final peak. This makes it possible to attribute a host-level resource spike to an exact Run and process subtree.
+Resource telemetry is time-series evidence, not only a final peak. Linux Guardian sampling now carries bounded process evidence, but high-rate samples still enter the lifecycle event journal in the current supervisor path, and the supervisor-to-client telemetry query and long-run acceptance path are still being completed. A recorded sample does not imply complete history: unsupported metrics, unavailable intervals, aggregation resolution, and gaps remain explicit.
 
 ## AI-native without agent semantics
 

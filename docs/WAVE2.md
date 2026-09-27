@@ -12,13 +12,13 @@ Linux is authoritative.
 
 The existing Windows backend remains in the repository as an experimental, frozen implementation. Shared-contract work may keep it compiling, but Wave 2 does not require Windows parity, Windows certification, or new Windows features.
 
-## Audit findings that drive Wave 2
+## Audit findings at the original baseline
 
 The initial runtime is already substantial: resident supervisor, bbolt persistence, durable per-Run guardians, Linux cgroup/session ownership, PTY, bounded output, resource sampling, lease/deadline enforcement, restart reconciliation, terminal receipts, and broad Linux integration coverage are present.
 
 The next risks are therefore not missing basic process management. They are correctness under retries, long-lived/high-concurrency evidence, host-level pressure, and operational lifetime.
 
-The code audit identified these concrete items:
+The code audit identified these concrete items at that baseline; they are historical findings, not a statement that every item remains open on current `main`:
 
 1. Run creation is not idempotent across an ambiguous client retry.
 2. Linux `pids.max` task semantics are exposed through a process-count-shaped model.
@@ -148,6 +148,23 @@ Required work:
 Jinushi does not decide which Run should be paused, resumed, deprioritized, or removed for semantic reasons.
 
 Completion gate: long-running use has bounded historical state and an explicit recovery/control story for both host pressure and Guardian loss.
+
+## Current implementation status
+
+This status snapshot was reviewed against `main@0d154cac`:
+
+| Track / issue | Status | Notes |
+| --- | --- | --- |
+| A / #4 — canonical contract | Complete | Shared event, process/task, capability, receipt, retention, deadline, and Linux safety contracts are implemented. |
+| B / #5 — idempotent control | Complete | Run submission and retry-sensitive control identities are implemented. |
+| C / #6 — physical evidence | Partial | Linux process evidence and bounded Guardian/store telemetry pieces exist. The supervisor still writes high-rate `resource.sample` events into the lifecycle journal; supervisor-to-client telemetry query and acceptance coverage remain incomplete. |
+| D / #7 — host envelope | Complete | Host workload limits, admission, capability reporting, and status projection are implemented. Host-specific cgroup and kernel proofs remain environment-dependent. |
+| E / #8 — observation and writer ownership | Partial | Event/output subscriptions, all-Run watch, reconnectable cursors, and writer leases exist. Interactive CLI attach still polls for output/terminal state, so the track acceptance gate remains open. |
+| F / #9 — operational lifetime | Pending | Terminal GC/status integration, capability-gated pause/resume and mutable controls, and Guardian-loss recovery remain governed by this track's requirements and the runtime/architecture contracts. |
+
+No manual real-machine certification is claimed. Code-level tests do not prove
+cgroup delegation, PSI availability, or other kernel-specific guarantees; report
+those as unsupported or blocked unless the target environment proves them.
 
 ## Dependency structure
 
