@@ -81,7 +81,11 @@ func (g *guardedExecutor) Reconcile(id string, owned model.Ownership, interactiv
 			return reconcileResult{}, err
 		}
 		receipt := *snap.Receipt
-		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: receipt.Outcome}}, nil
+		outcome := receipt.Outcome
+		if snap.LimitOutcome != "" {
+			outcome = snap.LimitOutcome
+		}
+		return reconcileResult{terminal: true, receipt: &receipt, exit: exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: outcome}}, nil
 	}
 	if snap.Ownership == nil {
 		return reconcileResult{}, errors.New("guardian ownership absent")
@@ -188,7 +192,11 @@ func (p *guardianPhysical) Wait() (exitResult, error) {
 	p.mu.Lock()
 	p.final = &evidence
 	p.mu.Unlock()
-	return exitResult{code: evidence.Exit.ExitCode, signal: evidence.Exit.Signal, outcome: evidence.Exit.Outcome, startedAt: evidence.Exit.StartedAt, finishedAt: evidence.Exit.FinishedAt}, nil
+	outcome := evidence.Exit.Outcome
+	if evidence.Snapshot.LimitOutcome != "" {
+		outcome = evidence.Snapshot.LimitOutcome
+	}
+	return exitResult{code: evidence.Exit.ExitCode, signal: evidence.Exit.Signal, outcome: outcome, startedAt: evidence.Exit.StartedAt, finishedAt: evidence.Exit.FinishedAt}, nil
 }
 
 func (p *guardianPhysical) Observe() (model.Resources, error) {
