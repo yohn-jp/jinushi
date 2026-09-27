@@ -25,6 +25,7 @@ import (
 )
 
 const outputChunkSize = 64 * 1024
+const maxWatchCLIPageLimit = 128
 
 type SupervisorRunner func(context.Context, string) error
 
@@ -69,6 +70,8 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer, runSuper
 		return idCommand(ctx, "await", args[1:], stdout, stderr)
 	case "events":
 		return eventsCommand(ctx, args[1:], stdout, stderr)
+	case "watch":
+		return watchCommand(ctx, args[1:], stdout, stderr)
 	case "close-input":
 		return closeInputCommand(ctx, args[1:], stdout, stderr)
 	case "output":
@@ -315,6 +318,18 @@ type errorRecord struct {
 	Error protocol.Failure `json:"error"`
 }
 
+type outputFollowRecord struct {
+	Type         string     `json:"type"`
+	RunID        string     `json:"runId"`
+	Stream       string     `json:"stream"`
+	Offset       int64      `json:"offset"`
+	NextOffset   int64      `json:"nextOffset"`
+	Data         string     `json:"data,omitempty"`
+	Gap          bool       `json:"gap,omitempty"`
+	RetainedFrom uint64     `json:"retainedFrom,omitempty"`
+	Run          *model.Run `json:"run,omitempty"`
+}
+
 var errStopFollow = errors.New("stop event follow after remote error")
 
 func followEventsCommand(ctx context.Context, stateDir, runID string, after uint64, stdout, stderr io.Writer) int {
@@ -421,7 +436,7 @@ func followEventsCommand(ctx context.Context, stateDir, runID string, after uint
 
 func writeFollowError(stdout, stderr io.Writer, failure protocol.Failure) int {
 	if err := writeNDJSON(stdout, errorRecord{Type: "error", Error: failure}); err != nil {
-		fmt.Fprintf(stderr, "write event stream: %v\n", err)
+		fmt.Fprintf(stderr, "write follow stream: %v\n", err)
 	}
 	return 1
 }
@@ -446,12 +461,68 @@ func closeInputCommand(ctx context.Context, args []string, stdout, stderr io.Wri
 	return code
 }
 
+func watchCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	fs, stateDir, human := commonFlags("watch", args, stderr)
+	cursor := fs.String("cursor", "", "resume after this opaque all-Run watch cursor")
+	follow := fs.Bool("follow", false, "subscribe until the client disconnects")
+	limit := fs.Int64("limit", 64, "maximum events in a snapshot page (1-128)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if len(fs.Args()) != 0 {
+		return usageError(stderr, "watch takes no positional arguments")
+	}
+	if *limit <= 0 || *limit > maxWatchCLIPageLimit {
+		return usageError(stderr, "watch --limit must be between 1 and 128")
+	}
+	request := protocol.Request{Op: "watch", Cursor: *cursor, Limit: *limit}
+	if !*follow {
+		_, code := requestAndRender(ctx, *stateDir, request, *human, stdout, stderr, false)
+		return code
+	}
+	if *human {
+		return usageError(stderr, "--human cannot be combined with --follow; watch follow always emits NDJSON")
+	}
+	request.Follow = true
+	var writeErr error
+	var remoteFailure bool
+	followErr := ipc.Follow(ctx, *stateDir, request, func(response protocol.Response) error {
+		if err := writeNDJSON(stdout, response); err != nil {
+			writeErr = err
+			return err
+		}
+		if response.Error != nil {
+			remoteFailure = true
+			return errStopFollow
+		}
+		return nil
+	})
+	if writeErr != nil {
+		fmt.Fprintf(stderr, "write watch stream: %v\n", writeErr)
+		return 1
+	}
+	if remoteFailure {
+		return 1
+	}
+	if ctx.Err() != nil {
+		return 0
+	}
+	if followErr == nil {
+		return writeFollowError(stdout, stderr, protocol.Failure{Code: "subscription-closed", Message: "watch subscription closed before the client disconnected"})
+	}
+	if followErr != nil {
+		return writeFollowError(stdout, stderr, protocol.Failure{Code: "watch-follow-failed", Message: followErr.Error()})
+	}
+	return 0
+}
+
 func outputCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs, stateDir, human := commonFlags("output", args, stderr)
 	stream := fs.String("stream", "stdout", "stdout, stderr, or pty")
 	offset := fs.Int64("offset", 0, "byte offset into retained output")
 	limit := fs.Int64("limit", outputChunkSize, "maximum bytes to return")
-	jsonOutput := fs.Bool("json", false, "write the base64 JSON response instead of raw bytes")
+	jsonOutput := fs.Bool("json", false, "write base64 JSON (NDJSON with --follow) instead of raw bytes")
+	follow := fs.Bool("follow", false, "subscribe to output until the Run reaches terminal")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -460,6 +531,12 @@ func outputCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	if *offset < 0 || *limit <= 0 || *limit > protocol.MaxFrame {
 		return usageError(stderr, "output offset must be non-negative and limit must be between 1 and the frame limit")
+	}
+	if *follow {
+		if *human {
+			return usageError(stderr, "--human cannot be combined with --follow; output follow writes bytes or NDJSON")
+		}
+		return followOutputCommand(ctx, *stateDir, fs.Arg(0), *stream, *offset, *limit, *jsonOutput, stdout, stderr)
 	}
 	response, err := ipc.Call(ctx, *stateDir, protocol.Request{Op: "output", RunID: fs.Arg(0), Stream: *stream, Offset: *offset, Limit: *limit})
 	if err != nil {
@@ -496,6 +573,153 @@ func outputCommand(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "output history gap; retained output starts at byte %d\n", response.RetainedFrom)
 	}
 	return 0
+}
+
+func followOutputCommand(ctx context.Context, stateDir, runID, stream string, offset, limit int64, jsonOutput bool, stdout, stderr io.Writer) int {
+	requestLimit := limit
+	if requestLimit > outputChunkSize {
+		requestLimit = outputChunkSize
+	}
+	request := protocol.Request{Op: "output", RunID: runID, Stream: stream, Offset: offset, Limit: requestLimit, Follow: true}
+	var finalState model.State
+	var remoteFailure bool
+	var writeErr error
+	followErr := ipc.Follow(ctx, stateDir, request, func(response protocol.Response) error {
+		if response.Error != nil {
+			remoteFailure = true
+			if jsonOutput {
+				if err := writeNDJSON(stdout, errorRecord{Type: "error", Error: *response.Error}); err != nil {
+					writeErr = err
+					return err
+				}
+			} else {
+				fmt.Fprintf(stderr, "%s: %s\n", response.Error.Code, response.Error.Message)
+			}
+			return errStopFollow
+		}
+		data, err := base64.StdEncoding.DecodeString(response.Data)
+		if err != nil {
+			remoteFailure = true
+			failure := protocol.Failure{Code: "invalid-output-stream", Message: "output response was not valid base64"}
+			return reportOutputFollowFailure(stdout, stderr, jsonOutput, failure, &writeErr)
+		}
+		if int64(len(data)) > requestLimit {
+			remoteFailure = true
+			failure := protocol.Failure{Code: "invalid-output-stream", Message: "output page exceeded its bounded byte limit"}
+			return reportOutputFollowFailure(stdout, stderr, jsonOutput, failure, &writeErr)
+		}
+		pageOffset := offset
+		if response.Gap {
+			if response.RetainedFrom > uint64(1<<63-1) {
+				remoteFailure = true
+				failure := protocol.Failure{Code: "invalid-output-stream", Message: "output retained-from watermark exceeded the offset range"}
+				return reportOutputFollowFailure(stdout, stderr, jsonOutput, failure, &writeErr)
+			}
+			if retained := int64(response.RetainedFrom); retained > pageOffset {
+				pageOffset = retained
+			}
+		}
+		if int64(len(data)) > int64(1<<63-1)-pageOffset {
+			remoteFailure = true
+			failure := protocol.Failure{Code: "invalid-output-stream", Message: "output offset overflowed"}
+			return reportOutputFollowFailure(stdout, stderr, jsonOutput, failure, &writeErr)
+		}
+		nextOffset := pageOffset + int64(len(data))
+		if jsonOutput {
+			if len(data) > 0 || response.Gap {
+				record := outputFollowRecord{Type: "output", RunID: runID, Stream: stream, Offset: pageOffset, NextOffset: nextOffset, Data: response.Data, Gap: response.Gap, RetainedFrom: response.RetainedFrom, Run: response.Run}
+				if err := writeNDJSON(stdout, record); err != nil {
+					writeErr = err
+					return err
+				}
+			}
+		} else {
+			if response.Gap {
+				fmt.Fprintf(stderr, "output history gap; retained output starts at byte %d\n", response.RetainedFrom)
+			}
+			if err := writeAll(stdout, data); err != nil {
+				writeErr = err
+				return err
+			}
+		}
+		offset = nextOffset
+		if response.Run != nil && (response.Run.State == model.Terminal || response.Run.State == model.Uncertain) {
+			finalState = response.Run.State
+		}
+		return nil
+	})
+	if writeErr != nil {
+		fmt.Fprintf(stderr, "write output stream: %v\n", writeErr)
+		return 1
+	}
+	if remoteFailure {
+		return 1
+	}
+	if ctx.Err() != nil {
+		return 0
+	}
+	if followErr != nil {
+		failure := protocol.Failure{Code: "output-follow-failed", Message: followErr.Error()}
+		if jsonOutput {
+			return writeFollowError(stdout, stderr, failure)
+		}
+		fmt.Fprintf(stderr, "%s: %s\n", failure.Code, failure.Message)
+		return 1
+	}
+	if finalState == "" {
+		failure := protocol.Failure{Code: "subscription-closed", Message: "output subscription ended before terminal state was observed"}
+		if jsonOutput {
+			return writeFollowError(stdout, stderr, failure)
+		}
+		fmt.Fprintf(stderr, "%s: %s\n", failure.Code, failure.Message)
+		return 1
+	}
+	if finalState == model.Uncertain {
+		if jsonOutput {
+			if err := writeNDJSON(stdout, uncertainRecord{Type: "uncertain", RunID: runID, State: finalState}); err != nil {
+				fmt.Fprintf(stderr, "write output stream: %v\n", err)
+				return 1
+			}
+			return 1
+		}
+		fmt.Fprintln(stderr, "output: Run physical state is uncertain")
+		return 1
+	}
+	if jsonOutput {
+		if err := writeNDJSON(stdout, terminalRecord{Type: "terminal", RunID: runID, State: finalState}); err != nil {
+			fmt.Fprintf(stderr, "write output stream: %v\n", err)
+			return 1
+		}
+	}
+	return 0
+}
+
+func reportOutputFollowFailure(stdout, stderr io.Writer, jsonOutput bool, failure protocol.Failure, writeErr *error) error {
+	if jsonOutput {
+		*writeErr = writeNDJSON(stdout, errorRecord{Type: "error", Error: failure})
+		if *writeErr != nil {
+			return *writeErr
+		}
+	} else {
+		fmt.Fprintf(stderr, "%s: %s\n", failure.Code, failure.Message)
+	}
+	return errStopFollow
+}
+
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func attachCommand(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -1035,7 +1259,8 @@ Usage:
   jinushi inspect <run-id>
   jinushi await <run-id>
   jinushi events [--after SEQ] [--follow] <run-id>
-  jinushi output [--stream stdout|stderr|pty] [--offset N] [--limit N] <run-id>
+  jinushi watch [--cursor CURSOR] [--follow] [--limit N]
+  jinushi output [--stream stdout|stderr|pty] [--offset N] [--limit N] [--follow] <run-id>
   jinushi attach [--rows N --cols N] <run-id>
   jinushi signal <run-id> <signal>
   jinushi cancel <run-id>
@@ -1047,6 +1272,7 @@ Usage:
   jinushi resize --rows N --cols N <run-id>
 
 Responses are JSON by default. Use --human for concise status output. The
-output command writes decoded bytes by default; pass --json for a base64 JSON response.
+output command writes decoded bytes by default; pass --json for a base64 JSON response or NDJSON records with --follow. The
+watch command returns bounded all-Run event pages; use its nextCursor as --cursor to reconnect.
 In attach mode, Ctrl+] detaches the client and leaves the Run alive.`)
 }
