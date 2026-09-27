@@ -566,6 +566,33 @@ func TestDetachedRunSurvivesClientDisconnect(t *testing.T) {
 	}
 }
 
+func TestCloseInputDeliversEOFToRealRun(t *testing.T) {
+	h := newHarness(t)
+	started := h.run("--", "/bin/sh", "-c", "cat; printf EOF")
+	h.waitUntil("stdin-reading Run to enter running state", 10*time.Second, func() bool { return h.inspect(started.ID).State == "running" })
+
+	code, _, input := h.invoke(5*time.Second, "input", "--state-dir", h.stateDir, started.ID, "payload-before-eof")
+	if code != 0 || input.Error != nil {
+		t.Fatalf("write stdin through production CLI: exit=%d response=%+v", code, input)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	closed, err := ipc.Call(ctx, h.stateDir, protocol.Request{Version: 1, Op: "close-input", RunID: started.ID})
+	cancel()
+	if err != nil || closed.Error != nil {
+		t.Fatalf("close stdin through production local protocol: response=%+v err=%v", closed, err)
+	}
+
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code != 0 || completed.Receipt.Outcome != "exited" || completed.Receipt.ExitCode == nil || *completed.Receipt.ExitCode != 0 {
+		t.Fatalf("stdin EOF did not let the Run finish normally: exit=%d receipt=%+v", code, completed.Receipt)
+	}
+	_, _, output := h.invoke(5*time.Second, "output", "--state-dir", h.stateDir, "--stream", "stdout", "--limit", "128", "--json", started.ID)
+	data, decodeErr := base64.StdEncoding.DecodeString(output.Data)
+	if output.Error != nil || decodeErr != nil || string(data) != "payload-before-eofEOF" {
+		t.Fatalf("Run did not preserve input bytes through EOF: output=%q decodeErr=%v response=%+v", data, decodeErr, output)
+	}
+}
+
 func TestSupervisorCrashRestartReconcilesLiveRun(t *testing.T) {
 	h := newHarness(t)
 	started := h.run("--", helperBinary, "wait", "60000")
