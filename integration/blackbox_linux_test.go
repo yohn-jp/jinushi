@@ -904,6 +904,158 @@ func TestLeaseExpiryTerminatesOwnedRun(t *testing.T) {
 	}
 }
 
+func TestWallTimeLimitExpiresWhileSupervisorIsStopped(t *testing.T) {
+	h := newHarness(t)
+	pidFile := filepath.Join(t.TempDir(), "wall-time-descendant.pid")
+	started := h.run("--wall-time-ms", "1000", "--", helperBinary, "spawn-grandchild", pidFile)
+	pid := waitForPIDFile(t, pidFile, 10*time.Second)
+	h.waitUntil("wall-limited Run to enter running state", 10*time.Second, func() bool {
+		return h.inspect(started.ID).State == "running"
+	})
+
+	supervisorDown := false
+	t.Cleanup(func() {
+		if supervisorDown {
+			h.startSupervisor()
+			supervisorDown = false
+		}
+	})
+	h.stopSupervisor(true)
+	supervisorDown = true
+	// The wall deadline plus guardian termination grace must elapse without a
+	// Supervisor monitor available to drive termination.
+	time.Sleep(4 * time.Second)
+	waitProcessGone(t, pid, 3*time.Second)
+
+	h.startSupervisor()
+	supervisorDown = false
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code == 0 || completed.Receipt.Outcome != "timed-out" || !completed.Receipt.TerminationRequested || completed.Receipt.Cleanup != "complete" {
+		t.Fatalf("guardian wall deadline did not survive Supervisor downtime with a terminal receipt: exit=%d receipt=%+v", code, completed.Receipt)
+	}
+	waitProcessGone(t, pid, 2*time.Second)
+}
+
+func TestLeaseExpiresWhileSupervisorIsStopped(t *testing.T) {
+	h := newHarness(t)
+	pidFile := filepath.Join(t.TempDir(), "lease-descendant.pid")
+	started := h.run("--lifetime", "lease-bound", "--lease-ms", "1000", "--", helperBinary, "spawn-grandchild", pidFile)
+	pid := waitForPIDFile(t, pidFile, 10*time.Second)
+	h.waitUntil("lease-bound Run to enter running state", 10*time.Second, func() bool {
+		return h.inspect(started.ID).State == "running"
+	})
+
+	supervisorDown := false
+	t.Cleanup(func() {
+		if supervisorDown {
+			h.startSupervisor()
+			supervisorDown = false
+		}
+	})
+	h.stopSupervisor(true)
+	supervisorDown = true
+	// Verify the guardian enforces lease expiry and cleans the real process tree
+	// before a replacement Supervisor can reconcile the Run.
+	time.Sleep(4 * time.Second)
+	waitProcessGone(t, pid, 3*time.Second)
+
+	h.startSupervisor()
+	supervisorDown = false
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code == 0 || completed.Receipt.Outcome != "cancelled" || !completed.Receipt.TerminationRequested || completed.Receipt.Cleanup != "complete" {
+		t.Fatalf("guardian lease deadline did not survive Supervisor downtime with a terminal receipt: exit=%d receipt=%+v", code, completed.Receipt)
+	}
+	_, _, events := h.invoke(5*time.Second, "events", "--state-dir", h.stateDir, started.ID)
+	if events.Error != nil || !containsEvent(events.Events, "lease.expired") {
+		t.Fatalf("lease expiry event was not durable across Supervisor restart: %+v", events)
+	}
+	waitProcessGone(t, pid, 2*time.Second)
+}
+
+func TestLeaseRenewalAfterRestartSurvivesOriginalExpiry(t *testing.T) {
+	h := newHarness(t)
+	pidFile := filepath.Join(t.TempDir(), "renewed-lease-descendant.pid")
+	const initialLeaseMs = int64(5000)
+	const renewedLeaseMs = int64(10000)
+	started := h.run("--lifetime", "lease-bound", "--lease-ms", strconv.FormatInt(initialLeaseMs, 10), "--", helperBinary, "spawn-grandchild", pidFile)
+	pid := waitForPIDFile(t, pidFile, 10*time.Second)
+	h.waitUntil("renewal Run to enter running state", 10*time.Second, func() bool {
+		return h.inspect(started.ID).State == "running"
+	})
+	if started.LeaseGeneration == 0 || started.LeaseExpiry == nil {
+		t.Fatalf("accepted lease-bound Run omitted initial lease evidence: %+v", started)
+	}
+	originalGeneration := started.LeaseGeneration
+	originalExpiry := *started.LeaseExpiry
+
+	supervisorDown := false
+	t.Cleanup(func() {
+		if supervisorDown {
+			h.startSupervisor()
+			supervisorDown = false
+		}
+	})
+	h.stopSupervisor(true)
+	supervisorDown = true
+	time.Sleep(200 * time.Millisecond)
+	h.startSupervisor()
+	supervisorDown = false
+
+	reconciled := h.inspect(started.ID)
+	if reconciled.State != "running" || reconciled.LeaseGeneration != originalGeneration || reconciled.LeaseExpiry == nil || !reconciled.LeaseExpiry.Equal(originalExpiry) {
+		t.Fatalf("Supervisor restart did not recover the original live lease: %+v", reconciled)
+	}
+	code, _, renewedResponse := h.invoke(8*time.Second, "lease", "renew", "--state-dir", h.stateDir, "--generation", strconv.FormatUint(reconciled.LeaseGeneration, 10), "--lease-ms", strconv.FormatInt(renewedLeaseMs, 10), started.ID)
+	if code != 0 || renewedResponse.Error != nil || renewedResponse.Run == nil {
+		t.Fatalf("renew lease through production CLI after restart: exit=%d response=%+v", code, renewedResponse)
+	}
+	renewed := *renewedResponse.Run
+	if renewed.LeaseGeneration != originalGeneration+1 || renewed.LeaseExpiry == nil || !renewed.LeaseExpiry.After(originalExpiry) {
+		t.Fatalf("lease renewal did not advance durable generation/expiry: old generation=%d expiry=%s, renewed=%+v", originalGeneration, originalExpiry, renewed)
+	}
+
+	// Stop the Supervisor again and cross the original deadline. If renewal was
+	// not persisted into Guardian ownership, the actual descendant will die at
+	// the old expiry while the Supervisor is unavailable.
+	h.stopSupervisor(true)
+	supervisorDown = true
+	oldExpiryProofTime := originalExpiry.Add(300 * time.Millisecond)
+	if !renewed.LeaseExpiry.After(oldExpiryProofTime.Add(time.Second)) {
+		t.Fatalf("renewed lease leaves too little proof window beyond the original expiry: renewed=%s proof=%s", renewed.LeaseExpiry, oldExpiryProofTime)
+	}
+	if wait := time.Until(oldExpiryProofTime); wait > 0 {
+		time.Sleep(wait)
+	}
+	if !linuxProcessExecuting(pid) {
+		t.Fatalf("real descendant PID %d did not survive beyond the original lease expiry", pid)
+	}
+
+	h.startSupervisor()
+	supervisorDown = false
+	recovered := h.inspect(started.ID)
+	if recovered.State != "running" || recovered.LeaseGeneration != renewed.LeaseGeneration || recovered.LeaseExpiry == nil || !recovered.LeaseExpiry.Equal(*renewed.LeaseExpiry) {
+		t.Fatalf("renewed lease evidence did not survive a second Supervisor restart: %+v, want generation=%d expiry=%s", recovered, renewed.LeaseGeneration, renewed.LeaseExpiry)
+	}
+	code, _, canceled := h.invoke(5*time.Second, "cancel", "--state-dir", h.stateDir, started.ID)
+	if code != 0 || canceled.Error != nil {
+		t.Fatalf("cancel renewed lease Run: exit=%d response=%+v", code, canceled)
+	}
+	code, completed := h.await(started.ID, 15*time.Second)
+	if code == 0 || completed.Receipt.Outcome != "cancelled" || completed.Receipt.Cleanup != "complete" {
+		t.Fatalf("cancel renewed Run did not prove physical cleanup: exit=%d receipt=%+v", code, completed.Receipt)
+	}
+	waitProcessGone(t, pid, 3*time.Second)
+}
+
+func containsEvent(events []event, kind string) bool {
+	for _, item := range events {
+		if item.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
 func waitForPIDFile(t *testing.T, path string, timeout time.Duration) int {
 	t.Helper()
 	var pid int
