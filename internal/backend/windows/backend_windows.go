@@ -724,24 +724,7 @@ func observeJob(job windows.Handle, peak *atomic.Int64) (model.Resources, error)
 	if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&accounting)), uint32(unsafe.Sizeof(accounting)), nil); err != nil {
 		return resources, fmt.Errorf("query Job Object accounting: %w", err)
 	}
-	count := int64(accounting.ActiveProcesses)
-	if peak != nil {
-		for {
-			previous := peak.Load()
-			if count <= previous || peak.CompareAndSwap(previous, count) {
-				break
-			}
-		}
-		if count < peak.Load() {
-			count = peak.Load()
-		}
-	}
-	resources.ProcessCount = measured(count)
-	if peak == nil {
-		resources.PeakProcessCount = unavailable()
-	} else {
-		resources.PeakProcessCount = measured(peak.Load())
-	}
+	resources.ProcessCount, resources.PeakProcessCount = processCountMetrics(accounting.ActiveProcesses, peak)
 	user := accounting.TotalUserTime
 	kernel := accounting.TotalKernelTime
 	if user < 0 || kernel < 0 {
@@ -761,6 +744,22 @@ func observeJob(job windows.Handle, peak *atomic.Int64) (model.Resources, error)
 		resources.PeakMemoryBytes = unavailable()
 	}
 	return resources, nil
+}
+
+func processCountMetrics(active uint32, peak *atomic.Int64) (current, maximum model.Metric) {
+	current = measured(int64(active))
+	if peak == nil {
+		return current, unavailable()
+	}
+
+	activeValue := int64(active)
+	for {
+		previous := peak.Load()
+		if activeValue <= previous || peak.CompareAndSwap(previous, activeValue) {
+			break
+		}
+	}
+	return current, measured(peak.Load())
 }
 
 func activeProcessCount(job windows.Handle) (uint32, error) {

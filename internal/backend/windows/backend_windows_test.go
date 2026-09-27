@@ -293,6 +293,27 @@ func TestWindowsArgumentQuoting(t *testing.T) {
 	}
 }
 
+func TestProcessCountMetricsKeepsCurrentSeparateFromPeak(t *testing.T) {
+	var peak atomic.Int64
+	peak.Store(8)
+
+	current, maximum := processCountMetrics(3, &peak)
+	if current.Status != "measured" || current.Value != 3 {
+		t.Fatalf("current process count = %+v, want measured 3", current)
+	}
+	if maximum.Status != "measured" || maximum.Value != 8 {
+		t.Fatalf("peak process count = %+v, want measured 8", maximum)
+	}
+	if peak.Load() != 8 {
+		t.Fatalf("observing a lower current count changed the peak to %d", peak.Load())
+	}
+
+	current, maximum = processCountMetrics(10, &peak)
+	if current.Value != 10 || maximum.Value != 10 {
+		t.Fatalf("new high-water mark was not retained: current=%+v peak=%+v", current, maximum)
+	}
+}
+
 func helperArgs() []string {
 	for index, arg := range os.Args {
 		if arg == "--" && index+1 < len(os.Args) {
