@@ -8,6 +8,7 @@ type Request struct {
 	Version         int            `json:"version"`
 	Op              string         `json:"op"`
 	RunID           string         `json:"runId,omitempty"`
+	AttachID        string         `json:"attachId,omitempty"`
 	Spec            *model.RunSpec `json:"spec,omitempty"`
 	After           uint64         `json:"after,omitempty"`
 	Offset          int64          `json:"offset,omitempty"`
@@ -35,5 +36,6 @@ type Response struct {
 	Gap          bool                `json:"gap,omitempty"`
 	Data         string              `json:"data,omitempty"`
 	Capabilities *model.Capabilities `json:"capabilities,omitempty"`
+	AttachID     string              `json:"attachId,omitempty"`
 	Error        *Failure            `json:"error,omitempty"`
 }
