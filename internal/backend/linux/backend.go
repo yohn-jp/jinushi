@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,11 +33,22 @@ type cgroupSpawnError struct{ err error }
 func (e *cgroupSpawnError) Error() string { return e.err.Error() }
 func (e *cgroupSpawnError) Unwrap() error { return e.err }
 
-type Backend struct{}
+type Backend struct {
+	hostMu         sync.Mutex
+	host           *hostCgroup
+	hostConfig     HostEnvelopeConfig
+	hostConfigured bool
+	hostFailure    string
+}
 
 func New() backend.Backend { return &Backend{} }
 
-func (*Backend) ValidateLimits(limits model.Limits) error {
+func (b *Backend) ValidateLimits(limits model.Limits) error {
+	b.hostMu.Lock()
+	defer b.hostMu.Unlock()
+	if b.hostConfigured && b.host == nil {
+		return fmt.Errorf("%w: configured Linux host envelope is unavailable: %s", ErrUnsupported, b.hostFailure)
+	}
 	if limits.CPUQuotaPercent > (int64(^uint64(0)>>1) / 1000) {
 		return errors.New("CPU quota exceeds Linux cgroup v2 range")
 	}
@@ -44,7 +56,7 @@ func (*Backend) ValidateLimits(limits model.Limits) error {
 		return fmt.Errorf("%w: Linux cgroup v2 cannot enforce a process-leader limit; use a task-count limit", ErrUnsupported)
 	}
 	if limits.TaskCount > 0 {
-		location, ok := probeCgroup()
+		location, ok := b.probeRunCgroupLocked()
 		if !ok || !location.pidsLimit {
 			return fmt.Errorf("%w: Linux task-count enforcement requires a delegated cgroup v2 pids controller", ErrUnsupported)
 		}
@@ -52,8 +64,10 @@ func (*Backend) ValidateLimits(limits model.Limits) error {
 	return nil
 }
 
-func (*Backend) Capabilities() model.Capabilities {
-	location, ok := probeCgroup()
+func (b *Backend) Capabilities() model.Capabilities {
+	b.hostMu.Lock()
+	defer b.hostMu.Unlock()
+	location, ok := b.probeRunCgroupLocked()
 	capabilities := model.Capabilities{
 		Backend:                 "linux",
 		PTY:                     true,
@@ -74,7 +88,12 @@ func (*Backend) Capabilities() model.Capabilities {
 	return capabilities
 }
 
-func (*Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Process, error) {
+func (b *Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Process, error) {
+	b.hostMu.Lock()
+	defer b.hostMu.Unlock()
+	if b.hostConfigured && b.host == nil {
+		return nil, &HostAdmissionError{Resource: "workload-root", Limit: 1, Reason: "configured Linux host envelope is unsupported: " + b.hostFailure}
+	}
 	if len(spec.Argv) == 0 || spec.Argv[0] == "" {
 		return nil, errors.New("argv must contain an executable")
 	}
@@ -101,20 +120,47 @@ func (*Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Pro
 	limitRequested := spec.Limits.MemoryBytes > 0 || spec.Limits.CPUQuotaPercent > 0 || spec.Limits.TaskCount > 0
 	var cg *cgroup
 	var cgroupSetupErr error
-	location, locationErr := discoverCgroup()
-	if locationErr == nil && cgroupWritable(location.basePath) {
+	location, locationErr := b.runCgroupLocationLocked()
+	if b.host != nil {
+		release, lockErr := b.host.lockAdmission()
+		if lockErr != nil {
+			return nil, &HostAdmissionError{Resource: "workload-root", Limit: 1, Reason: lockErr.Error()}
+		}
+		defer release()
+		location, locationErr = b.runCgroupLocationLocked()
+		if locationErr != nil {
+			return nil, &HostAdmissionError{Resource: "workload-root", Limit: 1, Reason: locationErr.Error()}
+		}
+	}
+	if locationErr == nil && b.host != nil {
+		if err := b.host.checkAdmission(b.hostConfig); err != nil {
+			return nil, err
+		}
+	}
+	parentWritable := false
+	if locationErr == nil {
+		if b.host != nil {
+			parentWritable = unix.Faccessat(int(b.host.file.Fd()), ".", unix.W_OK|unix.X_OK, 0) == nil
+		} else {
+			parentWritable = cgroupWritable(location.basePath)
+		}
+	}
+	if parentWritable {
 		name, nameErr := randomCgroupName()
 		if nameErr != nil {
 			return nil, nameErr
 		}
-		cg, cgroupSetupErr = newCgroup(location, name, spec.Limits.MemoryBytes, spec.Limits.CPUQuotaPercent, spec.Limits.TaskCount)
+		cg, cgroupSetupErr = b.newRunCgroupLocked(location, name, spec.Limits.MemoryBytes, spec.Limits.CPUQuotaPercent, spec.Limits.TaskCount)
 	}
-	if limitRequested && cg == nil {
+	if (limitRequested || b.hostConfigured) && cg == nil {
 		if cgroupSetupErr == nil {
 			cgroupSetupErr = locationErr
 		}
 		if cgroupSetupErr == nil {
 			cgroupSetupErr = ErrUnsupported
+		}
+		if b.hostConfigured && (!limitRequested || !parentWritable || locationErr != nil) {
+			return nil, &HostAdmissionError{Resource: "workload-root", Limit: 1, Reason: fmt.Sprintf("configured host envelope cannot own this Run: %v", cgroupSetupErr)}
 		}
 		return nil, fmt.Errorf("%w: requested Linux resource limit cannot be enforced: %v", ErrUnsupported, cgroupSetupErr)
 	}
@@ -128,7 +174,10 @@ func (*Backend) Start(spec model.RunSpec, stdout, stderr io.Writer) (backend.Pro
 
 	process, err := startCommand(spec, env, stdout, stderr, cg)
 	var spawnErr *cgroupSpawnError
-	if err != nil && cg != nil && !limitRequested && errors.As(err, &spawnErr) && isCgroupSpawnUnavailable(err) {
+	if err != nil && b.hostConfigured && cg != nil && errors.As(err, &spawnErr) && isCgroupSpawnUnavailable(err) {
+		return nil, &HostAdmissionError{Resource: "workload-root", Limit: 1, Reason: fmt.Sprintf("cannot establish Run membership in the configured workload root: %v", err)}
+	}
+	if err != nil && cg != nil && !limitRequested && !b.hostConfigured && errors.As(err, &spawnErr) && isCgroupSpawnUnavailable(err) {
 		cg.close()
 		cg = nil
 		process, err = startCommand(spec, env, stdout, stderr, nil)
@@ -420,6 +469,10 @@ func probeCgroup() (cgroupLocation, bool) {
 	if err != nil {
 		return cgroupLocation{}, false
 	}
+	return probeCgroupAt(location)
+}
+
+func probeCgroupAt(location cgroupLocation) (cgroupLocation, bool) {
 	parent, err := openDirectoryNoSymlinks(location.basePath)
 	if err != nil {
 		return cgroupLocation{}, false

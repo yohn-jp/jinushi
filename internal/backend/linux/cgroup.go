@@ -224,6 +224,13 @@ func cgroupControllerEnabled(basePath, name string) bool {
 		return false
 	}
 	defer base.Close()
+	return cgroupControllerEnabledAt(base, name)
+}
+
+func cgroupControllerEnabledAt(base *os.File, name string) bool {
+	if base == nil || !isControlName(name) {
+		return false
+	}
 	if verifyCgroupDirectory(base) != nil {
 		return false
 	}
@@ -253,6 +260,26 @@ func newCgroup(location cgroupLocation, name string, memoryBytes, cpuPercent, ta
 	if err != nil {
 		return nil, fmt.Errorf("open delegated cgroup parent safely: %w", err)
 	}
+	defer parent.Close()
+	return newCgroupUnder(location, name, memoryBytes, cpuPercent, taskCount, parent)
+}
+
+// newCgroupUnder creates a Run cgroup below an already validated cgroup
+// directory handle. The passed handle is duplicated and remains owned by the
+// returned cgroup, so a host workload root can be used without reopening its
+// path between validation and child creation.
+func newCgroupUnder(location cgroupLocation, name string, memoryBytes, cpuPercent, taskCount int64, parentHandle *os.File) (*cgroup, error) {
+	if parentHandle == nil {
+		return nil, errors.New("delegated cgroup parent handle is unavailable")
+	}
+	if err := verifyCgroupDirectory(parentHandle); err != nil {
+		return nil, err
+	}
+	parentFD, err := unix.Openat(int(parentHandle.Fd()), ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate delegated cgroup parent handle: %w", err)
+	}
+	parent := os.NewFile(uintptr(parentFD), location.basePath)
 	if err := verifyCgroupDirectory(parent); err != nil {
 		_ = parent.Close()
 		return nil, err
@@ -336,6 +363,10 @@ func newCgroup(location cgroupLocation, name string, memoryBytes, cpuPercent, ta
 			return nil, err
 		}
 	}
+	location.memoryLimit = cgroupControllerEnabledAt(cg.parent, "memory") && fileWritableAt(cg.file, "memory.max") && fileWritableAt(cg.file, "memory.oom.group")
+	location.cpuLimit = cgroupControllerEnabledAt(cg.parent, "cpu") && fileWritableAt(cg.file, "cpu.max")
+	location.pidsLimit = cgroupControllerEnabledAt(cg.parent, "pids") && fileWritableAt(cg.file, "pids.max")
+	cg.location = location
 	cg.baseline = readLimitCounters(cg)
 	removeOnError = false
 	return cg, nil
