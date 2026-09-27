@@ -30,6 +30,7 @@ type exitResult struct {
 	finishedAt           time.Time
 	terminationRequested bool
 	forced               bool
+	receipt              *model.Receipt
 }
 
 type terminationResult struct {
@@ -98,10 +99,30 @@ type Service struct {
 	active    map[string]*active
 	stop      chan struct{}
 	closeOnce sync.Once
+	workers   sync.WaitGroup
+	closing   bool // guarded by mu; also gates workers.Add against Close.Wait
 }
 
 func newService(root string, db *store.Store, backend executor, config Config) *Service {
 	return &Service{root: root, store: db, backend: backend, config: config, active: make(map[string]*active), stop: make(chan struct{})}
+}
+
+func (s *Service) launchLocked(work func()) bool {
+	if s.closing {
+		return false
+	}
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		work()
+	}()
+	return true
+}
+
+func (s *Service) launch(work func()) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.launchLocked(work)
 }
 
 func newID() (string, error) {
@@ -373,14 +394,19 @@ func (s *Service) create(spec *model.RunSpec) protocol.Response {
 	if err != nil || len(encoded) >= protocol.MaxFrame-(300<<10) {
 		return failure("response-too-large", "Run metadata exceeds the IPC response limit")
 	}
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return failure("supervisor-closed", "supervisor is closing")
+	}
 	if _, _, err = s.store.Create(run, &model.Event{Kind: "run.accepted", ObservedAt: now}); err != nil {
+		s.mu.Unlock()
 		return failure("storage-failure", err.Error())
 	}
 	a := &active{run: run, spec: *spec, done: make(chan struct{})}
-	s.mu.Lock()
 	s.active[id] = a
+	s.launchLocked(func() { s.start(a) })
 	s.mu.Unlock()
-	go s.start(a)
 	return accepted
 }
 
@@ -420,7 +446,8 @@ func (s *Service) start(a *active) {
 	if err != nil {
 		var cleanTerminal *cleanStartTerminal
 		if errors.As(err, &cleanTerminal) {
-			s.finish(a, cleanTerminal.outcome, exitResult{outcome: cleanTerminal.outcome}, false, "complete")
+			receipt := cleanTerminal.receipt
+			s.finish(a, receipt.Outcome, exitResult{code: receipt.ExitCode, signal: receipt.Signal, outcome: receipt.Outcome, finishedAt: receipt.FinishedAt, terminationRequested: receipt.TerminationRequested, forced: receipt.Forced, receipt: &receipt}, receipt.Forced, receipt.Cleanup)
 			return
 		}
 		if p != nil {
@@ -453,9 +480,9 @@ func (s *Service) start(a *active) {
 	}
 	shouldTerminate := a.terminating
 	a.mu.Unlock()
-	go s.monitor(a)
+	s.launch(func() { s.monitor(a) })
 	if shouldTerminate {
-		go s.driveTermination(a, p)
+		s.launch(func() { s.driveTermination(a, p) })
 	}
 }
 
@@ -517,20 +544,6 @@ func (s *Service) monitor(a *active) {
 		case <-ticker.C:
 			s.sample(a)
 			s.sweepAttachments(a)
-			a.mu.Lock()
-			run := a.run
-			already := a.terminating
-			a.mu.Unlock()
-			if already {
-				continue
-			}
-			if run.Spec.Limits.WallTimeMs > 0 && run.StartedAt != nil && time.Since(*run.StartedAt) >= time.Duration(run.Spec.Limits.WallTimeMs)*time.Millisecond {
-				go s.terminate(a, "timed-out")
-				continue
-			}
-			if run.LeaseExpiry != nil && time.Now().After(*run.LeaseExpiry) {
-				go s.terminate(a, "lease-expired")
-			}
 		}
 	}
 }
@@ -619,7 +632,19 @@ func (s *Service) finish(a *active, outcome string, exit exitResult, forced bool
 		a.run.StartedAt = &started
 	}
 	a.run.FinishedAt = &now
-	a.run.Receipt = &model.Receipt{Version: model.ProtocolVersion, RunID: a.run.ID, Outcome: outcome, ExitCode: exit.code, Signal: exit.signal, StartedAt: a.run.StartedAt, FinishedAt: now, Resources: a.run.Resources, Output: a.run.Output, TerminationRequested: a.run.TerminationReason != "" || exit.terminationRequested, Forced: forced, Cleanup: cleanup}
+	if exit.receipt != nil {
+		copy := *exit.receipt
+		copy.Outcome = outcome
+		copy.Output = a.run.Output
+		copy.TerminationRequested = copy.TerminationRequested || a.run.TerminationReason != ""
+		copy.Forced = copy.Forced || forced
+		copy.Cleanup = cleanup
+		a.run.Receipt = &copy
+		a.run.Resources = copy.Resources
+		a.run.StartedAt = copy.StartedAt
+	} else {
+		a.run.Receipt = &model.Receipt{Version: model.ProtocolVersion, RunID: a.run.ID, Outcome: outcome, ExitCode: exit.code, Signal: exit.signal, StartedAt: a.run.StartedAt, FinishedAt: now, Resources: a.run.Resources, Output: a.run.Output, TerminationRequested: a.run.TerminationReason != "" || exit.terminationRequested, Forced: forced, Cleanup: cleanup}
+	}
 	s.populateReceipt(a.run, a.run.Receipt)
 	events := terminalEvents(now, exit.outcome, a.run.TerminationReason, priorReason)
 	events = append(events, model.Event{Kind: "run.terminal", ObservedAt: now, Body: map[string]any{"outcome": outcome}})
@@ -1091,7 +1116,7 @@ func (s *Service) cancel(id, reason string) protocol.Response {
 		return failure("storage-failure", err.Error())
 	}
 	if p != nil {
-		go s.driveTermination(a, p)
+		s.launch(func() { s.driveTermination(a, p) })
 	}
 	return response()
 }
@@ -1169,10 +1194,6 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	if a.run.State == model.Terminal || a.run.State == model.Uncertain {
 		return failure("already-terminal", "Run has reached a final state")
 	}
-	if a.run.LeaseExpiry != nil && time.Now().After(*a.run.LeaseExpiry) {
-		go s.terminate(a, "lease-expired")
-		return failure("lease-expired", "lease has expired")
-	}
 	if a.run.LeaseGeneration == req.LeaseGeneration+1 && a.run.LastLeaseExpectedGeneration == req.LeaseGeneration && a.run.LastLeaseMs == req.LeaseMs {
 		out = response()
 		r := publicRun(a.run)
@@ -1194,24 +1215,23 @@ func (s *Service) renew(req protocol.Request) protocol.Response {
 	lease, err := renewer.RenewLease(req.LeaseGeneration, req.LeaseMs)
 	if err != nil {
 		if errors.Is(err, guardian.ErrLeaseExpired) {
-			go s.terminate(a, "lease-expired")
 			return failure("lease-expired", "lease has expired")
 		}
 		if errors.Is(err, guardian.ErrStaleGeneration) {
 			return failure("stale-generation", "stale lease generation")
 		}
-		go s.markUncertain(a, "lease renewal ownership unproven")
+		s.launch(func() { s.markUncertain(a, "lease renewal ownership unproven") })
 		return failure("ownership-uncertain", "lease renewal was not proven")
 	}
 	if lease.expiry == nil || lease.generation != req.LeaseGeneration+1 || lease.lastExpectedGeneration != req.LeaseGeneration || lease.lastMs != req.LeaseMs {
-		go s.markUncertain(a, "lease renewal evidence mismatch")
+		s.launch(func() { s.markUncertain(a, "lease renewal evidence mismatch") })
 		return failure("ownership-uncertain", "lease renewal evidence did not match the request")
 	}
 	next := a.run
 	setLeaseState(&next, lease)
 	a.run = next
 	if _, err := s.store.Update(next, &model.Event{Kind: "lease.renewed", ObservedAt: time.Now().UTC()}); err != nil {
-		go s.markUncertain(a, "lease renewal durability failed")
+		s.launch(func() { s.markUncertain(a, "lease renewal durability failed") })
 		return failure("storage-failure", err.Error())
 	}
 	out = response()
@@ -1379,9 +1399,9 @@ func (s *Service) reconcile() error {
 				s.mu.Lock()
 				s.active[run.ID] = a
 				s.mu.Unlock()
-				go s.monitor(a)
+				s.launch(func() { s.monitor(a) })
 				if a.terminating {
-					go s.driveTermination(a, a.process)
+					s.launch(func() { s.driveTermination(a, a.process) })
 				}
 				continue
 			}
@@ -1401,8 +1421,16 @@ func (s *Service) Close() error {
 	if s.store == nil {
 		return errSupervisorClosed
 	}
-	s.closeOnce.Do(func() { close(s.stop) })
-	return s.store.Close()
+	var err error
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closing = true
+		close(s.stop)
+		s.mu.Unlock()
+		s.workers.Wait()
+		err = s.store.Close()
+	})
+	return err
 }
 
 func statePath(root string) string { return filepath.Join(root, "state.db") }

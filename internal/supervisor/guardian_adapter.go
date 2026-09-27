@@ -22,10 +22,10 @@ type guardedExecutor struct {
 	config     Config
 }
 
-type cleanStartTerminal struct{ outcome string }
+type cleanStartTerminal struct{ receipt model.Receipt }
 
 func (e *cleanStartTerminal) Error() string {
-	return "workload finished before ownership establishment: " + e.outcome
+	return "workload finished before ownership establishment: " + e.receipt.Outcome
 }
 
 func newGuardedExecutor(root string, config Config) (*guardedExecutor, error) {
@@ -73,7 +73,10 @@ func (g *guardedExecutor) Start(run model.Run, spec model.RunSpec, stdout, stder
 		if snap.Receipt.Outcome == "startup-failed" {
 			return nil, fmt.Errorf("workload startup failed")
 		}
-		return nil, &cleanStartTerminal{outcome: snap.Receipt.Outcome}
+		if err := p.syncOutput(0); err != nil {
+			return p, fmt.Errorf("import fast-terminal output: %w", err)
+		}
+		return nil, &cleanStartTerminal{receipt: *snap.Receipt}
 	}
 	if err != nil {
 		return p, err
@@ -308,7 +311,8 @@ func (p *guardianPhysical) Wait() (exitResult, error) {
 	if evidence.Snapshot.LimitOutcome != "" {
 		outcome = evidence.Snapshot.LimitOutcome
 	}
-	return exitResult{code: evidence.Exit.ExitCode, signal: evidence.Exit.Signal, outcome: outcome, startedAt: evidence.Exit.StartedAt, finishedAt: evidence.Exit.FinishedAt, terminationRequested: evidence.Receipt.TerminationRequested, forced: evidence.Receipt.Forced}, nil
+	receipt := evidence.Receipt
+	return exitResult{code: evidence.Exit.ExitCode, signal: evidence.Exit.Signal, outcome: outcome, startedAt: evidence.Exit.StartedAt, finishedAt: evidence.Exit.FinishedAt, terminationRequested: receipt.TerminationRequested, forced: receipt.Forced, receipt: &receipt}, nil
 }
 
 func (p *guardianPhysical) Observe() (model.Resources, error) {
