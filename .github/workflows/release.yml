@@ -1,0 +1,20 @@
+name: Go development release
+
+# Canonical wrapper managed by yohn-jp/.github. Jinushi keeps only the product
+# build target here; build, verification, artifact integrity, and dev release
+# allocation remain owned by the shared reusable workflow.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  release:
+    uses: yohn-jp/.github/.github/workflows/go-release.yml@main
+    with:
+      binary-name: jinushi
+      build-target: ./cmd/jinushi
+    permissions:
+      actions: read
+      contents: write
