@@ -1,0 +1,22 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "31 3 * * 1"
+
+permissions: {}
+
+jobs:
+  analyze:
+    uses: yohn-jp/.github/.github/workflows/codeql.yml@main
+    with:
+      languages: "go,actions"
+      config-file: ./.github/codeql/codeql-config.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read

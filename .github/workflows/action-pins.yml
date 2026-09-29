@@ -1,0 +1,15 @@
+name: Action reference policy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  validate:
+    uses: yohn-jp/.github/.github/workflows/action-pins.yml@main
+    permissions:
+      contents: read

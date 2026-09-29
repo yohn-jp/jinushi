@@ -1,0 +1,4 @@
+name: CodeQL security baseline
+
+queries:
+  - uses: security-extended
