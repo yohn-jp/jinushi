@@ -5,7 +5,7 @@
 
 This document defines how organization governance is projected into runtime-specific execution prompts. Runtime profiles are adapters: they describe delegation, implementation authority, context handling, and reporting for a runtime/model configuration. They do not redefine Issue scope, branch topology, repository policy, or product architecture.
 
-The machine-readable source is `.github/agents/runtime-profiles.json`, validated structurally by `.github/agents/runtime-profiles.schema.json` and semantically by `scripts/validate-runtime-profiles.mjs` (unique profile IDs, resolvable authority references). Its `authority.workflow` and `authority.promptGuide` entries each carry a `canonical` path (resolved against this provider repository) and a `projected` path (resolved against a consumer repository after `.github/sync-agents.yml` projection) — the same document is copied verbatim to consumers, so a single bare path could never resolve correctly in both contexts.
+The machine-readable source is `.github/agents/runtime-profiles.json`, validated structurally by `.github/agents/runtime-profiles.schema.json` and semantically by `scripts/validate-runtime-profiles.mjs` (unique profile IDs, resolvable authority references). Its `authority.workflow` and `authority.promptGuide` entries each carry a `canonical` path (resolved against this provider repository) and a `projected` path (resolved against a consumer repository after `.github/sync.yml` projection) — the same document is copied verbatim to consumers, so a single bare path could never resolve correctly in both contexts.
 
 ## 1. Prompt projection inputs
 
