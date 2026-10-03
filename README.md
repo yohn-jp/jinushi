@@ -131,7 +131,7 @@ Run submission and non-idempotent physical mutations use caller-provided retry i
 
 ### Nix
 
-The repository root is a Nix flake for `x86_64-linux` and `aarch64-linux`. It builds Jinushi from repository source with `buildGoModule`; `flake.lock` pins nixpkgs.
+The repository root is a Nix flake for `x86_64-linux` and `aarch64-linux`. It builds Jinushi from repository source with `buildGo126Module`; `flake.lock` pins nixpkgs.
 
 ```sh
 nix build .                                  # ./result/bin/jinushi
