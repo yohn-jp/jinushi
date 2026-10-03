@@ -17,13 +17,12 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          jinushi = pkgs.buildGoModule {
+          jinushi = pkgs.buildGo126Module {
             pname = "jinushi";
             version = self.shortRev or self.dirtyShortRev or "dev";
             src = self;
             subPackages = [ "cmd/jinushi" ];
             vendorHash = "sha256-4H7mQu8z9bIwtkj2jHjfhDNCNCcqqpSYxN1atAJw6l8=";
-            env.CGO_ENABLED = "0";
             meta = {
               description = "Go-native local execution substrate";
               homepage = "https://github.com/yohn-jp/jinushi";

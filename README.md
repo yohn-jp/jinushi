@@ -148,8 +148,6 @@ nix run github:yohn-jp/jinushi -- --help
 nix profile install github:yohn-jp/jinushi
 ```
 
-If `go.mod` or `go.sum` changes the module set, update `vendorHash` in `flake.nix`.
-
 ## What Jinushi observes
 
 Jinushi records physical execution facts, including:
