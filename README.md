@@ -129,6 +129,27 @@ jinushi status
 
 Run submission and non-idempotent physical mutations use caller-provided retry identities/current generation. `watch` provides bounded all-Run event pages and reconnectable cursors; event/output/PTY attach follow modes use runtime notifications. Telemetry follow is available over the local protocol. Pause, resume, and mutable resource controls are accepted only when the Run's effective backend capabilities permit them.
 
+### Nix
+
+The repository root is a Nix flake for `x86_64-linux` and `aarch64-linux`. It builds Jinushi from repository source with `buildGoModule`; `flake.lock` pins nixpkgs.
+
+```sh
+nix build .                                  # ./result/bin/jinushi
+nix run . -- --help
+nix run . -- supervisor --state-dir ./jinushi-state
+nix profile install .
+```
+
+The same commands work from a GitHub reference:
+
+```sh
+nix build github:yohn-jp/jinushi
+nix run github:yohn-jp/jinushi -- --help
+nix profile install github:yohn-jp/jinushi
+```
+
+If `go.mod` or `go.sum` changes the module set, update `vendorHash` in `flake.nix`.
+
 ## What Jinushi observes
 
 Jinushi records physical execution facts, including:
