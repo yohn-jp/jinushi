@@ -1,0 +1,40 @@
+name: gofmt autofix
+
+# Organization-owned wrapper distributed via .github/sync.yml. The reusable
+# workflow treats the PR head only as source data; privileged writes happen in
+# a separate job after exact-head and patch validation.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+concurrency:
+  group: gofmt-autofix-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  skip-external-fork:
+    name: Autofix skipped for external fork PR
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "::notice::gofmt autofix is explicitly skipped for external fork pull requests."
+
+  skip-recursion:
+    name: Autofix skipped for a gofmt autofix PR
+    if: github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.event.pull_request.head.ref, 'autofix/gofmt/pr-')
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "::notice::gofmt autofix PRs are excluded from recursive remediation."
+
+  autofix:
+    name: Create stacked gofmt autofix PR
+    if: github.event.pull_request.head.repo.full_name == github.repository && !startsWith(github.event.pull_request.head.ref, 'autofix/gofmt/pr-')
+    uses: yohn-jp/.github/.github/workflows/gofmt-autofix.yml@main
+    with:
+      autofix-app-id: ${{ vars.AUTOFIX_APP_ID }}
+    secrets:
+      AUTOFIX_APP_PRIVATE_KEY: ${{ secrets.AUTOFIX_APP_PRIVATE_KEY }}
