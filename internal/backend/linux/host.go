@@ -214,6 +214,7 @@ func (b *Backend) newRunCgroupLocked(location cgroupLocation, name string, memor
 }
 
 func openHostCgroup(location cgroupLocation, config HostEnvelopeConfig) (*hostCgroup, error) {
+	location = workloadRootLocation(location)
 	parent, err := openDirectoryNoSymlinks(location.basePath)
 	if err != nil {
 		return nil, fmt.Errorf("open delegated cgroup parent safely: %w", err)
@@ -234,7 +235,7 @@ func openHostCgroup(location cgroupLocation, config HostEnvelopeConfig) (*hostCg
 		_ = parent.Close()
 		return nil, fmt.Errorf("create Jinushi workload cgroup: %w", err)
 	}
-	rootPath := filepath.Join(location.basePath, hostCgroupName)
+	rootPath := location.childPath
 	rootFD, err := unix.Openat(int(parent.Fd()), hostCgroupName, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		_ = parent.Close()
@@ -317,6 +318,16 @@ func openHostCgroup(location cgroupLocation, config HostEnvelopeConfig) (*hostCg
 		}
 	}
 	return host, nil
+}
+
+// workloadRootLocation records both the mount-visible path and cgroup-relative
+// path for the aggregate workload root. validatePath reopens childPath from
+// the filesystem root, while childRel preserves the coordinate system used by
+// Run cgroups below this root.
+func workloadRootLocation(location cgroupLocation) cgroupLocation {
+	location.childPath = filepath.Join(location.basePath, hostCgroupName)
+	location.childRel = filepath.Clean(childRelativePath(location, hostCgroupName))
+	return location
 }
 
 func (h *hostCgroup) close() {
