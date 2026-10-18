@@ -5,6 +5,7 @@ package linux
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -59,6 +60,25 @@ func TestParseHostPressurePreservesMeasuredZeroAndGaps(t *testing.T) {
 	}
 }
 
+func TestWorkloadRootLocationPreservesMountAndCgroupCoordinates(t *testing.T) {
+	base := cgroupLocation{
+		mountPoint: "/sys/fs/cgroup",
+		mountRoot:  "/delegated",
+		basePath:   "/sys/fs/cgroup/tenant/repository",
+		baseRel:    "/delegated/tenant/repository",
+	}
+	got := workloadRootLocation(base)
+	want := base
+	want.childPath = filepath.Join(base.basePath, hostCgroupName)
+	want.childRel = filepath.Clean(childRelativePath(base, hostCgroupName))
+	if got != want {
+		t.Fatalf("workloadRootLocation() = %+v, want %+v", got, want)
+	}
+	if base.childPath != "" || base.childRel != "" {
+		t.Fatalf("workloadRootLocation mutated its input: %+v", base)
+	}
+}
+
 func TestHostEnvelopeDelegationAndCrossBackendAdmission(t *testing.T) {
 	config := HostEnvelopeConfig{MaxActiveRuns: 1}
 	first := &Backend{}
@@ -85,6 +105,12 @@ func TestHostEnvelopeDelegationAndCrossBackendAdmission(t *testing.T) {
 	second := &Backend{}
 	if err := second.ConfigureHostEnvelope(config); err != nil {
 		t.Fatalf("second backend could not reopen the shared workload root: %v", err)
+	}
+	if got, want := first.host.location.childPath, filepath.Join(first.host.location.basePath, hostCgroupName); got != want {
+		t.Fatalf("workload root path = %q, want %q", got, want)
+	}
+	if err := first.host.validatePath(); err != nil {
+		t.Fatalf("configured workload root path identity is not revalidatable: %v", err)
 	}
 	status := first.HostEnvelopeStatus()
 	if !status.Capabilities.WorkloadRoot || !status.Capabilities.ActiveRunEnforcement || status.ActiveRuns.Status != "measured" {
